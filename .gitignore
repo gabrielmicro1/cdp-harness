@@ -1,5 +1,8 @@
 # transient in-flight fleet state (resumable polling); never commit
 companies/.fleet-state.json
+
+# per-company runtime state lives on disk only, not in git
+companies/*/
 __pycache__/
 *.pyc
 .DS_Store
