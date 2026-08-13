@@ -1,0 +1,10 @@
+{
+  "slug": "emptyco",
+  "subscription": "m1 corpus",
+  "subscription_id": "600b01d1-0000-0000-0000-000000000000",
+  "resource_group": "rg-emptyco",
+  "storage_account": "stemptyco",
+  "container": "emptyco-raw",
+  "vm": {"name": null, "resource_group": "rg-emptyco", "exists": false},
+  "onboarded_at": "2026-08-10T09:00:00Z"
+}

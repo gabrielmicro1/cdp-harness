@@ -1,0 +1,10 @@
+{
+  "slug": "democo",
+  "subscription": "m1 corpus",
+  "subscription_id": "600b01d1-0000-0000-0000-000000000000",
+  "resource_group": "rg-democo",
+  "storage_account": "stdemoco",
+  "container": "democo-raw",
+  "vm": {"name": "verify-vm-democo", "resource_group": "rg-democo", "exists": true},
+  "onboarded_at": "2026-08-01T09:00:00Z"
+}

@@ -1,0 +1,25 @@
+{
+  "slug": "democo",
+  "timestamp": "2026-08-12T09:00:00Z",
+  "method": "sized",
+  "copied_from": null,
+  "used_capacity_bytes": 1564500000000,
+  "used_capacity_at": "2026-08-12T08:00:00Z",
+  "duration_seconds": 220,
+  "totals": {
+    "blob_count": 3000,
+    "compressed_bytes": 1564500000000,
+    "uncompressed_bytes": 3665000000000,
+    "zero_byte_blobs": 1
+  },
+  "sources": {
+    "gdrive": {"blob_count": 1300, "compressed_bytes": 500000000000, "uncompressed_bytes": 1500000000000},
+    "code": {"blob_count": 900, "compressed_bytes": 1050000000000, "uncompressed_bytes": 2100000000000},
+    "slack": {"blob_count": 300, "compressed_bytes": 4500000000, "uncompressed_bytes": 50000000000},
+    "zendesk": {"blob_count": 400, "compressed_bytes": 5000000000, "uncompressed_bytes": 10000000000},
+    "20260101T000000Z": {"blob_count": 100, "compressed_bytes": 5000000000, "uncompressed_bytes": 5000000000}
+  },
+  "methods": {"zip": 2080, "gz": 3, "stored": 917},
+  "errors": {"total": 2, "by_type": {"BadZipFile": 2}},
+  "notes": []
+}

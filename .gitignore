@@ -1,0 +1,6 @@
+# transient in-flight fleet state (resumable polling); never commit
+companies/.fleet-state.json
+__pycache__/
+*.pyc
+.DS_Store
+.preview/
