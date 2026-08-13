@@ -36,7 +36,8 @@ it in place**. Its operational knowledge is restructured into
 3. **Read-only against client data.** SAS tokens are minted with `rl`
    permissions only (1-day expiry). We NEVER write to client storage accounts —
    no blobs, no tags, no metadata, no container properties. All state lives in
-   this repo's filesystem, committed to git. *Why:* the client's container is
+   this repo's filesystem under `companies/`, which is **gitignored** — runtime
+   state stays local, never in version control. *Why:* the client's container is
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable.
@@ -55,7 +56,7 @@ it in place**. Its operational knowledge is restructured into
 ```
 CLAUDE.md                    # this file — the spec; keep it current
 SIZING-SKILL.md              # original sizing skill; source material, do not edit
-companies/                   # ALL runtime state; committed to git
+companies/                   # ALL runtime state; gitignored (local only)
   <slug>/
     config.json              # cached Azure discovery (see schema)
     expected-data-sizes.json # manifest declarations (see schema)
@@ -73,7 +74,7 @@ companies/                   # ALL runtime state; committed to git
   verify-completion/SKILL.md
   daily-brief/SKILL.md
 scripts/                     # the deterministic layer (python3, stdlib only)
-  common.py                  # paths, az runner, JSON IO, git commit, time, units
+  common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
   reconcile.py               # declared-vs-actual math: %, deltas, ETA, flags, lore notes
   corpus_sizer_rest.py       # VM-side sizer (stdlib+SAS); pushed via run-command
@@ -336,11 +337,11 @@ Preserve these. They are why the code looks the way it does.
 
 ## Conventions
 
-- **Git-commit every sizing run and every config change** (audit trail — the
-  numbers behind commercial conversations must be reconstructible). Harvest
-  commits new run files + status updates; onboarding commits the new company
-  dir; report generation commits reports. Commit messages:
-  `sizing: <slug|fleet> <date>`, `onboard: <slug>`, `reports: <date>`.
+- **Company directories are NOT committed** (`companies/*/` is gitignored;
+  only `companies/.gitkeep` is tracked). The audit trail is the append-only
+  `sizing-runs/` files on disk — run files and reports are never overwritten,
+  only added, so the numbers behind commercial conversations stay
+  reconstructible locally. Nothing in the harness runs git at runtime.
 - **Timestamps ISO-8601 UTC** in JSON; basic format in filenames.
 - **Bytes in storage, human units at presentation** (decimal GB/TB, ÷10⁹).
 - **Scripts are idempotent** — re-running harvest or report generation is
@@ -351,8 +352,7 @@ Preserve these. They are why the code looks the way it does.
 - **`--dry-run`** on anything that would touch Azure prints the az commands
   instead of running them.
 - **`--root`** on every company-reading script (default `companies/`) so tests
-  run against `tests/fixtures/companies/` without touching real state. Git
-  commits auto-disable when `--root` is non-default.
+  run against `tests/fixtures/companies/` without touching real state.
 - Skills never sign nudge drafts as AI, never use em dashes in them, and keep
   them in the user's casual Slack voice.
 

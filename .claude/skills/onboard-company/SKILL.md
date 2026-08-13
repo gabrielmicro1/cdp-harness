@@ -7,7 +7,7 @@ description: Use when adding a new client company to the harness — "onboard <c
 
 Input: a company slug + an image (screenshot) of the manifest's expected
 per-service sizes. Output: `companies/<slug>/` with config.json,
-expected-data-sizes.json, status.json, committed to git.
+expected-data-sizes.json, status.json (runtime state — gitignored, local only).
 
 ## Steps
 
@@ -45,9 +45,8 @@ expected-data-sizes.json, status.json, committed to git.
 4. **Create the remaining structure** (discover_company.py already made
    `sizing-runs/` and `reports/`): write `status.json` with
    `stage: "pushing"`, `last_run` nulls, `last_change_detected_at: null`.
-   Schemas are in CLAUDE.md — follow them exactly.
-
-5. **Commit:** `git add companies/<slug> && git commit -m "onboard: <slug>"`.
+   Schemas are in CLAUDE.md — follow them exactly. Do NOT git-commit any of
+   it: `companies/*/` is gitignored runtime state.
 
 ## Edge cases
 

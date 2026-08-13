@@ -12,9 +12,10 @@ for slug in $(ls companies | grep -v '^\.'); do
   python3 scripts/gen_report.py "$slug" || echo "FAILED: $slug"
 done
 python3 scripts/gen_dashboard.py
-git add companies/*/reports reports/index.html
-git commit -m "reports: $(date -u +%Y-%m-%d)"
 ```
+
+Reports and the dashboard are generated runtime artifacts — do not git-commit
+them (`companies/*/` is gitignored; `reports/index.html` regenerates).
 
 - `reports/index.html` is **the user's working view** (progress bar, %, 24h
   delta, ETA, stage, stall/failure badges, link to each latest report);

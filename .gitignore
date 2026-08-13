@@ -3,6 +3,9 @@ companies/.fleet-state.json
 
 # per-company runtime state lives on disk only, not in git
 companies/*/
+
+# generated fleet dashboard (rebuilt by report-all)
+reports/index.html
 __pycache__/
 *.pyc
 .DS_Store

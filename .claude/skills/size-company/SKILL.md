@@ -9,7 +9,8 @@ Measures compressed + uncompressed size per source for `<slug>-raw`, on an
 in-region VM via **managed run commands** — nothing large touches the laptop,
 and everything is **read-only** against client storage (rl SAS, 1-day expiry;
 we never write blobs/tags/metadata). Output: a new
-`companies/<slug>/sizing-runs/<ts>.json` + updated status.json, committed.
+`companies/<slug>/sizing-runs/<ts>.json` + updated status.json (gitignored
+runtime state — never committed).
 
 Prereq: the company is onboarded (config.json exists). If not → onboard-company.
 
@@ -21,7 +22,7 @@ python3 scripts/size_company.py <slug>
 ```
 
 That does all phases: UsedCapacity skip-check → firewall-if-needed → SAS mint →
-launch → poll → harvest → cleanup → commit. It's bounded at ~8 minutes of
+launch → poll → harvest → cleanup. It's bounded at ~8 minutes of
 polling per invocation; **big containers need more** (blob COUNT drives
 runtime, ~3–4k blobs/sec — webspiders' 10.9M blobs ≈ 45 min). When the output
 says still in flight, keep going across turns:

@@ -32,8 +32,8 @@ Cover, in order:
 ## Nudge drafts (never send — draft only)
 
 For each stalled company, write a short Slack-style nudge to
-`companies/<slug>/reports/nudge-<date>.md`, then commit with the reports.
-Voice rules (the user sends these from their own Slack):
+`companies/<slug>/reports/nudge-<date>.md` (local runtime state, not
+committed). Voice rules (the user sends these from their own Slack):
 
 - Casual, friendly, direct. First person. No greeting-card openers, no
   signature (it's Slack), no corporate filler, and **no em dashes**.

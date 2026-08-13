@@ -1,15 +1,15 @@
 """Shared plumbing for the cdp-harness scripts.
 
 Paths, az invocation (with the /opt/homebrew/bin PATH fix), atomic JSON IO,
-timestamps, git commits, and company-directory helpers. Everything here is
-stdlib-only. See CLAUDE.md for the schemas and conventions.
+timestamps, and company-directory helpers. Everything here is stdlib-only.
+See CLAUDE.md for the schemas and conventions. Note: companies/ is runtime
+state, gitignored — nothing here (or anywhere in the harness) runs git.
 """
 from __future__ import annotations
 
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,25 +159,6 @@ def sizing_runs(root: Path, slug: str) -> list[Path]:
 def latest_runs(root: Path, slug: str, n: int = 2) -> list[dict]:
     """Newest-first list of the last n parsed run files."""
     return [read_json(p) for p in reversed(sizing_runs(root, slug)[-n:])]
-
-
-# ── git ──────────────────────────────────────────────────────────────────────
-
-def git_commit(paths: list[Path], message: str, root: Path) -> bool:
-    """Commit paths, best-effort. Disabled (returns False) when operating on a
-    non-default companies root (fixtures) so tests never touch git."""
-    if root != DEFAULT_COMPANIES_ROOT:
-        return False
-    try:
-        rels = [str(p) for p in paths]
-        subprocess.run(["git", "add", "--"] + rels, cwd=REPO_ROOT, check=True,
-                       capture_output=True, text=True)
-        proc = subprocess.run(["git", "commit", "-m", message, "--"] + rels,
-                              cwd=REPO_ROOT, capture_output=True, text=True)
-        return proc.returncode == 0  # nonzero = nothing to commit; fine
-    except Exception as exc:  # noqa: BLE001 — commit failure must not kill a run
-        print(f"WARNING: git commit failed: {exc}", file=sys.stderr)
-        return False
 
 
 # ── presentation units (decimal — ÷1e9; see CLAUDE.md units convention) ──────

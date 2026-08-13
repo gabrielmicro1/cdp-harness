@@ -32,7 +32,7 @@ scan, error counts surfaced). Your job is the **judgment layer** on top:
    ```bash
    python3 scripts/verify_completion.py <slug> --mark-complete
    ```
-   which sets `stage: complete` and commits. Never mark complete on a failing
+   which sets `stage: complete`. Never mark complete on a failing
    or ambiguous checklist; a wrongly-closed company silently drops out of the
    morning stall radar.
 

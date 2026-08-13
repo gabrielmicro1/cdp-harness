@@ -12,7 +12,7 @@ Checks (tolerance is a parameter, default 0.98 = within 98%):
               listed for HUMAN judgment; the script does not resolve them.
 
 Exit 0 = all hard checks pass; 1 = at least one fails; 2 = cannot verify.
---mark-complete sets stage: complete (only when passing) and commits.
+--mark-complete sets stage: complete (only when passing).
 
   verify_completion.py <slug> [--tolerance 0.98] [--root companies] [--mark-complete]
 """
@@ -111,7 +111,7 @@ def main() -> int:
     ap.add_argument("--tolerance", type=float, default=0.98)
     ap.add_argument("--root", type=Path, default=common.DEFAULT_COMPANIES_ROOT)
     ap.add_argument("--mark-complete", action="store_true",
-                    help="on pass: set stage complete and commit")
+                    help="on pass: set stage complete")
     args = ap.parse_args()
     try:
         result = verify(args.root, args.slug, args.tolerance)
@@ -123,9 +123,6 @@ def main() -> int:
         status = common.load_status(args.root, args.slug)
         status["stage"] = "complete"
         common.save_status(args.root, args.slug, status)
-        common.git_commit(
-            [common.company_dir(args.root, args.slug) / "status.json"],
-            f"verify: {args.slug} complete", args.root)
         result["stage_set"] = "complete"
     print(json.dumps(result, indent=2))
     return {"pass": 0, "fail": 1}.get(result["verdict"], 2)

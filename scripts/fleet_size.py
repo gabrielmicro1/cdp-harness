@@ -11,7 +11,7 @@ nonzero only after processing everyone.
 Subcommands:
   launch-all   phase 0 (skip check) + phase 1 (launch)
   poll-all     phase 2; bounded by --max-wait, resumable across invocations
-  harvest      phase 3; writes run files, updates status, cleans up, commits
+  harvest      phase 3; writes run files, updates status, cleans up
   run          launch-all + poll-all + harvest (for small fleets / one sitting)
   status       print current in-flight state
 
@@ -149,7 +149,6 @@ def cmd_poll_all(args) -> dict:
 def cmd_harvest(args) -> dict:
     root = args.root
     state = phases.load_state(root)
-    committed_paths: list[Path] = []
     for slug, comp in state["companies"].items():
         if comp.get("phase") != "terminal":
             if comp.get("phase") == "launched":
@@ -160,23 +159,16 @@ def cmd_harvest(args) -> dict:
         try:
             cfg = common.load_config(root, slug)
             res = phases.poll_one(cfg, slug, dry_run=args.dry_run)
-            run_path = phases.harvest_one(root, slug, cfg, comp, res,
-                                          dry_run=args.dry_run)
+            phases.harvest_one(root, slug, cfg, comp, res, dry_run=args.dry_run)
             phases.update_status(root, slug, "sized")
             comp.update(phase="done", outcome="sized", reason=None)
-            committed_paths += [run_path,
-                                common.company_dir(root, slug) / "status.json"]
         except Exception as exc:  # noqa: BLE001
             try:
                 phases.update_status(root, slug, "failed", str(exc))
-                committed_paths.append(common.company_dir(root, slug) / "status.json")
             except Exception:  # noqa: BLE001
                 pass
             comp.update(phase="done", outcome="failed", reason=str(exc))
         phases.save_state(root, state)
-    if committed_paths and not args.dry_run:
-        common.git_commit(committed_paths,
-                          f"sizing: fleet {common.utc_now():%Y-%m-%d}", root)
     return state
 
 

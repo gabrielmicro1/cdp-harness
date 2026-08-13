@@ -11,8 +11,8 @@ python3 scripts/gen_report.py <slug>
 
 Writes `companies/<slug>/reports/<date>.html` — self-contained (inline
 CSS/SVG, no CDN), micro1-branded, dark, **clean enough to share externally
-with that client**. Commit it: `git add companies/<slug>/reports && git commit
--m "reports: <slug> <date>"`.
+with that client**. It lives under `companies/` (gitignored runtime state);
+don't git-commit it.
 
 All math (declared vs uncompressed, %, delta/ETA from the two most recent
 runs, stall ≥3 days, flags) is in `scripts/reconcile.py` — never recompute it

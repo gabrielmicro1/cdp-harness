@@ -9,7 +9,7 @@ Thin orchestrator over `scripts/fleet_size.py`, which runs **fleet-wide
 phases, not per-company loops**: skip-check everyone (parallel ARM reads),
 launch all non-skipped (sequential, ~30s each), round-robin poll via
 instance-view reads (parallel, cheap — total wall time ≈ slowest company, not
-the sum), then harvest + commit. Never reimplement per-company logic here —
+the sum), then harvest. Never reimplement per-company logic here —
 that lives in `scripts/phases.py` shared with size-company.
 
 ## Run it

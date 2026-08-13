@@ -13,7 +13,7 @@ fleet CLI with --slugs), so single-company and fleet behavior can never drift.
 Each invocation is bounded (default --max-wait 480s, under the 10-minute Bash
 timeout). For huge containers (blob COUNT drives runtime, ~3–4k blobs/sec —
 webspiders' 10.9M blobs ≈ 45 min) run `--phase poll` repeatedly across turns,
-then `--phase harvest`. Per-company commit happens at harvest.
+then `--phase harvest`.
 """
 from __future__ import annotations
 
