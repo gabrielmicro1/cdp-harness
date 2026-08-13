@@ -2,28 +2,37 @@
 these functions — the fleet is a loop over the same phases a single company
 uses (single company = fleet of one). Never fork this logic into a CLI.
 
-Phases (see CLAUDE.md "Azure operational model" for the why):
-  0. skip_check      — UsedCapacity metric vs last run; unchanged → copied-forward
-  1. launch          — firewall ensure, mint rl SAS, managed run-command create
-  2. poll            — instance-view show (pure ARM read; parallel-safe)
-  3. harvest         — parse summary JSON (4KB-truncation fallback: one invoke),
-                       write sizing-run file, update status, cleanup
+Sizing runs LOCALLY on this machine — no VMs (the sizer reads only blob-list
+pages, zip central directories, and gzip trailers: kilobytes per blob, so
+nothing large flows). Phases (see CLAUDE.md "Azure operational model"):
 
-In-flight state persists in <root>/.fleet-state.json (gitignored) so polling
-can resume across separate CLI invocations / agent turns.
+  0. skip_check      — UsedCapacity metric vs last run; unchanged → copied-forward
+  1. launch          — IP firewall rule if needed, mint rl SAS, start the sizer
+                       as a DETACHED local process (survives the harness dying;
+                       its work files are the manual-rescue path)
+  2. poll            — .done file → Succeeded; else pid alive → Running
+  3. harvest         — read <tag>.summary.json, write sizing-run file, update
+                       status, cleanup (work files + only-ours IP rule)
+
+Work files live in <root>/.sizer-work/<slug>-sizer.* (gitignored). In-flight
+state persists in <root>/.fleet-state.json so polling resumes across separate
+CLI invocations / agent turns.
 """
 from __future__ import annotations
 
-import base64
-import json
+import os
+import shutil
+import subprocess
+import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import common
 from common import HarnessError
 
-RUN_CMD_TIMEOUT_S = 3 * 3600  # webspiders (10.9M blobs) took ~45 min; 3h headroom
-TERMINAL_STATES = {"Succeeded", "Failed", "TimedOut", "Canceled"}
+TERMINAL_STATES = {"Succeeded", "Failed"}
+PUBLIC_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
 
 
 def state_path(root: Path) -> Path:
@@ -41,12 +50,23 @@ def save_state(root: Path, state: dict) -> None:
     common.write_json(state_path(root), state)
 
 
-def run_command_name(slug: str) -> str:
-    return f"sizer-{slug}"
-
-
 def tag_for(slug: str) -> str:
     return f"{slug}-sizer"
+
+
+def work_dir(root: Path) -> Path:
+    return root / ".sizer-work"
+
+
+def _run_path(root: Path, slug: str) -> Path:
+    """Sizing-run path for now; bumps by a second on collision so a run can
+    never silently overwrite another (append-only audit trail)."""
+    from datetime import timedelta
+    ts = common.utc_now()
+    d = common.company_dir(root, slug) / "sizing-runs"
+    while (d / f"{common.ts_basic(ts)}.json").exists():
+        ts += timedelta(seconds=1)
+    return d / f"{common.ts_basic(ts)}.json"
 
 
 def sa_resource_id(cfg: dict) -> str:
@@ -98,15 +118,15 @@ def skip_check(root: Path, slug: str, cfg: dict, dry_run: bool = False) -> dict:
 
 
 def write_copied_forward_run(root: Path, slug: str, metric, metric_at) -> Path:
-    """New run file that copies the previous run's numbers without a VM launch."""
+    """New run file that copies the previous run's numbers without a launch."""
     prev = common.latest_runs(root, slug, 1)
     if not prev:
         raise HarnessError("copied-forward requires a previous sizing run")
     prev = prev[0]
-    now = common.utc_now()
+    path = _run_path(root, slug)
     run = {
         "slug": slug,
-        "timestamp": common.iso(now),
+        "timestamp": common.iso(common.utc_now()),
         "method": "copied-forward",
         "copied_from": prev["timestamp"],
         "used_capacity_bytes": metric,
@@ -118,65 +138,61 @@ def write_copied_forward_run(root: Path, slug: str, metric, metric_at) -> Path:
         "errors": prev.get("errors", {"total": 0, "by_type": {}}),
         "notes": [f"copied forward from {prev['timestamp']} (UsedCapacity unchanged)"],
     }
-    path = common.company_dir(root, slug) / "sizing-runs" / f"{common.ts_basic(now)}.json"
     common.write_json(path, run)
     return path
 
 
 # ── Phase 1: launch ──────────────────────────────────────────────────────────
 
-def check_vm_running(cfg: dict, dry_run: bool = False) -> str:
-    vm = cfg["vm"]
-    proc = common.run_az([
-        "vm", "get-instance-view", "-g", vm["resource_group"], "-n", vm["name"],
-        "--query",
-        "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus|[0]",
-        "-o", "tsv",
-    ], dry_run=dry_run)
-    return "VM running" if dry_run else proc.stdout.strip()
+def get_public_ip() -> str:
+    for url in PUBLIC_IP_SERVICES:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                ip = r.read().decode().strip()
+                if ip:
+                    return ip
+        except Exception:  # noqa: BLE001 — try the next service
+            continue
+    raise HarnessError("could not determine this machine's public IP (offline?)")
 
 
-def firewall_ensure(cfg: dict, dry_run: bool = False) -> tuple[bool, str]:
-    """Allow the VM's subnet on the SA if (and only if) it isn't already.
-    Returns (we_added, subnet_id). NEVER touches pre-existing rules."""
-    vm = cfg["vm"]
-    nic_id = common.run_az([
-        "vm", "show", "-g", vm["resource_group"], "-n", vm["name"],
-        "--query", "networkProfile.networkInterfaces[0].id", "-o", "tsv",
-    ], dry_run=dry_run).stdout.strip()
-    subnet_id = common.run_az([
-        "network", "nic", "show", "--ids", nic_id or "<nic-id>",
-        "--query", "ipConfigurations[0].subnet.id", "-o", "tsv",
-    ], dry_run=dry_run).stdout.strip()
-    already = common.run_az([
-        "storage", "account", "show", "-n", cfg["storage_account"],
-        "-g", cfg["resource_group"], "--query",
-        f"contains(networkRuleSet.virtualNetworkRules[].virtualNetworkResourceId, '{subnet_id or '<subnet-id>'}')",
-        "-o", "tsv",
-    ], dry_run=dry_run).stdout.strip()
+def ip_rule_ensure(cfg: dict, dry_run: bool = False) -> tuple[bool, str]:
+    """Allow this machine's public IP on the SA if (and only if) it isn't
+    already reachable. Returns (we_added, ip). NEVER touches pre-existing
+    rules — the client's own IPs in the allowlist are their push path."""
     if dry_run:
-        print("DRY-RUN: (if subnet not already allowed) az network vnet subnet update "
-              "--ids <subnet-id> --service-endpoints Microsoft.Storage; "
-              "az storage account network-rule add ...; sleep 60")
-        return False, subnet_id
-    if already == "true":
-        return False, subnet_id  # pre-existing — do NOT remove in cleanup
-    common.run_az(["network", "vnet", "subnet", "update", "--ids", subnet_id,
-                   "--service-endpoints", "Microsoft.Storage", "-o", "none"])
+        print("DRY-RUN: az storage account show -n "
+              f"{cfg['storage_account']} -g {cfg['resource_group']} "
+              "--query networkRuleSet   # then, only if defaultAction=Deny and "
+              "our public IP is missing:")
+        print(f"DRY-RUN: az storage account network-rule add -g "
+              f"{cfg['resource_group']} --account-name {cfg['storage_account']} "
+              f"--ip-address <public-ip>; sleep 60  # propagation")
+        return False, "<public-ip>"
+    ip = get_public_ip()
+    rules = common.az_json(["storage", "account", "show",
+                            "-n", cfg["storage_account"],
+                            "-g", cfg["resource_group"],
+                            "--query", "networkRuleSet"]) or {}
+    if rules.get("defaultAction") == "Allow":
+        return False, ip
+    existing = {r.get("ipAddressOrRange") for r in rules.get("ipRules") or []}
+    if ip in existing:
+        return False, ip  # pre-existing — do NOT remove in cleanup
     common.run_az(["storage", "account", "network-rule", "add",
                    "-g", cfg["resource_group"], "--account-name",
-                   cfg["storage_account"], "--subnet", subnet_id, "-o", "none"])
+                   cfg["storage_account"], "--ip-address", ip, "-o", "none"])
     time.sleep(60)  # propagation — a 403 right after adding = not propagated yet
-    return True, subnet_id
+    return True, ip
 
 
-def firewall_remove_if_ours(cfg: dict, subnet_id: str, we_added: bool,
-                            dry_run: bool = False) -> None:
+def ip_rule_remove_if_ours(cfg: dict, ip: str, we_added: bool,
+                           dry_run: bool = False) -> None:
     if not we_added:
-        return  # pre-existing rule — never delete
+        return  # pre-existing rule (or defaultAction=Allow) — never delete
     common.run_az(["storage", "account", "network-rule", "remove",
                    "-g", cfg["resource_group"], "--account-name",
-                   cfg["storage_account"], "--subnet", subnet_id, "-o", "none"],
+                   cfg["storage_account"], "--ip-address", ip, "-o", "none"],
                   dry_run=dry_run, check=False)
 
 
@@ -194,151 +210,88 @@ def mint_sas(cfg: dict, dry_run: bool = False) -> str:
     return "<sas>" if dry_run else proc.stdout.strip()
 
 
-def build_launch_script(cfg: dict, sas: str, tag: str) -> str:
-    """The managed run-command script. nohup is belt-and-suspenders: if the
-    run-command agent dies, the sizer survives and /var/tmp/$TAG.* remain as
-    the manual rescue path. `wait $PID` makes executionState track completion;
-    the final cat rides the summary home in instance-view output (≤4KB)."""
-    sizer_b64 = base64.b64encode(
-        (common.REPO_ROOT / "scripts" / "corpus_sizer_rest.py").read_bytes()
-    ).decode()
-    sas_b64 = base64.b64encode(sas.encode()).decode()
-    return f"""\
-echo '{sizer_b64}' | base64 -d > /var/tmp/corpus_sizer_rest.py || exit 9
-export SA='{cfg["storage_account"]}' CONTAINER='{cfg["container"]}' TAG='{tag}'
-export AZURE_STORAGE_SAS="$(echo '{sas_b64}' | base64 -d)"
-rm -f /var/tmp/{tag}.done
-nohup python3 /var/tmp/corpus_sizer_rest.py > /var/tmp/{tag}.stdout 2>&1 </dev/null &
-PID=$!
-echo "pid=$PID"
-wait $PID
-RC=$?
-echo "rc=$RC"
-cat /var/tmp/{tag}.summary.json 2>/dev/null
-exit $RC
-"""
-
-
-def delete_run_command(cfg: dict, slug: str, dry_run: bool = False) -> None:
-    """Managed run-command resources persist; a stale same-name one breaks the
-    next create. Called defensively pre-launch and always in cleanup."""
-    vm = cfg["vm"]
-    common.run_az(["vm", "run-command", "delete",
-                   "-g", vm["resource_group"], "--vm-name", vm["name"],
-                   "--run-command-name", run_command_name(slug), "--yes"],
-                  dry_run=dry_run, check=False, timeout=120)
+def _sizer_cmd() -> list[str]:
+    """The sizer invocation. caffeinate -i (macOS) holds off idle sleep while
+    a sizer runs — note it does NOT survive a closed lid; keep the laptop open
+    for monster containers. CDP_SIZER_SCRIPT overrides the script (tests)."""
+    sizer = os.environ.get("CDP_SIZER_SCRIPT",
+                           str(common.REPO_ROOT / "scripts" / "corpus_sizer_rest.py"))
+    cmd = [sys.executable, sizer]
+    if shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i"] + cmd
+    return cmd
 
 
 def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False) -> dict:
-    """Fire off the sizer via managed run-command create --async-execution.
-    Returns the per-company in-flight state dict."""
-    if not cfg.get("vm", {}).get("exists", False):
-        raise HarnessError("no VM discovered for this company (vm.exists=false)")
-    power = check_vm_running(cfg, dry_run=dry_run)
-    if "running" not in power.lower():
-        raise HarnessError(f"VM {cfg['vm']['name']} is not running ({power or 'unknown'})")
-    we_added_fw, subnet_id = firewall_ensure(cfg, dry_run=dry_run)
+    """Start the sizer as a detached local process (nohup-equivalent: new
+    session, stdin closed, output to <tag>.stdout). It keeps running if the
+    harness/agent dies — the work files are the rescue path. Returns the
+    per-company in-flight state dict."""
+    we_added_ip, ip = ip_rule_ensure(cfg, dry_run=dry_run)
     sas = mint_sas(cfg, dry_run=dry_run)
     tag = tag_for(slug)
-    script = build_launch_script(cfg, sas, tag)
-    delete_run_command(cfg, slug, dry_run=dry_run)
-    vm = cfg["vm"]
+    wd = work_dir(root)
+    cmd = _sizer_cmd()
     if dry_run:
-        print(f"DRY-RUN: az vm run-command create -g {vm['resource_group']} "
-              f"--vm-name {vm['name']} --run-command-name {run_command_name(slug)} "
-              f"--script '<{len(script)}-byte launch script: decode sizer, nohup, "
-              f"wait pid, cat summary.json>' --timeout-in-seconds {RUN_CMD_TIMEOUT_S} "
-              f"--async-execution")
-    else:
-        common.run_az(["vm", "run-command", "create",
-                       "-g", vm["resource_group"], "--vm-name", vm["name"],
-                       "--run-command-name", run_command_name(slug),
-                       "--script", script,
-                       "--timeout-in-seconds", str(RUN_CMD_TIMEOUT_S),
-                       "--async-execution", "-o", "none"], timeout=300)
-    return {"phase": "launched", "tag": tag, "we_added_fw": we_added_fw,
-            "subnet_id": subnet_id, "launched_at": common.iso_now(),
-            "outcome": None, "reason": None}
+        print(f"DRY-RUN: SA={cfg['storage_account']} "
+              f"CONTAINER={cfg['container']} TAG={tag} OUT_DIR={wd} "
+              f"AZURE_STORAGE_SAS=<sas> {' '.join(cmd)} "
+              f"# detached, output → {wd}/{tag}.*")
+        return {"phase": "launched", "tag": tag, "pid": None,
+                "we_added_ip": we_added_ip, "ip": ip,
+                "launched_at": common.iso_now(), "outcome": None, "reason": None}
+    wd.mkdir(parents=True, exist_ok=True)
+    for stale in wd.glob(f"{tag}.*"):  # a stale .done would fake completion
+        stale.unlink()
+    env = os.environ.copy()
+    env.update({"SA": cfg["storage_account"], "CONTAINER": cfg["container"],
+                "TAG": tag, "OUT_DIR": str(wd), "AZURE_STORAGE_SAS": sas})
+    with open(wd / f"{tag}.stdout", "w") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL,
+                                start_new_session=True, env=env,
+                                cwd=str(common.REPO_ROOT))
+    return {"phase": "launched", "tag": tag, "pid": proc.pid,
+            "we_added_ip": we_added_ip, "ip": ip,
+            "launched_at": common.iso_now(), "outcome": None, "reason": None}
 
 
 # ── Phase 2: poll ────────────────────────────────────────────────────────────
 
-def poll_one(cfg: dict, slug: str, dry_run: bool = False) -> dict:
-    """Instance-view read: pure ARM management-plane, no execution slot, no
-    Conflict, parallel-safe. Returns {state, out, err}."""
-    vm = cfg["vm"]
-    data = common.az_json([
-        "vm", "run-command", "show",
-        "-g", vm["resource_group"], "--vm-name", vm["name"],
-        "--run-command-name", run_command_name(slug), "--instance-view",
-        "--query", "instanceView.{state:executionState,out:output,err:error}",
-    ], dry_run=dry_run, timeout=120)
-    if data is None:
-        return {"state": "Unknown", "out": "", "err": ""}
-    return {"state": data.get("state") or "Pending",
-            "out": data.get("out") or "", "err": data.get("err") or ""}
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def poll_one(root: Path, slug: str, comp_state: dict,
+             dry_run: bool = False) -> dict:
+    """Local check, instant and side-effect-free: .done file wins (written on
+    clean completion), else a live pid means still running."""
+    if dry_run:
+        return {"state": "Unknown", "err": ""}
+    tag = comp_state.get("tag") or tag_for(slug)
+    wd = work_dir(root)
+    if (wd / f"{tag}.done").exists():
+        return {"state": "Succeeded", "err": ""}
+    pid = comp_state.get("pid")
+    if pid and _pid_alive(pid):
+        return {"state": "Running", "err": ""}
+    tail = ""
+    log = wd / f"{tag}.stdout"
+    if log.exists():
+        tail = log.read_text()[-400:]
+    return {"state": "Failed",
+            "err": f"sizer process gone without {tag}.done; stdout tail: {tail}"}
 
 
 # ── Phase 3: harvest ─────────────────────────────────────────────────────────
 
-def _extract_summary_json(output: str):
-    """The launch script's last stdout is the compact summary JSON. Find the
-    last '{' and parse to the end; truncated output (4KB cap) fails parse."""
-    idx = output.rfind("{\"sa\"")
-    if idx < 0:
-        idx = output.rfind("{")
-    if idx < 0:
-        return None
-    try:
-        return json.loads(output[idx:])
-    except json.JSONDecodeError:
-        return None
-
-
-def invoke_cat_summary(cfg: dict, slug: str) -> dict | None:
-    """Truncation fallback: ONE legacy invoke (one-at-a-time per VM applies)."""
-    vm = cfg["vm"]
-    proc = common.run_az([
-        "vm", "run-command", "invoke", "-g", vm["resource_group"], "-n", vm["name"],
-        "--command-id", "RunShellScript",
-        "--scripts", f"cat /var/tmp/{tag_for(slug)}.summary.json",
-        "--query", "value[0].message", "-o", "tsv",
-    ], timeout=300)
-    return _extract_summary_json(proc.stdout)
-
-
-def fetch_sizes_tsv(cfg: dict, slug: str, dest: Path, max_chunks: int = 40) -> bool:
-    """Optional per-blob detail via chunked invokes (~3KB/chunk after base64).
-    Only for small containers / spot checks — a 10M-blob TSV cannot come home
-    this way; use scp or a storage-side copy instead. Serial invokes only."""
-    vm = cfg["vm"]
-    b64_parts = []
-    lines_per_chunk = 40  # 40 * ~76 chars ≈ 3KB, under the 4KB message cap
-    for i in range(max_chunks):
-        start = i * lines_per_chunk + 1
-        end = start + lines_per_chunk - 1
-        proc = common.run_az([
-            "vm", "run-command", "invoke", "-g", vm["resource_group"], "-n",
-            vm["name"], "--command-id", "RunShellScript",
-            "--scripts",
-            f"base64 /var/tmp/{tag_for(slug)}.sizes.tsv | sed -n '{start},{end}p'; "
-            f"echo CHUNK-END",
-            "--query", "value[0].message", "-o", "tsv",
-        ], timeout=300)
-        body = [ln for ln in proc.stdout.splitlines()
-                if ln and "CHUNK-END" not in ln and not ln.startswith("Enable")]
-        if not body:
-            break
-        b64_parts.extend(body)
-        if len(body) < lines_per_chunk:
-            break
-    else:
-        return False  # hit max_chunks — file bigger than this path supports
-    dest.write_bytes(base64.b64decode("".join(b64_parts)))
-    return True
-
-
-def summary_to_run(slug: str, summary: dict, skip_info: dict, state: dict,
+def summary_to_run(slug: str, summary: dict, skip_info: dict,
                    notes: list[str]) -> dict:
     return {
         "slug": slug,
@@ -367,45 +320,41 @@ def summary_to_run(slug: str, summary: dict, skip_info: dict, state: dict,
 
 
 def harvest_one(root: Path, slug: str, cfg: dict, comp_state: dict,
-                poll_result: dict, dry_run: bool = False) -> Path:
-    """Parse the finished run, write the sizing-run file, clean up Azure side.
-    Raises HarnessError if no summary can be recovered."""
-    notes = []
-    summary = _extract_summary_json(poll_result.get("out", ""))
-    if summary is None and not dry_run:
-        # 4KB truncation or agent hiccup — the nohup'd sizer may still have
-        # finished cleanly on the VM. One fallback invoke.
-        summary = invoke_cat_summary(cfg, slug)
-        notes.append("instance-view output truncated/unusable; "
-                     "summary recovered via fallback invoke")
-    if summary is None:
+                dry_run: bool = False) -> Path:
+    """Read the finished run's summary.json, write the sizing-run file, clean
+    up. Raises HarnessError if there is no summary to harvest."""
+    tag = comp_state.get("tag") or tag_for(slug)
+    wd = work_dir(root)
+    summary_path = wd / f"{tag}.summary.json"
+    if dry_run:
+        print(f"DRY-RUN: harvest would read {summary_path}, write a sizing-run "
+              f"file, and clean up")
+        raise HarnessError("dry-run: nothing to harvest")
+    if not summary_path.exists():
         raise HarnessError(
-            f"run-command state={poll_result.get('state')} but no summary JSON "
-            f"recoverable — manual rescue: check /var/tmp/{tag_for(slug)}.log on the VM")
+            f"no summary at {summary_path} — check {tag}.log / {tag}.stdout "
+            f"in {wd} (a 403 in the log = firewall propagation, not the SAS)")
+    summary = common.read_json(summary_path)
     skip_info = {"metric": comp_state.get("metric"),
                  "metric_at": comp_state.get("metric_at")}
-    run = summary_to_run(slug, summary, skip_info, comp_state, notes)
-    path = (common.company_dir(root, slug) / "sizing-runs"
-            / f"{common.ts_basic()}.json")
+    run = summary_to_run(slug, summary, skip_info, [])
+    path = _run_path(root, slug)
     common.write_json(path, run)
-    cleanup(cfg, slug, comp_state, dry_run=dry_run)
+    cleanup(root, slug, cfg, comp_state, dry_run=dry_run)
     return path
 
 
-def cleanup(cfg: dict, slug: str, comp_state: dict, dry_run: bool = False) -> None:
-    """Delete the run-command resource (stale ones break the next create),
-    rm temp files, remove the firewall rule only if WE added it."""
-    delete_run_command(cfg, slug, dry_run=dry_run)
-    vm = cfg["vm"]
-    tag = tag_for(slug)
-    common.run_az([
-        "vm", "run-command", "invoke", "-g", vm["resource_group"], "-n", vm["name"],
-        "--command-id", "RunShellScript",
-        "--scripts", f"rm -f /var/tmp/{tag}.* /var/tmp/corpus_sizer_rest.py",
-        "--query", "value[0].message", "-o", "tsv",
-    ], dry_run=dry_run, check=False, timeout=300)
-    firewall_remove_if_ours(cfg, comp_state.get("subnet_id", ""),
-                            comp_state.get("we_added_fw", False), dry_run=dry_run)
+def cleanup(root: Path, slug: str, cfg: dict, comp_state: dict,
+            dry_run: bool = False) -> None:
+    """Remove work files; remove the IP firewall rule only if WE added it.
+    The per-blob sizes.tsv is deleted too — the sizing-run JSON keeps
+    everything the harness needs; re-size if per-blob detail is wanted."""
+    if not dry_run:
+        for f in work_dir(root).glob(f"{comp_state.get('tag') or tag_for(slug)}.*"):
+            f.unlink()
+    ip_rule_remove_if_ours(cfg, comp_state.get("ip", ""),
+                           comp_state.get("we_added_ip", False),
+                           dry_run=dry_run)
     # SAS expires on its own (1 day) — nothing to revoke.
 
 

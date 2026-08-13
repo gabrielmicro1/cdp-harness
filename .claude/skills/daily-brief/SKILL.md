@@ -23,7 +23,8 @@ Cover, in order:
 - **Who moved in the last 24h**, with their deltas (from `delta_24h`).
 - **Newly stalled** companies (stage flipped to stalled today) vs already
   stalled ones — distinguish them.
-- **Action items:** failures with reasons, no-vm companies, VMs not running.
+- **Action items:** failures with reasons (403/firewall propagation, sizer
+  died mid-run, offline), and any monster container still sizing.
 - **ETAs at risk:** ETA more than ~2 weeks out, rate trending down, or no ETA
   because nothing has moved.
 - **Top 3 things needing attention today** — your judgment call; a stall at a

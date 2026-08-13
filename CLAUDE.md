@@ -44,7 +44,7 @@ it in place**. Its operational knowledge is restructured into
 
 4. **Failure isolation.** One broken company must never kill a fleet run. Every
    fleet operation wraps per-company work in try/except, collects a per-company
-   outcome (`sized | skipped-unchanged | no-vm | failed(reason)`), and reports
+   outcome (`sized | skipped-unchanged | failed(reason)`), and reports
    all of them at the end. Scripts exit nonzero if *any* company failed, but
    only after processing every company. *Why:* the fleet run is a morning
    routine; a webspiders timeout must not hide croplabel's result.
@@ -64,6 +64,7 @@ companies/                   # ALL runtime state; gitignored (local only)
     sizing-runs/             # one JSON per run, <YYYYMMDDTHHMMSSZ>.json
     reports/                 # per-company HTML reports + nudge drafts
   .fleet-state.json          # transient in-flight fleet state; gitignored
+  .sizer-work/               # local sizer work files (<slug>-sizer.*); gitignored
 .claude/skills/              # the judgment layer
   onboard-company/SKILL.md
   size-company/SKILL.md
@@ -77,7 +78,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
   reconcile.py               # declared-vs-actual math: %, deltas, ETA, flags, lore notes
-  corpus_sizer_rest.py       # VM-side sizer (stdlib+SAS); pushed via run-command
+  corpus_sizer_rest.py       # portable stdlib+SAS sizer; runs locally, detached
   discover_company.py        # az discovery for onboarding → config.json
   size_company.py            # single-company sizing CLI (fleet of one)
   fleet_size.py              # fleet sizing CLI (launch-all / poll-all / harvest)
@@ -119,7 +120,7 @@ Cached so daily runs skip discovery entirely.
   "vm": {
     "name": "verify-vm-croplabel",      // preferred verify-vm-*, else any VM in RG
     "resource_group": "rg-croplabel",
-    "exists": true                      // false = no VM found (~40% of companies!) — sizing impossible until resolved
+    "exists": true                      // INFORMATIONAL — sizing runs locally; false is normal (most companies have no VM)
   },
   "onboarded_at": "2026-08-13T14:00:00Z"
 }
@@ -184,7 +185,7 @@ Cached so daily runs skip discovery entirely.
   "stage": "pushing",                    // onboarding | pushing | stalled | verifying | complete
   "last_run": {
     "timestamp": "2026-08-13T14:00:00Z",
-    "outcome": "sized",                  // sized | skipped-unchanged | no-vm | failed
+    "outcome": "sized",                  // sized | skipped-unchanged | failed
     "reason": null                       // human-readable failure reason when outcome=failed
   },
   "last_change_detected_at": "2026-08-12T14:00:00Z" // last time total bytes grew
@@ -209,68 +210,59 @@ Login is cached in `~/.azure`. Subscription is **"m1 corpus"** (selected by
 name; the id `600b01d1…` is a sanity-check hint). Claude drives az end-to-end
 itself — no handing commands to the user unless they ask.
 
-### Managed Run Commands (the launch/poll mechanism)
+### Local sizing execution (the launch/poll mechanism)
 
-We use **managed run commands** (`az vm run-command create/show/delete`), not
-the legacy action API (`az vm run-command invoke`), for launching and polling
-the sizer:
+Sizing runs **on this machine** — no VMs are provisioned or required. This is
+safe because a SIZE job never bulk-downloads: the sizer reads blob-list pages,
+zip central directories, and gzip trailers — kilobytes per blob. (The old
+in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
 
-- **Launch:** `az vm run-command create -g $VM_RG --vm-name $VM
-  --run-command-name sizer-$SLUG --script "$SCRIPT" --async-execution`.
-  The script base64-decodes `corpus_sizer_rest.py` onto the VM, launches it
-  under `nohup` writing to `/var/tmp/$TAG.*` (belt-and-suspenders: if the
-  run-command agent dies, the sizer survives and the log files remain as a
-  manual rescue path), then `wait`s on the pid so the run-command's
-  `executionState` tracks sizer completion, and finally
-  `cat /var/tmp/$TAG.summary.json` so the summary rides home in instance-view
-  output.
-- **Poll:** `az vm run-command show -g $VM_RG --vm-name $VM --run-command-name
-  sizer-$SLUG --instance-view --query "instanceView.{state:executionState,out:output,err:error}"`.
-  This is a **pure ARM management-plane read**: no execution slot consumed, no
-  `Conflict` errors, instantly repeatable, parallel-safe across the whole
-  fleet. This replaces the old invoke-based VM-side polling entirely.
-- **4KB output cap:** instance-view output+error is truncated at ~4KB. The
-  sizer's `summary.json` is deliberately compact (per-source arrays) to fit.
-  Harvest detects truncation (unparseable JSON) and falls back to ONE
-  `az vm run-command invoke` that `cat`s `/var/tmp/$TAG.summary.json`.
-- **Cleanup:** `az vm run-command delete -g $VM_RG --vm-name $VM
-  --run-command-name sizer-$SLUG --yes`. Run-command resources **persist on the
-  VM resource**, and a stale same-name resource breaks the next `create` — so
-  harvest always deletes, and launch defensively deletes any stale resource
-  first. Cleanup also removes `/var/tmp/$TAG.*` temp files (via one invoke) and
-  conditionally removes the firewall rule (below).
+- **Launch:** `phases.launch` starts `scripts/corpus_sizer_rest.py` as a
+  **detached local process** (new session, stdin closed, output to
+  `<tag>.stdout` — nohup-equivalent), wrapped in `caffeinate -i` on macOS so
+  the machine won't idle-sleep mid-run. Work files go to
+  `companies/.sizer-work/<slug>-sizer.*` (gitignored). Belt-and-suspenders:
+  if the harness/agent dies, the sizer keeps running and its work files remain
+  as the manual rescue path. Stale work files are cleared before each launch
+  (a stale `.done` would fake completion).
+- **Poll:** `<tag>.done` exists → Succeeded; else pid alive → Running; else
+  Failed (with the stdout tail as the reason). Instant, local, no az calls.
+- **Harvest:** read `<tag>.summary.json` directly, write the sizing-run file,
+  then cleanup (work files + only-ours firewall rule). No output caps, no
+  truncation fallbacks.
+- **Caveats:** `caffeinate -i` does NOT survive a closed lid — keep the laptop
+  open/awake for monster containers. A network drop mid-listing kills the run
+  (per-blob read errors are merely counted; a listing error is fatal) —
+  re-running is idempotent and safe.
+- **Legacy:** the harness previously ran the sizer on in-region VMs via
+  managed run commands (create/show/delete, 4KB instance-view cap,
+  one-invoke-at-a-time). If a VM path is ever needed again (e.g. a
+  webspiders-scale container is too slow over the internet), recover it from
+  git history (commit c3ba27c and earlier) and SIZING-SKILL.md.
 
-### The one-invoke-at-a-time rule
+### Firewall (IP rules — conditional, only touch if needed)
 
-`az vm run-command invoke` (legacy action API) allows **ONE execution at a time
-per VM** — a second concurrent invoke gets `Conflict`. Managed run-command
-*show* polling is exempt (it's an ARM read). Invoke is still used in exactly
-three places, all strictly after the managed run command reaches a terminal
-state: (1) truncation-fallback `cat` of summary.json, (2) optional chunked
-fetch of the per-blob `sizes.tsv`, (3) temp-file cleanup. Never run two invokes
-against the same VM concurrently; never leave a VM-side sleep loop running (it
-jams the slot). A `Conflict` means another invoke is still finishing — wait
-~15s and retry; any background sizer keeps running regardless.
-
-### Firewall (conditional — only touch if needed)
-
-The VM's subnet must be allowed on the storage account. **Check first; only add
-if missing; only remove a rule WE added — NEVER delete a pre-existing rule**
-(transfer VMs' subnets are usually already whitelisted; verify VMs' often
-aren't; a pre-existing rule may be what the client's own push path depends on).
-After adding: ensure the subnet has the `Microsoft.Storage` service endpoint,
-then `az storage account network-rule add`, then **sleep ~60s for
-propagation**. A `403 AuthorizationFailure` on the sizer's first read =
-firewall (subnet not allowed), **not** a bad SAS — if it appears right after
-adding a rule, it's propagation: wait and retry, don't re-mint the SAS.
+The storage accounts are `defaultAction: Deny` with an **IP allowlist** (the
+client's own push locations — e.g. am-city-inc has five client IPs). Before
+launching, `phases.ip_rule_ensure` checks the SA's networkRuleSet:
+`defaultAction: Allow` → nothing to do; our current public IP already listed →
+pre-existing, **NEVER remove it**; otherwise `az storage account network-rule
+add --ip-address <our-ip>`, **sleep ~60s for propagation**, and remove it
+again at cleanup. **Only remove a rule WE added this run — a pre-existing IP
+rule may be the client's own push path; deleting one breaks their transfer.**
+Our public IP comes from api.ipify.org (fallback checkip.amazonaws.com) and
+changes with location (office/home/VPN) — which is why rules are added
+per-run rather than cached. A `403 AuthorizationFailure` on the sizer's first
+read = firewall (IP not allowed/propagated), **not** a bad SAS — if it appears
+right after adding the rule it's propagation: wait and retry, don't re-mint.
 
 ### SAS policy
 
 Account SAS, `--services b --resource-types sco`, **permissions `rl` only**
 (read+list — all a SIZE job needs), `--https-only`, **1-day expiry** (long
 enough for the biggest containers, short enough to be self-cleaning; we never
-revoke, we let them lapse). The SAS and the sizer script are both base64'd
-through the run-command script to survive shell quoting.
+revoke, we let them lapse). The SAS is passed to the local sizer via its
+process environment (`AZURE_STORAGE_SAS`), never written to disk or logs.
 
 ### The UsedCapacity skip check (Phase 0)
 
@@ -285,15 +277,13 @@ redundant re-size; harmless) and lags up to ~an hour; both errors are in the
 safe direction (a false "changed" just re-sizes; a same-hour push is caught the
 next morning). No previous sized run → always launch.
 
-### The no-verify-VM reality
+### The vm block is informational
 
-**~40% of companies have NO `verify-vm-<slug>`.** They have a `vm-*-extract`,
-`vm-dwt-transfer`, a leftover `vm-sizer-*`, or nothing. Discovery prefers
-`verify-vm-*`, falls back to ANY VM in the RG, else records
-`vm.exists: false`. A no-VM company gets outcome `no-vm` on every sizing
-attempt: **flag the user, don't guess** — starting a stopped VM or
-provisioning a sizer VM is their call. The VM must be *running*; check
-PowerState before launch.
+Sizing no longer uses VMs, but discovery still records what it finds (prefer
+`verify-vm-*`, else any VM in the RG, else `exists: false`) because it's
+useful context — most companies have NO VM at all (am-city-inc's RG holds
+only the storage account), some have `vm-*-extract` / `vm-dwt-transfer`
+leftovers. `vm.exists: false` is normal and blocks nothing.
 
 ---
 
@@ -318,9 +308,11 @@ Preserve these. They are why the code looks the way it does.
   the price of not streaming them for hours.
 - **BadZipFile errors** = corrupt/mislabeled `.zip` files (common in scraped/
   backup trees); counted at stored size; negligible.
-- **Blob COUNT drives runtime, not bytes:** ~3–4k blobs/sec. webspiders =
-  10.9M blobs ≈ 45 min; croplabel = 806 ≈ 1 min; latchel = 2,289 ≈ 2 min.
-  Budget polling accordingly.
+- **Blob COUNT drives runtime, not bytes:** ~3–4k blobs/sec *in-region*.
+  webspiders = 10.9M blobs ≈ 45 min; croplabel = 806 ≈ 1 min; latchel =
+  2,289 ≈ 2 min. Local sizing adds internet latency: listing stays comparable,
+  but zip-heavy containers pay 2–3 round trips per blob — budget hours, not
+  minutes, for millions of blobs. Budget polling accordingly.
 - **Units:** decimal GB (÷10⁹) everywhere in this harness. The older canonical
   `size_corpus.py` used GiB (÷1024³, ~7% lower) — account for that if
   comparing against pre-harness reports. Headline totals in TB when ≥1 TB;
@@ -377,27 +369,30 @@ existing stage checks (`stage ==`) to audit every consumer.
 
 ## Manual rescue (stuck sizer)
 
-The nohup design means a sizer can outlive a dead run-command agent. On the VM
-(`/var/tmp/`, TAG = `<slug>-sizer`):
+The detached-process design means a sizer can outlive a dead harness/agent.
+In `companies/.sizer-work/` (TAG = `<slug>-sizer`):
 
 - `$TAG.log` — timestamped progress (`progress N blobs, errors=M` every 5k)
-- `$TAG.sizes.tsv` — per-blob rows so far (`wc -l` ≈ blobs done; ~3–4k/sec)
+- `$TAG.sizes.tsv` — per-blob rows so far (`wc -l` ≈ blobs done)
 - `$TAG.stdout` — sizer stdout/stderr
 - `$TAG.summary` / `$TAG.summary.json` — written at the end
 - `$TAG.done` — exists only on clean completion
 
-Fallback poll (the old invoke-based path — one at a time per VM!):
+Checking by hand:
 
 ```bash
-az vm run-command invoke -g $VM_RG -n $VM --command-id RunShellScript \
-  --scripts "ls /var/tmp/$TAG.done 2>/dev/null && echo DONE || echo NOT-YET; tail -1 /var/tmp/$TAG.log; echo rows=\$(wc -l < /var/tmp/$TAG.sizes.tsv 2>/dev/null)" \
-  --query "value[0].message" -o tsv
+ls companies/.sizer-work/$TAG.done && echo DONE || echo NOT-YET
+tail -1 companies/.sizer-work/$TAG.log
+wc -l < companies/.sizer-work/$TAG.sizes.tsv
+pgrep -f corpus_sizer_rest.py
 ```
 
-If the managed run command shows `Failed` but `$TAG.done` exists, the sizer
-finished fine — harvest from the files directly (invoke `cat
-/var/tmp/$TAG.summary.json`). If neither progresses, check the log tail for
-`403 AuthorizationFailure` (firewall — see above) before suspecting the SAS.
+If the state file says `Failed` but `$TAG.done` exists, the sizer finished
+fine (the tracked pid was probably `caffeinate`'s) — just run harvest; it
+reads `$TAG.summary.json` directly. If nothing progresses, check the log tail
+for `403 AuthorizationFailure` (firewall/IP propagation — see above) before
+suspecting the SAS. Note harvest's cleanup deletes `$TAG.sizes.tsv` — copy it
+first if the per-blob detail matters.
 
 ## Offline validation
 

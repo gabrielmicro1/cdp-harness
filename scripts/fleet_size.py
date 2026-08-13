@@ -2,11 +2,13 @@
 """fleet_size.py — fleet-wide sizing orchestrator.
 
 Runs fleet-wide PHASES, not per-company loops: skip-check everyone (parallel
-ARM reads), launch all non-skipped (sequential), round-robin poll via
-instance-view reads (parallel, cheap — total wall time ≈ slowest company),
-then harvest. One broken company never kills the run: every company gets an
-outcome (sized | skipped-unchanged | no-vm | failed) and the script exits
-nonzero only after processing everyone.
+ARM reads), launch all non-skipped as detached LOCAL sizer processes
+(sequential launches; the sizers run concurrently — total wall time ≈
+slowest company), poll their .done files/pids, then harvest. One broken
+company never kills the run: every company gets an outcome
+(sized | skipped-unchanged | failed) and the script exits nonzero only after
+processing everyone. Detached sizers survive the harness dying; their work
+files are the rescue path.
 
 Subcommands:
   launch-all   phase 0 (skip check) + phase 1 (launch)
@@ -79,15 +81,12 @@ def cmd_launch_all(args) -> dict:
             except Exception as exc:  # noqa: BLE001
                 comp.update(phase="done", outcome="failed",
                             reason=f"copy-forward: {exc}")
-        elif not cfg.get("vm", {}).get("exists", False):
-            phases.update_status(root, slug, "no-vm",
-                                 "no VM discovered — flag the user, don't guess")
-            comp.update(phase="done", outcome="no-vm",
-                        reason="vm.exists=false in config.json")
         else:
             to_launch.append((slug, cfg))
 
-    # Phase 1 — sequential launches (~30s each; also serializes any shared VM)
+    # Phase 1 — sequential launches (a launch is a few ARM reads + spawning a
+    # detached process; the +60s propagation sleep only happens for SAs whose
+    # firewall needed our IP added)
     for slug, cfg in to_launch:
         comp = state["companies"][slug]
         try:
@@ -117,22 +116,12 @@ def cmd_poll_all(args) -> dict:
         pending = _in_flight(state)
         if not pending:
             break
-
-        def poll(slug):
-            try:
-                cfg = common.load_config(root, slug)
-                return slug, phases.poll_one(cfg, slug, dry_run=args.dry_run), None
-            except Exception as exc:  # noqa: BLE001
-                return slug, None, str(exc)
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(poll, pending))
-        for slug, res, err in results:
+        for slug in pending:  # local .done/pid checks — instant, no az calls
             comp = state["companies"][slug]
-            if err is not None:
-                comp["last_poll_error"] = err  # transient; keep polling
-                continue
+            res = phases.poll_one(root, slug, comp, dry_run=args.dry_run)
             comp["exec_state"] = res["state"]
+            if res["state"] == "Failed":
+                comp["exec_error"] = res.get("err", "")
             if res["state"] in phases.TERMINAL_STATES:
                 comp["phase"] = "terminal"
         phases.save_state(root, state)
@@ -158,8 +147,7 @@ def cmd_harvest(args) -> dict:
             continue
         try:
             cfg = common.load_config(root, slug)
-            res = phases.poll_one(cfg, slug, dry_run=args.dry_run)
-            phases.harvest_one(root, slug, cfg, comp, res, dry_run=args.dry_run)
+            phases.harvest_one(root, slug, cfg, comp, dry_run=args.dry_run)
             phases.update_status(root, slug, "sized")
             comp.update(phase="done", outcome="sized", reason=None)
         except Exception as exc:  # noqa: BLE001

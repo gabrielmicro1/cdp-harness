@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""corpus_sizer_rest.py — dependency-free per-source corpus sizer (VM-side).
+"""corpus_sizer_rest.py — dependency-free per-source corpus sizer (portable).
 
 Ported from the proven corpus-transfer-engine sizer (croplabel / webspiders /
 latchel runs). Uses ONLY the Python standard library plus a SAS token — no
-azure-storage-blob, no managed identity, no outbound internet (it only talks to
-the storage account). That makes it runnable on ANY corpus VM: a verify VM, an
-extract/transfer VM (which lack the SDK), or a bare box.
+azure-storage-blob, no managed identity, no SDKs. It only talks to the storage
+account, so it runs anywhere with HTTPS reach: this laptop (the harness
+default — phases.py launches it as a detached local process) or any VM.
 
 Env:
   SA                 storage account name
   CONTAINER          container name
   AZURE_STORAGE_SAS  a SAS with read+list (rl) on the account/container
   TAG                short label for output files (default: CONTAINER)
+  OUT_DIR            directory for output files (default /var/tmp)
   MAX_ZIP_ENTRIES    safety cap on entries parsed per zip (default 5_000_000)
 
-Writes on the VM:
-  /var/tmp/<TAG>.log           progress
-  /var/tmp/<TAG>.sizes.tsv     name<TAB>compressed<TAB>uncompressed<TAB>ratio<TAB>method
-  /var/tmp/<TAG>.summary       human per-datasource table + totals (decimal GB, /1e9)
-  /var/tmp/<TAG>.summary.json  compact machine summary (kept small so it fits the
-                               managed run-command instance-view 4KB output cap)
-  /var/tmp/<TAG>.done          written on clean completion
+Writes in OUT_DIR:
+  <TAG>.log           progress
+  <TAG>.sizes.tsv     name<TAB>compressed<TAB>uncompressed<TAB>ratio<TAB>method
+  <TAG>.summary       human per-datasource table + totals (decimal GB, /1e9)
+  <TAG>.summary.json  compact machine summary (what harvest reads)
+  <TAG>.done          written on clean completion
 
 Sizing (no bulk download — reads only indexes/trailers):
   .zip            -> End-of-Central-Directory + Central Directory via Range GETs
@@ -46,7 +46,7 @@ SAS = os.environ.get("AZURE_STORAGE_SAS") or os.environ["SAS"]
 TAG = os.environ.get("TAG", CONTAINER)
 MAX_ZIP_ENTRIES = int(os.environ.get("MAX_ZIP_ENTRIES", "5000000"))
 
-BASE = f"/var/tmp/{TAG}"
+BASE = os.path.join(os.environ.get("OUT_DIR", "/var/tmp"), TAG)
 LOG, OUT = f"{BASE}.log", f"{BASE}.sizes.tsv"
 SUMMARY, SUMMARY_JSON, DONE = f"{BASE}.summary", f"{BASE}.summary.json", f"{BASE}.done"
 
@@ -238,8 +238,8 @@ def write_summary(per, n, zero, errors, err_types, methods, dur_s):
         lines.append(f"{k:<22}{f_:>10}{gb(c_):>16.2f}{gb(u_):>18.2f}{r_:>9.3f}")
     with open(SUMMARY, "w") as f:
         f.write("\n".join(lines) + "\n")
-    # Compact machine summary — MUST stay well under the 4KB instance-view cap.
-    # src values are [files, compressed, uncompressed] arrays to save bytes.
+    # Compact machine summary — what phases.harvest_one reads.
+    # src values are [files, compressed, uncompressed] arrays.
     machine = {
         "sa": SA, "container": CONTAINER, "blobs": n, "comp": tc, "unc": tu,
         "zero": zero, "errors": errors, "err_types": err_types,

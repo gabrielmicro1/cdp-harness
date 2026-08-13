@@ -17,11 +17,10 @@ expected-data-sizes.json, status.json (runtime state — gitignored, local only)
    python3 scripts/discover_company.py <slug>
    ```
    This resolves the SA (RG name contains slug), container (`<slug>-raw`;
-   `-scrubbed` and `insights-logs-*` ignored), and VM (prefers `verify-vm-*`,
-   else any VM in the RG) and writes config.json.
-   - **`vm.exists: false` is normal (~40% of companies)** but means sizing is
-     impossible until a VM is started or provisioned. Warn the user plainly and
-     ask how they want to handle it — do NOT pick or start a VM yourself.
+   `-scrubbed` and `insights-logs-*` ignored), and VM info, and writes
+   config.json.
+   - The `vm` block is **informational only** — sizing runs locally and needs
+     no VM; `vm.exists: false` is normal (most companies) and blocks nothing.
    - A `container_warning` in the output means `<slug>-raw` doesn't exist yet —
      tell the user; the company may not be fully provisioned.
 

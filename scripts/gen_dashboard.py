@@ -107,8 +107,6 @@ def build(root: Path):
         if lr.get("outcome") == "failed":
             badges.append(f'<span class="badge b-err" title="{esc(lr.get("reason"))}"'
                           f'>run failed</span>')
-        if not s["config"].get("vm", {}).get("exists", False):
-            badges.append('<span class="badge b-err">no VM</span>')
         if s["stalled"] and stage != "stalled":
             badges.append('<span class="badge b-err">stalled</span>')
         if not s["expected_confirmed"]:
@@ -138,7 +136,6 @@ def build(root: Path):
             "uncompressed_total": s["uncompressed_total"],
             "delta_24h": d24, "eta": s["eta"], "stalled": s["stalled"],
             "last_outcome": lr.get("outcome"), "last_reason": lr.get("reason"),
-            "no_vm": not s["config"].get("vm", {}).get("exists", False),
         })
     body.append("</table>")
 

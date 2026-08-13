@@ -11,11 +11,13 @@ summary parsing, sizer summary compactness, and fleet_size.py --dry-run.
 from __future__ import annotations
 
 import json
+import os
 import py_compile
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -100,7 +102,7 @@ def main() -> int:
           str(summary["fleet_pct"]))
     check("dashboard lists both companies", len(summary["companies"]) == 2)
     empty = [c for c in summary["companies"] if c["slug"] == "emptyco"][0]
-    check("emptyco flagged no_vm", empty.get("no_vm") is True)
+    check("emptyco listed with no runs", empty.get("pct_complete") is None)
     dh = dash_out.read_text()
     check("dashboard links democo report",
           f"companies/democo/reports/{report_path.name}" in dh)
@@ -211,46 +213,85 @@ def main() -> int:
     finally:
         phases.read_used_capacity = real
 
-    print("\n— launch-output parsing + summary compactness —")
-    sample = 'Enable succeeded\npid=1234\nrc=0\n{"sa":"st","container":"c","blobs":5,"comp":10,"unc":20,"zero":0,"errors":0,"err_types":{},"methods":{"zip":5},"dur_s":3,"src":{"a":[5,10,20]}}'
-    parsed = phases._extract_summary_json(sample)
-    check("summary parses from instance-view output",
-          parsed is not None and parsed["unc"] == 20)
-    check("truncated output → None",
-          phases._extract_summary_json(sample[:-30]) is None)
-    run = phases.summary_to_run("democo", parsed, {"metric": 1, "metric_at": "t"},
-                                {}, [])
+    print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
+    summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
+               "comp": 10, "unc": 20, "zero": 0, "errors": 1,
+               "err_types": {"BadZipFile": 1}, "methods": {"zip": 5},
+               "dur_s": 3, "src": {"a": [5, 10, 20]}}
+    run = phases.summary_to_run("democo", summary,
+                                {"metric": 1, "metric_at": "t"}, [])
     check("summary_to_run totals", run["totals"]["uncompressed_bytes"] == 20
-          and run["sources"]["a"]["blob_count"] == 5)
-    big = {"sa": "storageaccount", "container": "slug-raw", "blobs": 10_900_000,
-           "comp": 2**43, "unc": 2**44, "zero": 12345,
-           "errors": 999, "err_types": {"BadZipFile": 900, "URLError": 99},
-           "methods": {"zip": 9_000_000, "gz": 100, "stored": 1_899_900},
-           "dur_s": 2700,
-           "src": {f"source-name-{i}": [123456, 2**40 + i, 2**41 + i]
-                   for i in range(30)}}
-    size = len(json.dumps(big, separators=(",", ":")))
-    check(f"30-source summary fits 4KB cap ({size}B)", size < 3500)
+          and run["sources"]["a"]["blob_count"] == 5
+          and run["errors"]["by_type"] == {"BadZipFile": 1})
+
+    fake_sizer = tmp / "fake_sizer.py"
+    fake_sizer.write_text(
+        "import json, os, time\n"
+        "out, tag = os.environ['OUT_DIR'], os.environ['TAG']\n"
+        "assert os.environ['AZURE_STORAGE_SAS'] == 'sig=fake'\n"
+        "base = os.path.join(out, tag)\n"
+        "open(base + '.log', 'w').write('start\\n')\n"
+        "time.sleep(1)\n"
+        f"json.dump({json.dumps(summary)}, open(base + '.summary.json', 'w'))\n"
+        "open(base + '.done', 'w').close()\n")
+    os.environ["CDP_SIZER_SCRIPT"] = str(fake_sizer)
+    removed = []
+    real_ensure, real_sas = phases.ip_rule_ensure, phases.mint_sas
+    real_remove = phases.ip_rule_remove_if_ours
+    try:
+        phases.ip_rule_ensure = lambda cfg, dry_run=False: (True, "1.2.3.4")
+        phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
+        phases.ip_rule_remove_if_ours = \
+            lambda cfg, ip, we, dry_run=False: removed.append((ip, we))
+        st = phases.launch(root, "democo", cfg)
+        check("launch detached with pid", st["phase"] == "launched"
+              and st["pid"] and st["we_added_ip"] is True)
+        res = phases.poll_one(root, "democo", st)
+        check("polls Running or already done",
+              res["state"] in ("Running", "Succeeded"))
+        deadline = time.time() + 15
+        while res["state"] not in phases.TERMINAL_STATES and time.time() < deadline:
+            time.sleep(0.3)
+            res = phases.poll_one(root, "democo", st)
+        check("reaches Succeeded via .done", res["state"] == "Succeeded")
+        n_runs_before = len(common.sizing_runs(root, "democo"))
+        run_path = phases.harvest_one(
+            root, "democo", cfg, {**st, "metric": 111, "metric_at": "m-t"})
+        harvested = common.read_json(run_path)
+        check("harvest writes run from summary.json",
+              harvested["method"] == "sized"
+              and harvested["totals"]["uncompressed_bytes"] == 20
+              and harvested["used_capacity_bytes"] == 111
+              and len(common.sizing_runs(root, "democo")) == n_runs_before + 1)
+        check("cleanup removed work files",
+              not list(phases.work_dir(root).glob("democo-sizer.*")))
+        check("cleanup removed only-ours IP rule", removed == [("1.2.3.4", True)])
+    finally:
+        phases.ip_rule_ensure, phases.mint_sas = real_ensure, real_sas
+        phases.ip_rule_remove_if_ours = real_remove
+        os.environ.pop("CDP_SIZER_SCRIPT", None)
 
     print("\n— fleet_size --dry-run —")
     proc = run_script("fleet_size.py", "launch-all", "--root", root,
                       "--dry-run", "--slugs", "democo", "emptyco",
                       expect_rc=0)
     out = proc.stdout
-    check("dry-run prints run-command create",
-          "az vm run-command create" in out and "--async-execution" in out)
+    check("dry-run prints local detached launch",
+          "corpus_sizer_rest.py" in out and "OUT_DIR" in out
+          and "detached" in out)
+    check("dry-run prints no VM commands", "run-command" not in out)
     check("dry-run prints SAS mint", "generate-sas" in out and "rl" in out)
     check("dry-run prints metrics read", "UsedCapacity" in out)
-    check("dry-run prints firewall conditional", "network-rule add" in out)
+    check("dry-run prints IP firewall conditional",
+          "network-rule add" in out and "--ip-address" in out)
     outcomes = json.loads(out[out.rindex('{\n  "started_at"'):])
-    check("emptyco outcome no-vm",
-          outcomes["outcomes"]["emptyco"]["outcome"] == "no-vm")
-    check("democo launched (no outcome yet)",
-          outcomes["outcomes"]["democo"]["outcome"] in (None, "failed") and
-          outcomes["outcomes"]["democo"].get("exec_state") is None)
+    check("both launched (no-vm outcome gone)",
+          all(outcomes["outcomes"][s]["outcome"] is None
+              for s in ("democo", "emptyco")))
     state = phases.load_state(root)
-    check("state file tracks democo launch",
-          state["companies"]["democo"]["phase"] == "launched")
+    check("state file tracks launches",
+          state["companies"]["democo"]["phase"] == "launched"
+          and state["companies"]["emptyco"]["phase"] == "launched")
     check("no real az was needed (dry-run)", True)
 
     shutil.rmtree(tmp)

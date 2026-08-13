@@ -11,9 +11,11 @@ fleet CLI with --slugs), so single-company and fleet behavior can never drift.
   size_company.py <slug> --dry-run
 
 Each invocation is bounded (default --max-wait 480s, under the 10-minute Bash
-timeout). For huge containers (blob COUNT drives runtime, ~3–4k blobs/sec —
-webspiders' 10.9M blobs ≈ 45 min) run `--phase poll` repeatedly across turns,
-then `--phase harvest`.
+timeout). The sizer runs locally as a detached process, so it survives between
+invocations. For huge containers (blob COUNT drives runtime; ~3–4k blobs/sec
+in-region, slower over the internet — webspiders' 10.9M blobs is hours, not
+minutes, locally) run `--phase poll` repeatedly across turns, then
+`--phase harvest`.
 """
 from __future__ import annotations
 

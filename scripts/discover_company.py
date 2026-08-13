@@ -4,9 +4,9 @@
 Discovery logic (from SIZING-SKILL.md Steps 0–1):
   SA:        first storage account whose resource group name contains the slug
   container: <slug>-raw (ignore -scrubbed and insights-logs-*); warn if absent
-  VM:        prefer verify-vm-*, else ANY VM in the SA's RG, else exists:false
-             (~40% of companies have no verify VM — that's normal, but a no-VM
-             company can't be sized until a VM is started/provisioned)
+  VM:        prefer verify-vm-*, else ANY VM in the SA's RG, else exists:false.
+             INFORMATIONAL ONLY — sizing runs locally on this machine; the vm
+             block is cached context (most companies have no VM, which is fine)
 
 Idempotent: re-running refreshes the cached discovery, preserving onboarded_at.
 Prints the resulting config as JSON on stdout; exits nonzero on failure
@@ -117,9 +117,8 @@ def main() -> int:
         (common.company_dir(args.root, args.slug) / "reports").mkdir(exist_ok=True)
     print(json.dumps(cfg, indent=2))
     if not cfg["vm"]["exists"]:
-        print(f"WARNING: no VM found in {cfg['resource_group']} — this company "
-              f"cannot be sized until a VM is started or provisioned (~40% of "
-              f"companies lack a verify VM; flag the user)", file=sys.stderr)
+        print(f"note: no VM in {cfg['resource_group']} (informational — "
+              f"sizing runs locally and does not need one)", file=sys.stderr)
     return 0
 
 
