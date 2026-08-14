@@ -898,7 +898,9 @@ def main() -> int:
                    "bytes": 7, "blob_count": 0, "entry_count": 1,
                    "path_bytes": 0, "zip_entry_bytes": 7,
                    "sources": {"a": 7}}},
-               "sources_l2": {"a/(files)": [5, 10, 20]}}
+               "sources_l2": {"a/(files)": [5, 10, 20]},
+               "gz": {"streamed": 2, "streamed_bytes": 900,
+                      "uncertain": 1, "uncertain_bytes": 100}}
     run = phases.summary_to_run("democo", summary,
                                 {"metric": 1, "metric_at": "t"}, [])
     check("summary_to_run totals", run["totals"]["uncompressed_bytes"] == 20
@@ -910,11 +912,15 @@ def main() -> int:
     old_run = phases.summary_to_run("democo",
                                     {k: v for k, v in summary.items()
                                      if k not in ("cache", "detected_services",
-                                                  "sources_l2")},
+                                                  "sources_l2", "gz")},
                                     {"metric": 1, "metric_at": "t"}, [])
     check("summary_to_run tolerates old summaries",
           old_run["cache"] is None and old_run["detected_services"] == {}
           and old_run["sources_l2"] == {})
+    check("summary_to_run gz passthrough",
+          run["gz"] == {"streamed": 2, "streamed_bytes": 900,
+                        "uncertain": 1, "uncertain_bytes": 100})
+    check("summary_to_run tolerates missing gz", old_run.get("gz") is None)
 
     fake_sizer = tmp / "fake_sizer.py"
     fake_sizer.write_text(
@@ -1013,10 +1019,31 @@ def main() -> int:
               cf2["detected_services"]["hubspot"]["bytes"] == 7
               and cf2["sources_l2"] == {"a/(files)": [5, 10, 20]}
               and cf2["cache"] is None)
+        check("copied-forward carries gz", cf2["gz"] == {
+            "streamed": 2, "streamed_bytes": 900,
+            "uncertain": 1, "uncertain_bytes": 100})
     finally:
         phases.ip_rule_ensure, phases.mint_sas = real_ensure, real_sas
         phases.ip_rule_remove_if_ours = real_remove
         os.environ.pop("CDP_SIZER_SCRIPT", None)
+
+    print("\n— reconcile: gz uncertainty notes —")
+    base_run = {"totals": {"compressed_bytes": 10, "uncompressed_bytes": 50},
+                "sources": {}, "methods": {"gz": 5},
+                "errors": {"total": 0, "by_type": {}}}
+    old_style = " ".join(reconcile.lore_notes(dict(base_run)))
+    check("old run: legacy qualitative gz note", "trailer" in old_style)
+    new_certain = dict(base_run, gz={"streamed": 5, "streamed_bytes": 1000,
+                                     "uncertain": 0, "uncertain_bytes": 0})
+    check("new run, all certain: no gz note",
+          "trailer" not in " ".join(reconcile.lore_notes(new_certain))
+          and "measur" not in " ".join(reconcile.lore_notes(new_certain)))
+    new_unc = dict(base_run, gz={"streamed": 1, "streamed_bytes": 10,
+                                 "uncertain": 3,
+                                 "uncertain_bytes": 7_500_000_000})
+    nn = " ".join(reconcile.lore_notes(new_unc))
+    check("new run: quantified note", "3" in nn and "7.5" in nn
+          and "measur" in nn)
 
     print("\n— fleet_size --dry-run —")
     proc = run_script("fleet_size.py", "launch-all", "--root", root,

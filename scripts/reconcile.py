@@ -114,7 +114,16 @@ def lore_notes(run: dict | None) -> list[str]:
             f"timestamps (e.g. a Google Takeout run), not source names — the "
             f"real sources are one level deeper. Consider re-splitting on the "
             f"second path segment before sharing per-source numbers.")
-    if run.get("methods", {}).get("gz", 0) > 0:
+    gzinfo = run.get("gz")
+    if gzinfo is not None:
+        if gzinfo.get("uncertain", 0) > 0:
+            notes.append(
+                f"{gzinfo['uncertain']} gz blob(s) "
+                f"({gzinfo['uncertain_bytes'] / 1e9:.1f} GB compressed) could "
+                f"not be measured from gzip trailers (>=4 GiB wrap or "
+                f"multi-member archives) — the true logical size may exceed "
+                f"the measured total.")
+    elif run.get("methods", {}).get("gz", 0) > 0:
         notes.append(
             ".tar.gz files are sized from the gzip trailer: exact below 4 GiB, "
             "floored at stored size above — multi-GB tarballs are a small, "
