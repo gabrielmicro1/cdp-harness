@@ -34,6 +34,8 @@ and summarize what needs attention. Then open `reports/index.html`.
 | **report-all** | Regenerates every company report plus `reports/index.html` — the internal fleet dashboard: progress bars, 24h deltas, ETAs, stage badges, stall/failure flags, links to the latest per-company reports. |
 | **verify-completion** | The sign-off checklist for a company that looks done: headline and per-service totals within tolerance (default 98%), zero-byte blob scan, unexpected-source scan, error review — plus a human-judgment pass over record-count services and overshoots before `stage: complete` is set. |
 | **daily-brief** | Composes all of the above into one conversational morning summary: fleet %, who moved in the last 24h, newly stalled companies, action items, ETAs at risk, top 3 things needing attention — and drafts (never sends) a Slack-voice nudge for each stalled company. |
+| **gcs-azure-transfer** | The ingest path: copies a Google Workspace Data Export bucket (GCS) into `<slug>-raw/workspace-export/` via a temporary same-region Azure VM running rclone in tmux. Five operations (setup / transfer / status / verify / teardown) that work standalone across days — Azure itself is the state (VM name + tags). Two human-in-the-loop pauses: the storage-firewall entry (internal UI only; same-region VMs need the service-endpoint vnet rule, not an IP rule) and the customer admin's Google OAuth token. |
+| **dropbox-azure-transfer** | Sibling of gcs-azure-transfer on the same engine: copies a Dropbox account (or folder) into `<slug>-raw/dropbox-export/` via VM `xfer-dbx-<slug>` — can run alongside a GCS transfer for the same company. Same five operations and pauses; Dropbox-tuned rclone defaults (rate-limit-friendly), no source-expiry clock. |
 
 ### What the sizing actually measures
 
@@ -86,7 +88,7 @@ blob *count*, not bytes.
 ```
 CLAUDE.md                    # the spec: architecture, schemas, operational model
 SIZING-SKILL.md              # original battle-tested sizing skill (source material)
-.claude/skills/              # judgment layer (7 skills, see table above)
+.claude/skills/              # judgment layer (9 skills, see table above)
 scripts/
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # skip-check / launch / poll / harvest / cleanup + stage transitions

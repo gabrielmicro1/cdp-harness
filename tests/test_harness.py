@@ -294,6 +294,83 @@ def main() -> int:
           and state["companies"]["emptyco"]["phase"] == "launched")
     check("no real az was needed (dry-run)", True)
 
+    print("\n— gcs_transfer --dry-run —")
+    proc = run_script("gcs_transfer.py", "plan", "democo",
+                      "--bucket", "dwt-takeout-export-123", "--root", root,
+                      "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("plan resolves dest from config",
+          plan["vm_name"] == "xfer-democo"
+          and plan["storage_account"] == "stdemoco"
+          and plan["dest"] == "democo-raw/workspace-export")
+    proc = run_script("gcs_transfer.py", "create-vm", "democo",
+                      "--bucket", "dwt-takeout-export-123", "--root", root,
+                      "--dry-run")
+    out = proc.stdout
+    check("create-vm: static Standard PIP + accel-net + delete options",
+          "--public-ip-sku Standard" in out
+          and "--accelerated-networking true" in out
+          and "--os-disk-delete-option Delete" in out)
+    check("create-vm: tags carry bucket for stateless rediscovery",
+          "gcs_bucket=dwt-takeout-export-123" in out)
+    check("create-vm surfaces the human network-rule step",
+          "internal" in out and "network-rule" in out)
+    proc = run_script("gcs_transfer.py", "write-azure-remote", "democo",
+                      "--root", root, "--dry-run")
+    check("azure remote: rwlc-class SAS, secrets redacted",
+          "--permissions racwl" in proc.stdout
+          and "redacted" in proc.stdout)
+    check("transfer path NEVER adds network rules",
+          "network-rule add" not in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "gcs_transfer.py"), "write-gcs-remote",
+         "democo", "--bucket", "dwt-takeout-export-123", "--root", str(root),
+         "--dry-run"],
+        input='{"access_token":"SECRETTOKEN"}', capture_output=True, text=True)
+    check("gcs remote: token never echoed",
+          proc.returncode == 0 and "SECRETTOKEN" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = run_script("gcs_transfer.py", "teardown", "democo", "--root", root,
+                      "--dry-run", expect_rc=2)
+    check("teardown refuses without --confirmed",
+          '"not-confirmed"' in proc.stdout)
+    proc = run_script("gcs_transfer.py", "teardown", "democo", "--root", root,
+                      "--dry-run", "--confirmed")
+    check("confirmed teardown deletes PIP + NSG + VNET explicitly",
+          "public-ip delete" in proc.stdout and "nsg delete" in proc.stdout
+          and "vnet delete" in proc.stdout)
+    check("teardown reminds about IP + vnet-rule removal",
+          "internal UI" in proc.stdout and "vnet-rule" in proc.stdout)
+
+    print("\n— dropbox_transfer --dry-run (shared engine, dropbox Spec) —")
+    proc = run_script("dropbox_transfer.py", "plan", "democo", "--root", root,
+                      "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("dropbox plan: xfer-dbx VM + dropbox-export dest + root source",
+          plan["vm_name"] == "xfer-dbx-democo"
+          and plan["dest"] == "democo-raw/dropbox-export"
+          and plan["source"] == "dropbox:")
+    proc = run_script("dropbox_transfer.py", "create-vm", "democo",
+                      "--path", "Team Folder", "--root", root, "--dry-run")
+    check("dropbox create-vm: own purpose + path tags, no name collision",
+          "purpose=dropbox-transfer" in proc.stdout
+          and "dropbox_path=Team Folder" in proc.stdout
+          and "-n xfer-dbx-democo" in proc.stdout)
+    proc = run_script("dropbox_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run")
+    check("dropbox transfer: rate-limit-friendly defaults",
+          "--transfers 8" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "dropbox_transfer.py"),
+         "write-dropbox-remote", "democo", "--root", str(root), "--dry-run"],
+        input='{"access_token":"DBXSECRET"}', capture_output=True, text=True)
+    check("dropbox token never echoed",
+          proc.returncode == 0 and "DBXSECRET" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = run_script("dropbox_transfer.py", "teardown", "democo",
+                      "--root", root, "--dry-run", expect_rc=2)
+    check("dropbox teardown also gated", '"not-confirmed"' in proc.stdout)
+
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]
     print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")

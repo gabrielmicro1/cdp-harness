@@ -40,7 +40,11 @@ it in place**. Its operational knowledge is restructured into
    state stays local, never in version control. *Why:* the client's container is
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
-   non-negotiable.
+   non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
+   skills (gcs, dropbox) *populate* `<slug>-raw` from a cloud source (rwlc
+   SAS, 21-day default) — they are the ingest path, not an audit path. They
+   only add blobs under their dest prefix and never modify or delete
+   existing data; everything else in the harness stays strictly read-only.
 
 4. **Failure isolation.** One broken company must never kill a fleet run. Every
    fleet operation wraps per-company work in try/except, collects a per-company
@@ -74,6 +78,10 @@ companies/                   # ALL runtime state; gitignored (local only)
   report-all/SKILL.md
   verify-completion/SKILL.md
   daily-brief/SKILL.md
+  gcs-azure-transfer/SKILL.md              # GCS export → <slug>-raw via transfer VM
+  gcs-azure-transfer/references/commands.md
+  dropbox-azure-transfer/SKILL.md          # Dropbox → <slug>-raw (same engine)
+  dropbox-azure-transfer/references/commands.md
 scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
@@ -82,6 +90,10 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   discover_company.py        # az discovery for onboarding → config.json
   size_company.py            # single-company sizing CLI (fleet of one)
   fleet_size.py              # fleet sizing CLI (launch-all / poll-all / harvest)
+  transfer_engine.py         # cloud→Azure transfer engine (VM, rclone, tmux)
+  gcs_transfer.py            # thin GCS CLI over transfer_engine (Spec only)
+  dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
+  bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
   verify_completion.py       # completion checklist
@@ -286,6 +298,42 @@ only the storage account), some have `vm-*-extract` / `vm-dwt-transfer`
 leftovers. `vm.exists: false` is normal and blocks nothing.
 
 ---
+
+### Cloud → Azure transfers (the ingest path)
+
+Some companies' corpora arrive in a cloud source we must pull ourselves:
+Google Workspace Data Export buckets (`dwt-takeout-export-<digits>`, browser
+OAuth by the customer's super admin only — no service accounts, no HMAC
+keys) or a Dropbox account. rclone-with-a-token on a temporary Azure VM is
+the viable path for both. `scripts/transfer_engine.py` is the ONE engine;
+`gcs_transfer.py` / `dropbox_transfer.py` are thin Spec-only CLIs over it,
+driven by the `gcs-azure-transfer` / `dropbox-azure-transfer` skills. The
+workflow: VM `xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, so both can run at
+once) in the company's RG and the SA's region, static Standard-SKU public IP
+(never deallocated before teardown), rclone copy in a tmux session into
+`<slug>-raw/workspace-export/` (Dropbox: `dropbox-export/`). Rules that
+differ from the sizing path — do not cross-contaminate:
+
+- **Network rules are HUMAN-ONLY for this path.** The transfer VM's IP is
+  added via the internal network-rules UI by the user; the harness never runs
+  `network-rule add` here (rules added outside the UI get stripped).
+  `phases.ip_rule_ensure` belongs to the sizing path only.
+- **SAS is `racwl`, 21-day default** (write path — the read-only `rl` policy
+  above is for sizing). Never revoked; lapses on its own.
+- **Secrets** (SAS URL, Google OAuth token) live only in the VM's
+  `~/.config/rclone/rclone.conf` (600) and die with the VM — never in files,
+  tags, logs, or argv on this machine.
+- **No state file** — Azure is the source of truth (VM name + tags carry
+  bucket/prefix); discovery reconstructs the phase. Transfer state never
+  touches `status.json`.
+- Export buckets expire ~60 days after export start (early packets sooner) —
+  the engagement has a clock.
+- **Same-region VMs can't be allowed by IP rule** (learned on song-division,
+  2026-08): Azure storage IP rules never match traffic from a VM in the SA's
+  own region — it arrives over the backbone with a private source address.
+  The transfer VM needs the `Microsoft.Storage` service endpoint on its
+  subnet + a vnet-rule on the SA. The laptop-based sizing path is unaffected
+  (external IP, IP rules work).
 
 ## Learned the hard way (from real croplabel / webspiders / latchel runs)
 
