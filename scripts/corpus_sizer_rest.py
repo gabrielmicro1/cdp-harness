@@ -321,10 +321,15 @@ EOCD64_STRUCT = "<IQHHIIQQQQ"
 CD_SIG = 0x02014b50
 
 
-def _parse_cd(cd, total_entries):
+def _parse_cd(cd, total_entries, matcher=None):
+    """Walk the central directory: sum uncompressed sizes and, when a matcher
+    is given, attribute matched entry paths to services (exact per-entry
+    usize — zero extra requests). Returns (total_uncomp, entries_seen, svc)
+    with svc = {service: [bytes, entry_count]}."""
     total_uncomp = 0
     n = 0
     p = 0
+    svc = {}
     cap = min(total_entries, MAX_ZIP_ENTRIES)
     sig = struct.pack("<I", CD_SIG)
     while p + 46 <= len(cd) and n < cap:
@@ -342,40 +347,49 @@ def _parse_cd(cd, total_entries):
                 xid, xlen = struct.unpack("<HH", ex[xp:xp + 4])
                 if xid == 0x0001:
                     zdata = ex[xp + 4:xp + 4 + xlen]
-                    zp = 0
-                    # order: usize, csize, lho, disk — usize first if it was 0xFFFFFFFF
-                    usize = struct.unpack("<Q", zdata[zp:zp + 8])[0]
+                    usize = struct.unpack("<Q", zdata[0:8])[0]
                     break
                 xp += 4 + xlen
+        if matcher is not None:
+            raw = cd[p + 46:name_end]
+            try:
+                ename = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                ename = raw.decode("cp437", errors="replace")
+            hit = match_path(ename, matcher)
+            if hit:
+                rec = svc.setdefault(hit, [0, 0])
+                rec[0] += usize
+                rec[1] += 1
         total_uncomp += usize
         n += 1
         p = extra_end + cmt_len
-    return total_uncomp, n
+    return total_uncomp, n, svc
 
 
-def zip_uncompressed(name, clen):
-    """Return (uncompressed_bytes, note). Range-reads only the EOCD + CD."""
+def zip_uncompressed(name, clen, matcher=None):
+    """Return (uncompressed_bytes, note, svc). Range-reads only EOCD + CD."""
     tail_size = min(clen, 65557)
     tail = fetch_range(name, clen - tail_size, clen - 1)
     idx = tail.rfind(struct.pack("<I", EOCD_SIG))
     if idx < 0:
-        return clen, "zip-no-eocd"
+        return clen, "zip-no-eocd", {}
     (_sig, _disk, _cds, _etd, total_entries, cd_size, cd_off, _cl) = struct.unpack(
         EOCD_STRUCT, tail[idx:idx + EOCD_SIZE])
     if total_entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF:
         loc_start = idx - LOC64_SIZE
         if loc_start < 0:
-            return clen, "zip-loc64-split"
+            return clen, "zip-loc64-split", {}
         (lsig, _ld, eocd64_off, _nd) = struct.unpack(LOC64_STRUCT, tail[loc_start:idx])
         if lsig != LOC64_SIG:
-            return clen, "zip-loc64-bad"
+            return clen, "zip-loc64-bad", {}
         e64 = fetch_range(name, eocd64_off, eocd64_off + 55)
         (_s64, _sz64, _v, _vn, _d64, _cds64, _etd64, total_entries,
          cd_size, cd_off) = struct.unpack(EOCD64_STRUCT, e64[:56])
     cd = fetch_range(name, cd_off, cd_off + cd_size - 1)
-    total_uncomp, n = _parse_cd(cd, total_entries)
+    total_uncomp, n, svc = _parse_cd(cd, total_entries, matcher)
     note = f"zip:{n}entries" if n == total_entries else f"zip:partial{n}/{total_entries}"
-    return total_uncomp, note
+    return total_uncomp, note, svc
 
 
 def gz_uncompressed(name, clen):
@@ -412,7 +426,7 @@ def enumerate_and_size():
                 try:
                     if lname.endswith(".zip"):
                         kind = "zip"
-                        uncomp, method = zip_uncompressed(name, clen)
+                        uncomp, method, _svc = zip_uncompressed(name, clen)
                     elif lname.endswith((".tar.gz", ".tgz", ".gz")):
                         kind = "gz"
                         uncomp, method = gz_uncompressed(name, clen)

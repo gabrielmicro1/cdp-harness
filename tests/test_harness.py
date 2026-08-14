@@ -10,14 +10,17 @@ summary parsing, sizer summary compactness, and fleet_size.py --dry-run.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import py_compile
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -287,6 +290,26 @@ def main() -> int:
     check("seed: keeps good zip row only", list(seed) == ["gdrive/a.zip"]
           and seed["gdrive/a.zip"] == ("0xAB", 123, 456, "zip:3entries", ""),
           str(seed))
+
+    print("\n— sizer: zip entry detection —")
+
+    def make_zip(entries):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for ename, size in entries.items():
+                z.writestr(ename, b"x" * size)
+        return buf.getvalue()
+
+    zb = make_zip({"hubspot/contacts.csv": 100, "misc/y.txt": 50})
+    eidx = zb.rfind(struct.pack("<I", 0x06054b50))
+    (_s, _d, _c1, _c2, n_ent, cd_size, cd_off, _cl) = struct.unpack(
+        "<IHHHHIIH", zb[eidx:eidx + 22])
+    tot, n, svc = sizer._parse_cd(zb[cd_off:cd_off + cd_size], n_ent,
+                                  sizer.build_matcher())
+    check("cd totals with names", tot == 150 and n == 2, f"{tot},{n}")
+    check("cd svc attribution", svc == {"hubspot": [100, 1]}, str(svc))
+    tot, n, svc = sizer._parse_cd(zb[cd_off:cd_off + cd_size], n_ent, None)
+    check("cd no matcher → no svc", tot == 150 and svc == {})
 
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
