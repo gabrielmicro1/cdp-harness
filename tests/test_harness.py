@@ -10,6 +10,7 @@ summary parsing, sizer summary compactness, and fleet_size.py --dry-run.
 """
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -310,6 +312,119 @@ def main() -> int:
     check("cd svc attribution", svc == {"hubspot": [100, 1]}, str(svc))
     tot, n, svc = sizer._parse_cd(zb[cd_off:cd_off + cd_size], n_ent, None)
     check("cd no matcher → no svc", tot == 150 and svc == {})
+
+    print("\n— sizer: offline end-to-end (fake container, cold then cached) —")
+    container = {
+        "gdrive/export.zip": make_zip({"docs/a.txt": 1000,
+                                       "hubspot/contacts.csv": 5000}),
+        "gdrive/plain.txt": b"y" * 200,
+        "slack/logs/day1.gz": gzip.compress(b"z" * 3000),
+        "rootfile.bin": b"r" * 50,
+    }
+    etags = {n: f"0x{i:02d}" for i, n in enumerate(sorted(container))}
+    counters = {"range_gets": 0}
+
+    def make_listing_xml(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        prefix = q.get("prefix", [""])[0]
+        delim = q.get("delimiter", [""])[0]
+        blobs, prefs, seen = [], [], set()
+        for n in sorted(n for n in container if n.startswith(prefix)):
+            rest = n[len(prefix):]
+            if delim and delim in rest:
+                p = prefix + rest.split(delim)[0] + delim
+                if p not in seen:
+                    seen.add(p)
+                    prefs.append(p)
+                continue
+            blobs.append(n)
+        parts = ["<EnumerationResults><Blobs>"]
+        for n in blobs:
+            parts.append(f"<Blob><Name>{n}</Name><Properties>"
+                         f"<Content-Length>{len(container[n])}</Content-Length>"
+                         f"<Etag>{etags[n]}</Etag></Properties></Blob>")
+        for p in prefs:
+            parts.append(f"<BlobPrefix><Name>{p}</Name></BlobPrefix>")
+        parts.append("</Blobs><NextMarker/></EnumerationResults>")
+        return "".join(parts).encode()
+
+    def fake_http(url, extra_headers=None):
+        if "comp=list" in url:
+            return make_listing_xml(url)
+        name = urllib.parse.unquote(
+            url.split("/fake-raw/", 1)[1].split("?", 1)[0])
+        data = container[name]
+        rng = (extra_headers or {}).get("Range")
+        if rng:
+            counters["range_gets"] += 1
+            a, b = rng[len("bytes="):].split("-")
+            return data[int(a):int(b) + 1]
+        return data
+
+    swork = tmp / "sizer-work"
+    swork.mkdir()
+    sizer_env = {"SA": "fakesa", "CONTAINER": "fake-raw", "SAS": "sig=x",
+                 "TAG": "fakeco-sizer", "OUT_DIR": str(swork),
+                 "EXPECTED_SERVICES": "gdrive,hubspot,slack",
+                 "SIZER_WORKERS": "4", "LIST_WORKERS": "2"}
+    os.environ.update(sizer_env)
+    os.environ.pop("CACHE_FILE", None)
+    os.environ.pop("SEED_TSV", None)
+    real_http = sizer.http_get
+    try:
+        sizer.http_get = fake_http
+        sizer.main()
+        s1 = json.loads((swork / "fakeco-sizer.summary.json").read_text())
+        check("cold run totals", s1["blobs"] == 4
+              and s1["unc"] == 6000 + 200 + 3000 + 50
+              and s1["zero"] == 0 and s1["errors"] == 0,
+              json.dumps(s1)[:300])
+        check("cold run sources", set(s1["src"]) == {"gdrive", "slack", "(root)"})
+        check("sources_l2 keys", set(s1["sources_l2"]) ==
+              {"gdrive/(files)", "slack/logs", "(root)"}, str(s1["sources_l2"]))
+        det = s1["detected_services"]
+        check("hubspot detected inside zip",
+              det["hubspot"]["bytes"] == 5000
+              and det["hubspot"]["entry_count"] == 1
+              and det["hubspot"]["zip_entry_bytes"] == 5000
+              and det["hubspot"]["sources"] == {"gdrive": 5000}, str(det))
+        check("gdrive path-detected (zip 6000 + plain 200)",
+              det["gdrive"]["bytes"] == 6200
+              and det["gdrive"]["path_bytes"] == 6200, str(det.get("gdrive")))
+        check("slack path-detected", det["slack"]["bytes"] == 3000)
+        check("cold cache stats", s1["cache"] == {"hits": 0, "misses": 2},
+              str(s1["cache"]))
+        check(".done and index written",
+              (swork / "fakeco-sizer.done").exists()
+              and (swork / "fakeco-sizer.index.tsv.gz").exists())
+        cold_ranges = counters["range_gets"]
+        check("cold run did range reads", cold_ranges > 0)
+
+        # ── warm run: seed CACHE_FILE from the produced index ──
+        cache_copy = tmp / "fakeco-index.tsv.gz"
+        shutil.copy(swork / "fakeco-sizer.index.tsv.gz", cache_copy)
+        for f in swork.glob("fakeco-sizer.*"):
+            f.unlink()
+        os.environ["CACHE_FILE"] = str(cache_copy)
+        counters["range_gets"] = 0
+        sizer.main()
+        s2 = json.loads((swork / "fakeco-sizer.summary.json").read_text())
+        check("warm run identical totals",
+              s2["unc"] == s1["unc"] and s2["src"] == s1["src"])
+        check("warm run all hits, zero range reads",
+              s2["cache"] == {"hits": 2, "misses": 0}
+              and counters["range_gets"] == 0,
+              f'{s2["cache"]} ranges={counters["range_gets"]}')
+        check("warm run keeps zip-entry detection (from cached det_json)",
+              s2["detected_services"]["hubspot"]["bytes"] == 5000,
+              str(s2["detected_services"].get("hubspot")))
+        tsv = (swork / "fakeco-sizer.sizes.tsv").read_text().rstrip("\n").split("\n")
+        check("tsv has 4 rows x 7 cols", len(tsv) == 4
+              and all(len(r.split("\t")) == 7 for r in tsv), tsv[0])
+    finally:
+        sizer.http_get = real_http
+        for k in list(sizer_env) + ["CACHE_FILE", "SEED_TSV"]:
+            os.environ.pop(k, None)
 
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,

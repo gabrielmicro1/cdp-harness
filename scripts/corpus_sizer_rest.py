@@ -22,10 +22,10 @@ Env:
 
 Writes in OUT_DIR:
   <TAG>.log           progress
-  <TAG>.sizes.tsv     name<TAB>compressed<TAB>uncompressed<TAB>ratio<TAB>method
+  <TAG>.sizes.tsv     name, clen, uncomp, ratio, method, etag, det_json
   <TAG>.summary       human per-datasource table + totals (decimal GB, /1e9)
   <TAG>.summary.json  compact machine summary (what harvest reads)
-  <TAG>.index.tsv.gz  incremental index (for future tasks)
+  <TAG>.index.tsv.gz  incremental index (cache seed for the next run)
   <TAG>.done          written on clean completion
 
 Sizing (no bulk download — reads only indexes/trailers):
@@ -40,13 +40,16 @@ Read-only; writes nothing back to the blob.
 import gzip
 import json
 import os
+import queue
 import re
 import struct
+import threading
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── config (import-safe: real values come from _init_from_env in main) ───────
 SA = CONTAINER = SAS = TAG = ""
@@ -80,8 +83,11 @@ def _init_from_env():
     DONE, INDEX = f"{BASE}.done", f"{BASE}.index.tsv.gz"
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def logmsg(m):
-    with open(LOG, "a") as f:
+    with _LOG_LOCK, open(LOG, "a") as f:
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} [{TAG}] {m}\n")
 
 
@@ -401,90 +407,248 @@ def gz_uncompressed(name, clen):
     return max(isize, clen), "gz-trailer"
 
 
-def enumerate_and_size():
-    open(OUT, "w").close()
-    per = defaultdict(lambda: [0, 0, 0])  # prefix -> [files, comp, uncomp]
-    err_types = defaultdict(int)          # exception class name -> count
-    methods = defaultdict(int)            # zip / gz / stored blob counts
-    marker = ""
-    n = 0
-    zero = 0
-    errors = 0
-    with open(OUT, "a", buffering=1) as tsv:
+def list_url(prefix=None, delimiter=None, marker=""):
+    url = (f"https://{SA}.blob.core.windows.net/{CONTAINER}"
+           f"?restype=container&comp=list&maxresults=5000")
+    if prefix:
+        url += "&prefix=" + urllib.parse.quote(prefix, safe="")
+    if delimiter:
+        url += "&delimiter=" + urllib.parse.quote(delimiter, safe="")
+    if marker:
+        url += "&marker=" + urllib.parse.quote(marker, safe="")
+    return url
+
+
+def discover_prefixes():
+    """Delimiter listing → (top-level prefixes, root-level blobs)."""
+    prefixes, root_blobs, marker = [], [], ""
+    while True:
+        blobs, prefs, marker = parse_list_page(
+            http_get(list_url(delimiter="/", marker=marker)))
+        prefixes += prefs
+        root_blobs += blobs
+        if not marker:
+            return prefixes, root_blobs
+
+
+def size_blob(name, clen, etag, kind, matcher):
+    """Worker-pool job. Never raises — failures become err:* rows (counted,
+    floored to stored size, never cached)."""
+    uncomp, method, svc, err = clen, "stored", {}, None
+    try:
+        if kind == "zip":
+            uncomp, method, svc = zip_uncompressed(name, clen, matcher)
+        elif kind == "gz":
+            uncomp, method = gz_uncompressed(name, clen)
+    except Exception as exc:  # noqa: BLE001
+        err = type(exc).__name__
+        method, uncomp = f"err:{err}", clen
+        logmsg(f"ERROR {name}: {err}: {str(exc)[:160]}")
+    return {"name": name, "clen": clen, "uncomp": uncomp, "method": method,
+            "kind": kind, "etag": etag, "svc": svc, "cached": False, "err": err}
+
+
+class Aggregator:
+    """Single-threaded consumer of sized-blob rows: writes the TSV and owns
+    every aggregate, so nothing here needs a lock."""
+
+    def __init__(self, tsv_path, matcher):
+        self.per = defaultdict(lambda: [0, 0, 0])   # top prefix
+        self.l2 = defaultdict(lambda: [0, 0, 0])    # second level
+        self.detected = {}
+        self.err_types = defaultdict(int)
+        self.methods = defaultdict(int)
+        self.index_rows = []
+        self.n = self.zero = self.errors = 0
+        self.cache_hits = self.cache_misses = 0
+        self.matcher = matcher
+        self.tsv = open(tsv_path, "w", buffering=1)
+
+    def _svc(self, svc):
+        return self.detected.setdefault(svc, {
+            "bytes": 0, "blob_count": 0, "entry_count": 0,
+            "path_bytes": 0, "zip_entry_bytes": 0, "sources": {}})
+
+    def add(self, r):
+        name, clen, uncomp = r["name"], r["clen"], r["uncomp"]
+        det_json = (json.dumps(r["svc"], separators=(",", ":"))
+                    if r["svc"] else "")
+        ratio = (uncomp / clen) if clen else 0.0
+        self.tsv.write(f"{name}\t{clen}\t{uncomp}\t{ratio:.3f}"
+                       f"\t{r['method']}\t{r['etag']}\t{det_json}\n")
+        top = name.split("/", 1)[0] if "/" in name else "(root)"
+        for agg in (self.per[top], self.l2[l2_key(name)]):
+            agg[0] += 1
+            agg[1] += clen
+            agg[2] += uncomp
+        self.methods[r["kind"]] += 1
+        self.n += 1
+        if clen == 0:
+            self.zero += 1
+        if r["err"]:
+            self.errors += 1
+            self.err_types[r["err"]] += 1
+        if r["cached"]:
+            self.cache_hits += 1
+        elif r["kind"] in CACHEABLE_KINDS:
+            self.cache_misses += 1
+        if r["kind"] in CACHEABLE_KINDS and not r["err"]:
+            self.index_rows.append(
+                (name, r["etag"], clen, uncomp, r["method"], det_json))
+        # detection — path layer attributes the whole blob to its (single,
+        # deepest-wins) match; zip-entry layer attributes per-entry bytes,
+        # skipping the blob's own path service (those bytes are already in).
+        path_hit = match_path(name, self.matcher)
+        if path_hit:
+            d = self._svc(path_hit)
+            d["bytes"] += uncomp
+            d["path_bytes"] += uncomp
+            d["blob_count"] += 1
+            d["sources"][top] = d["sources"].get(top, 0) + uncomp
+        for svc, (b, cnt) in (r["svc"] or {}).items():
+            if svc == path_hit:
+                continue
+            d = self._svc(svc)
+            d["bytes"] += b
+            d["zip_entry_bytes"] += b
+            d["entry_count"] += cnt
+            d["sources"][top] = d["sources"].get(top, 0) + b
+        if clen >= 1_000_000_000:
+            logmsg(f"  big: {name} comp={clen/1e9:.2f}GB "
+                   f"unc={uncomp/1e9:.2f}GB ({r['method']})")
+        if self.n % 5000 == 0:
+            logmsg(f"progress {self.n} blobs, errors={self.errors}, "
+                   f"cache_hits={self.cache_hits}")
+
+    def close(self):
+        self.tsv.close()
+
+
+def enumerate_and_size(cache, matcher):
+    """Prefix-parallel listing + pooled zip/gz reads + cache short-circuit.
+    A listing failure is fatal (raised after draining workers) — the partial
+    TSV stays behind as next launch's seed. Per-blob failures are just rows."""
+    agg = Aggregator(OUT, matcher)
+    results = queue.Queue(maxsize=10000)          # backpressure bound
+    inflight = threading.BoundedSemaphore(SIZER_WORKERS * 4)
+    stop = threading.Event()
+    size_pool = ThreadPoolExecutor(max_workers=SIZER_WORKERS)
+
+    def consume():
         while True:
-            url = (f"https://{SA}.blob.core.windows.net/{CONTAINER}"
-                   f"?restype=container&comp=list&maxresults=5000")
-            if marker:
-                url += "&marker=" + urllib.parse.quote(marker, safe="")
-            root = ET.fromstring(http_get(url))
-            for b in root.findall(".//Blob"):
-                name = b.findtext("Name") or ""
-                clen = int(b.findtext(".//Content-Length") or "0")
-                lname = name.lower()
-                uncomp, method = clen, "stored"
-                kind = "stored"
-                try:
-                    if lname.endswith(".zip"):
-                        kind = "zip"
-                        uncomp, method, _svc = zip_uncompressed(name, clen)
-                    elif lname.endswith((".tar.gz", ".tgz", ".gz")):
-                        kind = "gz"
-                        uncomp, method = gz_uncompressed(name, clen)
-                except Exception as exc:  # noqa: BLE001
-                    errors += 1
-                    err_types[type(exc).__name__] += 1
-                    method = f"err:{type(exc).__name__}"
-                    uncomp = clen
-                    logmsg(f"ERROR {name}: {type(exc).__name__}: {str(exc)[:160]}")
-                methods[kind] += 1
-                if clen == 0:
-                    zero += 1
-                ratio = (uncomp / clen) if clen else 0.0
-                tsv.write(f"{name}\t{clen}\t{uncomp}\t{ratio:.3f}\t{method}\n")
-                top = name.split("/", 1)[0] if "/" in name else "(root)"
-                rec = per[top]
-                rec[0] += 1
-                rec[1] += clen
-                rec[2] += uncomp
-                n += 1
-                if clen >= 1_000_000_000:
-                    logmsg(f"  big: {name} comp={clen/1e9:.2f}GB unc={uncomp/1e9:.2f}GB ({method})")
-                if n % 5000 == 0:
-                    logmsg(f"progress {n} blobs, errors={errors}")
-            marker = root.findtext("NextMarker") or ""
+            r = results.get()
+            if r is None:
+                return
+            agg.add(r)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+
+    def handle_blob(name, clen, etag):
+        kind = blob_kind(name)
+        if kind == "stored":
+            results.put({"name": name, "clen": clen, "uncomp": clen,
+                         "method": "stored", "kind": kind, "etag": etag,
+                         "svc": {}, "cached": False, "err": None})
+            return
+        hit = cache_lookup(cache, name, etag, clen)
+        if hit:
+            _etag, _clen, uncomp, method, det = hit
+            results.put({"name": name, "clen": clen, "uncomp": uncomp,
+                         "method": method, "kind": kind, "etag": etag,
+                         "svc": json.loads(det) if det else {},
+                         "cached": True, "err": None})
+            return
+        inflight.acquire()
+        fut = size_pool.submit(size_blob, name, clen, etag, kind, matcher)
+
+        def done(f):
+            inflight.release()
+            results.put(f.result())
+
+        fut.add_done_callback(done)
+
+    def list_prefix(prefix):
+        marker = ""
+        while not stop.is_set():
+            blobs, _, marker = parse_list_page(
+                http_get(list_url(prefix=prefix, marker=marker)))
+            for name, clen, etag in blobs:
+                handle_blob(name, clen, etag)
             if not marker:
-                break
-    return per, n, zero, errors, dict(err_types), dict(methods)
+                return
+
+    fatal = None
+    try:
+        prefixes, root_blobs = discover_prefixes()
+        for name, clen, etag in root_blobs:
+            handle_blob(name, clen, etag)
+        if prefixes:
+            logmsg(f"listing {len(prefixes)} top-level prefixes, "
+                   f"{LIST_WORKERS} listers, {SIZER_WORKERS} sizers, "
+                   f"cache={len(cache)} rows")
+            with ThreadPoolExecutor(
+                    max_workers=min(LIST_WORKERS, len(prefixes))) as listers:
+                futs = [listers.submit(list_prefix, p) for p in prefixes]
+                for fut in as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        stop.set()
+                        fatal = fatal or exc
+    except Exception as exc:  # noqa: BLE001 — discover_prefixes failed
+        stop.set()
+        fatal = fatal or exc
+    size_pool.shutdown(wait=True)
+    results.put(None)
+    consumer.join()
+    agg.close()
+    if fatal is not None:
+        raise fatal
+    return agg
 
 
-def write_summary(per, n, zero, errors, err_types, methods, dur_s):
+def write_summary(agg, dur_s):
     gb = lambda x: x / 1e9  # noqa: E731
-    tc = sum(v[1] for v in per.values())
-    tu = sum(v[2] for v in per.values())
+    tc = sum(v[1] for v in agg.per.values())
+    tu = sum(v[2] for v in agg.per.values())
     lines = [
         f"SA: {SA}",
         f"Container: {CONTAINER}",
-        f"Blobs: {n}",
+        f"Blobs: {agg.n}",
         f"Compressed:   {tc} bytes ({gb(tc):.2f} GB)",
         f"Uncompressed: {tu} bytes ({gb(tu):.2f} GB)",
         (f"Ratio: {tu / tc:.3f}" if tc else "Ratio: n/a"),
-        f"Errors: {errors}",
+        f"Errors: {agg.errors}",
+        f"Cache: {agg.cache_hits} hits, {agg.cache_misses} misses",
         "",
-        f"{'datasource':<22}{'files':>10}{'compressed_GB':>16}{'uncompressed_GB':>18}{'ratio':>9}",
+        f"{'datasource':<22}{'files':>10}{'compressed_GB':>16}"
+        f"{'uncompressed_GB':>18}{'ratio':>9}",
     ]
-    for k in sorted(per, key=lambda k: -per[k][2]):
-        f_, c_, u_ = per[k]
+    for k in sorted(agg.per, key=lambda k: -agg.per[k][2]):
+        f_, c_, u_ = agg.per[k]
         r_ = (u_ / c_) if c_ else 0.0
         lines.append(f"{k:<22}{f_:>10}{gb(c_):>16.2f}{gb(u_):>18.2f}{r_:>9.3f}")
+    if agg.detected:
+        lines.append("")
+        lines.append("detected services (path + zip-entry layers):")
+        for k, d in sorted(agg.detected.items(), key=lambda kv: -kv[1]["bytes"]):
+            lines.append(f"  {k:<20}{gb(d['bytes']):>10.2f} GB "
+                         f"(path {gb(d['path_bytes']):.2f} / "
+                         f"zip-entries {gb(d['zip_entry_bytes']):.2f})")
     with open(SUMMARY, "w") as f:
         f.write("\n".join(lines) + "\n")
-    # Compact machine summary — what phases.harvest_one reads.
-    # src values are [files, compressed, uncompressed] arrays.
     machine = {
-        "sa": SA, "container": CONTAINER, "blobs": n, "comp": tc, "unc": tu,
-        "zero": zero, "errors": errors, "err_types": err_types,
-        "methods": methods, "dur_s": round(dur_s),
-        "src": {k: v for k, v in sorted(per.items(), key=lambda kv: -kv[1][2])},
+        "sa": SA, "container": CONTAINER, "blobs": agg.n, "comp": tc, "unc": tu,
+        "zero": agg.zero, "errors": agg.errors,
+        "err_types": dict(agg.err_types), "methods": dict(agg.methods),
+        "dur_s": round(dur_s),
+        "src": {k: v for k, v in sorted(agg.per.items(),
+                                        key=lambda kv: -kv[1][2])},
+        "cache": {"hits": agg.cache_hits, "misses": agg.cache_misses},
+        "detected_services": {k: v for k, v in sorted(
+            agg.detected.items(), key=lambda kv: -kv[1]["bytes"])},
+        "sources_l2": rollup_l2(agg.l2),
     }
     with open(SUMMARY_JSON, "w") as f:
         json.dump(machine, f, separators=(",", ":"))
@@ -495,10 +659,16 @@ def main():
     _init_from_env()
     open(LOG, "w").close()
     t0 = time.time()
-    logmsg(f"start SA={SA} CONTAINER={CONTAINER} (stdlib+SAS)")
-    per, n, zero, errors, err_types, methods = enumerate_and_size()
-    write_summary(per, n, zero, errors, err_types, methods, time.time() - t0)
-    logmsg(f"size done blobs={n} errors={errors}")
+    cache = load_cache(CACHE_FILE)
+    cache.update(load_seed_tsv(SEED_TSV))
+    matcher = build_matcher(EXPECTED_SERVICES)
+    logmsg(f"start SA={SA} CONTAINER={CONTAINER} cache={len(cache)} rows "
+           f"workers={SIZER_WORKERS} (stdlib+SAS)")
+    agg = enumerate_and_size(cache, matcher)
+    write_summary(agg, time.time() - t0)
+    write_index(INDEX, agg.index_rows)
+    logmsg(f"size done blobs={agg.n} errors={agg.errors} "
+           f"cache hits={agg.cache_hits} misses={agg.cache_misses}")
     open(DONE, "w").close()
     print(open(SUMMARY).read())
 
