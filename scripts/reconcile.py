@@ -30,15 +30,24 @@ def _find_source(service: str, sources: dict) -> str | None:
     return None
 
 
+def _find_detected(service: str, detected: dict) -> dict | None:
+    n = norm(service)
+    for svc, d in detected.items():
+        if norm(svc) == n:
+            return d
+    return None
+
+
 def service_rows(expected: dict | None, run: dict | None) -> tuple[list[dict], list[str]]:
     """Per-service reconciliation rows + unexpected actual sources.
 
     Row: {service, declared_bytes, declared_records, actual_bytes,
           actual_compressed, blob_count, pct, flags[]}
-    Flags: record-count | declared-empty | zero-declared-has-data | overshoot
+    Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded
     """
     services = (expected or {}).get("services", {})
     sources = dict((run or {}).get("sources", {}))
+    detected = (run or {}).get("detected_services", {})
     rows = []
     matched = set()
     for svc, decl in services.items():
@@ -65,7 +74,16 @@ def service_rows(expected: dict | None, run: dict | None) -> tuple[list[dict], l
         elif row["declared_bytes"]:
             row["pct"] = row["actual_bytes"] / row["declared_bytes"] * 100
             if row["actual_bytes"] == 0:
-                row["flags"].append("declared-empty")
+                d = _find_detected(svc, detected)
+                if d and d.get("bytes", 0) > 0:
+                    # data exists, just inside another source's blobs
+                    row["flags"].append("found-embedded")
+                    row["embedded_bytes"] = d["bytes"]
+                    row["embedded_in"] = sorted(
+                        d.get("sources", {}),
+                        key=lambda s: -d["sources"][s])
+                else:
+                    row["flags"].append("declared-empty")
             elif row["pct"] > 100:
                 # overshoot is often a WRONG MANIFEST — commercially significant
                 row["flags"].append("overshoot")
@@ -106,6 +124,36 @@ def lore_notes(run: dict | None) -> list[str]:
             f"{badzip} BadZipFile error(s): corrupt or mislabeled .zip files "
             f"(common in scraped/backup trees), counted at stored size — "
             f"negligible impact.")
+    return notes
+
+
+UNDECLARED_NOTE_FLOOR = 1_000_000_000  # surface undeclared finds ≥1 GB only
+
+
+def detection_notes(rows: list[dict], expected: dict | None,
+                    run: dict | None) -> list[str]:
+    """Notes from the sizer's embedded-service detection: declared services
+    found inside other sources, and material undeclared discoveries."""
+    notes = []
+    for r in rows:
+        if "found-embedded" in r["flags"]:
+            hosts = ", ".join(r["embedded_in"][:3])
+            notes.append(
+                f"{r['service']} shows no top-level data, but "
+                f"~{r['embedded_bytes'] / 1e9:.1f} GB of {r['service']} data "
+                f"was detected inside {hosts} — likely exported within "
+                f"another service's archive.")
+    declared = {norm(s) for s in (expected or {}).get("services", {})}
+    tops = {norm(s) for s in (run or {}).get("sources", {})}
+    for svc, d in (run or {}).get("detected_services", {}).items():
+        if norm(svc) in declared or norm(svc) in tops:
+            continue
+        if d.get("bytes", 0) >= UNDECLARED_NOTE_FLOOR:
+            hosts = ", ".join(sorted(d.get("sources", {}),
+                                     key=lambda s: -d["sources"][s])[:3])
+            notes.append(
+                f"Detected ~{d['bytes'] / 1e9:.1f} GB of {svc} data under "
+                f"{hosts}; {svc} is not declared in the manifest.")
     return notes
 
 
@@ -197,6 +245,6 @@ def company_summary(root: Path, slug: str) -> dict:
         "days_since_change": days_since_change,
         "service_rows": rows,
         "unexpected_sources": unexpected,
-        "notes": lore_notes(latest),
+        "notes": lore_notes(latest) + detection_notes(rows, expected, latest),
         "expected_confirmed": bool((expected or {}).get("confirmed_by_user")),
     }

@@ -165,6 +165,67 @@ def main() -> int:
     check("passco marked complete",
           common.load_status(root, "passco")["stage"] == "complete")
 
+    print("\n— reconcile: embedded-service detection —")
+    embedco = root / "embedco"
+    (embedco / "sizing-runs").mkdir(parents=True)
+    common.write_json(embedco / "config.json", {
+        "slug": "embedco", "subscription": "m1 corpus", "subscription_id": "x",
+        "resource_group": "rg-embedco", "storage_account": "stembedco",
+        "container": "embedco-raw",
+        "vm": {"name": None, "resource_group": "rg-embedco", "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(embedco / "expected-data-sizes.json", {
+        "slug": "embedco", "manifest_total_bytes": 2_000_000_000_000,
+        "services": {"gdrive": {"bytes": 1_500_000_000_000},
+                     "hubspot": {"bytes": 500_000_000_000}},
+        "source": "test", "confirmed_by_user": True,
+        "created_at": "2026-08-01T00:00:00Z"})
+    common.write_json(embedco / "status.json", {
+        "slug": "embedco", "stage": "pushing",
+        "last_run": {"timestamp": "2026-08-13T09:00:00Z", "outcome": "sized",
+                     "reason": None},
+        "last_change_detected_at": "2026-08-13T09:00:00Z"})
+    common.write_json(embedco / "sizing-runs" / "20260813T100000Z.json", {
+        "slug": "embedco", "timestamp": "2026-08-13T10:00:00Z",
+        "method": "sized", "copied_from": None,
+        "used_capacity_bytes": 1_000_000_000_000,
+        "used_capacity_at": "2026-08-13T09:00:00Z", "duration_seconds": 60,
+        "totals": {"blob_count": 10, "compressed_bytes": 1_000_000_000_000,
+                   "uncompressed_bytes": 1_200_000_000_000,
+                   "zero_byte_blobs": 0},
+        "sources": {"workspace-export": {
+            "blob_count": 10, "compressed_bytes": 1_000_000_000_000,
+            "uncompressed_bytes": 1_200_000_000_000}},
+        "methods": {"zip": 10}, "errors": {"total": 0, "by_type": {}},
+        "cache": {"hits": 0, "misses": 10},
+        "detected_services": {
+            "hubspot": {"bytes": 400_000_000_000, "blob_count": 0,
+                        "entry_count": 12000, "path_bytes": 0,
+                        "zip_entry_bytes": 400_000_000_000,
+                        "sources": {"workspace-export": 400_000_000_000}},
+            "stripe": {"bytes": 5_000_000_000, "blob_count": 0,
+                       "entry_count": 40, "path_bytes": 0,
+                       "zip_entry_bytes": 5_000_000_000,
+                       "sources": {"workspace-export": 5_000_000_000}}},
+        "sources_l2": {"workspace-export/hubspot": [4, 0, 400_000_000_000]},
+        "notes": []})
+    es = reconcile.company_summary(root, "embedco")
+    eflags = {r["service"]: r["flags"] for r in es["service_rows"]}
+    erows = {r["service"]: r for r in es["service_rows"]}
+    check("hubspot found-embedded (not declared-empty)",
+          eflags["hubspot"] == ["found-embedded"], str(eflags))
+    check("embedded bytes + location recorded",
+          erows["hubspot"]["embedded_bytes"] == 400_000_000_000
+          and erows["hubspot"]["embedded_in"] == ["workspace-export"])
+    enotes = " ".join(es["notes"])
+    check("embedded note names hubspot + host",
+          "hubspot" in enotes and "workspace-export" in enotes, enotes)
+    check("undeclared stripe surfaced (≥1GB)", "stripe" in enotes, enotes)
+    proc = run_script("gen_report.py", "embedco", "--root", root)
+    ehtml = Path(proc.stdout.strip()).read_text()
+    check("report renders found-embedded badge",
+          "embedded in another source" in ehtml)
+
     print("\n— copied-forward + status transitions —")
     run_path = phases.write_copied_forward_run(root, "democo",
                                                1_564_500_000_000,
