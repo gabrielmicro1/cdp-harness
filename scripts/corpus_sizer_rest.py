@@ -19,6 +19,14 @@ Env:
   CACHE_FILE         optional cache file path (default "")
   SEED_TSV           optional seed TSV path (default "")
   EXPECTED_SERVICES  comma-separated service names (default "")
+  GZ_STREAM_THRESHOLD compressed-byte size at/above which a gz blob is always
+                      exact-streamed, regardless of trailer plausibility
+                      (default 256_000_000)
+  GZ_STREAM_FLOOR_MIN minimum compressed size before a floored/garbage-trailer
+                      gz blob is worth exact-streaming (default 8_000_000)
+  GZ_STREAM_BUDGET   per-run cap on compressed bytes spent exact-streaming gz
+                      blobs (default 50_000_000_000); 0 disables streaming
+                      entirely (and cache staleness re-checks with it)
 
 Writes in OUT_DIR:
   <TAG>.log           progress
@@ -35,8 +43,15 @@ Sizing (no bulk download — reads only indexes/trailers):
   .zip            -> End-of-Central-Directory + Central Directory via Range GETs
                      (ZIP64-aware); sum entry uncompressed sizes. NON-recursive.
   .gz/.tgz/.tar.gz-> 4-byte ISIZE trailer, floored at compressed size (exact
-                     <4 GiB, sane lower bound above). Never streams — so it
-                     stays fast on multi-GB backup tarballs.
+                     <4 GiB, sane lower bound above). Methods: gz-tiny (no
+                     trailer to read), gz-trailer (plausible), gz-floor
+                     (ISIZE < clen: wrap/multi-member/incompressible),
+                     gz-bad-trailer (ISIZE implausible vs DEFLATE's ~1032:1
+                     bound — corrupt/misnamed). Big or floored/garbage-trailer
+                     blobs are exact-streamed (decompressed member-by-member,
+                     counting output bytes) under a per-run byte budget —
+                     method becomes gz-exact; a failed stream falls back to
+                     the trailer value, counted uncertain. See GZ_STREAM_*.
   everything else -> uncompressed = content-length (accurate for loose files).
 Read-only; writes nothing back to the blob.
 """
@@ -63,12 +78,16 @@ SIZER_WORKERS = 16      # zip/gz range-read worker threads
 LIST_WORKERS = 8        # concurrent top-level-prefix listers
 CACHE_FILE = SEED_TSV = ""
 EXPECTED_SERVICES: tuple = ()
+GZ_STREAM_THRESHOLD = 256_000_000
+GZ_STREAM_FLOOR_MIN = 8_000_000
+GZ_STREAM_BUDGET = 50_000_000_000
 BASE = LOG = OUT = SUMMARY = SUMMARY_JSON = DONE = INDEX = ""
 
 
 def _init_from_env():
     global SA, CONTAINER, SAS, TAG, MAX_ZIP_ENTRIES, SIZER_WORKERS, LIST_WORKERS
     global CACHE_FILE, SEED_TSV, EXPECTED_SERVICES
+    global GZ_STREAM_THRESHOLD, GZ_STREAM_FLOOR_MIN, GZ_STREAM_BUDGET
     global BASE, LOG, OUT, SUMMARY, SUMMARY_JSON, DONE, INDEX
     SA = os.environ["SA"]
     CONTAINER = os.environ["CONTAINER"]
@@ -82,6 +101,9 @@ def _init_from_env():
     EXPECTED_SERVICES = tuple(
         s.strip() for s in os.environ.get("EXPECTED_SERVICES", "").split(",")
         if s.strip())
+    GZ_STREAM_THRESHOLD = int(os.environ.get("GZ_STREAM_THRESHOLD", "256000000"))
+    GZ_STREAM_FLOOR_MIN = int(os.environ.get("GZ_STREAM_FLOOR_MIN", "8000000"))
+    GZ_STREAM_BUDGET = int(os.environ.get("GZ_STREAM_BUDGET", "50000000000"))
     BASE = os.path.join(os.environ.get("OUT_DIR", "/var/tmp"), TAG)
     LOG, OUT = f"{BASE}.log", f"{BASE}.sizes.tsv"
     SUMMARY, SUMMARY_JSON = f"{BASE}.summary", f"{BASE}.summary.json"
@@ -552,6 +574,53 @@ class StreamBudget:
             return True
 
 
+def gz_stream_candidate(method, clen):
+    """Should this gz blob be stream-measured exactly? Big blobs always
+    (wrap risk); floored/garbage trailers above a small floor (multi-member
+    risk without letting thousands of tiny bgzip files eat the budget)."""
+    if GZ_STREAM_BUDGET <= 0:
+        return False
+    if clen >= GZ_STREAM_THRESHOLD:
+        return True
+    return method in ("gz-floor", "gz-bad-trailer") and clen >= GZ_STREAM_FLOOR_MIN
+
+
+def gz_cached_row_stale(method, clen, uncomp):
+    """Cache-migration rule: a cached gz row that is NOT gz-exact but that
+    the CURRENT trigger would stream must be re-measured (a one-time miss).
+    Pre-taxonomy rows say gz-trailer even when floored — uncomp == clen is
+    the tell. When streaming is disabled the row is never stale (re-reading
+    the trailer every run would gain nothing)."""
+    if GZ_STREAM_BUDGET <= 0 or method == "gz-exact":
+        return False
+    if clen >= GZ_STREAM_THRESHOLD:
+        return True
+    floored = method in ("gz-floor", "gz-bad-trailer") or uncomp == clen
+    return floored and clen >= GZ_STREAM_FLOOR_MIN
+
+
+def gz_uncertain_row(kind, method, clen):
+    """Rows whose logical size is not reliably measurable: floored/garbage
+    trailers, and plausible trailers big enough that a silent >=4GiB wrap is
+    possible. gz-exact and small plausible trailers are certain."""
+    if kind != "gz":
+        return False
+    if method in ("gz-floor", "gz-bad-trailer"):
+        return True
+    return method == "gz-trailer" and clen >= GZ_STREAM_THRESHOLD
+
+
+def _gz_stream_with_retry(name, attempts=3):
+    last = None
+    for i in range(attempts):
+        try:
+            return gz_stream_exact(name)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(1 + i)
+    raise last
+
+
 def list_url(prefix=None, delimiter=None, marker=""):
     url = (f"https://{SA}.blob.core.windows.net/{CONTAINER}"
            f"?restype=container&comp=list&maxresults=5000")
@@ -582,15 +651,22 @@ def discover_prefixes():
             return prefixes, root_blobs
 
 
-def size_blob(name, clen, etag, kind, matcher):
-    """Worker-pool job. Never raises — failures become err:* rows (counted,
-    floored to stored size, never cached)."""
+def size_blob(name, clen, etag, kind, matcher, budget=None):
+    """Worker-pool job. Never raises — failures become err:* rows, and a
+    failed exact-stream falls back to the trailer value (counted uncertain)."""
     uncomp, method, svc, err = clen, "stored", {}, None
     try:
         if kind == "zip":
             uncomp, method, svc = zip_uncompressed(name, clen, matcher)
         elif kind == "gz":
             uncomp, method = gz_uncompressed(name, clen)
+            if (budget is not None and gz_stream_candidate(method, clen)
+                    and budget.reserve(clen)):
+                try:
+                    uncomp, method = _gz_stream_with_retry(name), "gz-exact"
+                except Exception as exc:  # noqa: BLE001 — keep trailer value
+                    logmsg(f"stream fallback {name}: {type(exc).__name__}: "
+                           f"{str(exc)[:120]}")
     except Exception as exc:  # noqa: BLE001
         err = type(exc).__name__
         method, uncomp = f"err:{err}", clen
@@ -612,6 +688,8 @@ class Aggregator:
         self.index_rows = []
         self.n = self.zero = self.errors = 0
         self.cache_hits = self.cache_misses = 0
+        self.gz_streamed = self.gz_streamed_bytes = 0
+        self.gz_uncertain = self.gz_uncertain_bytes = 0
         self.matcher = matcher
         self.tsv = open(tsv_path, "w", buffering=1)
         self.tsv.write(f"#matcher\t{fingerprint}\n")
@@ -644,6 +722,13 @@ class Aggregator:
             self.cache_hits += 1
         elif r["kind"] in CACHEABLE_KINDS:
             self.cache_misses += 1
+        if r["kind"] == "gz":
+            if r["method"] == "gz-exact" and not r["cached"]:
+                self.gz_streamed += 1
+                self.gz_streamed_bytes += clen
+            if gz_uncertain_row(r["kind"], r["method"], clen):
+                self.gz_uncertain += 1
+                self.gz_uncertain_bytes += clen
         if r["kind"] in CACHEABLE_KINDS and not r["err"]:
             self.index_rows.append(
                 (name, r["etag"], clen, uncomp, r["method"], det_json))
@@ -689,6 +774,7 @@ def enumerate_and_size(cache, matcher):
     results = queue.Queue(maxsize=10000)          # backpressure bound
     inflight = threading.BoundedSemaphore(SIZER_WORKERS * 4)
     stop = threading.Event()
+    budget = StreamBudget(GZ_STREAM_BUDGET)
     size_pool = ThreadPoolExecutor(max_workers=SIZER_WORKERS)
     consumer_exc = []
 
@@ -716,6 +802,8 @@ def enumerate_and_size(cache, matcher):
                          "svc": {}, "cached": False, "err": None})
             return
         hit = cache_lookup(cache, name, etag, clen)
+        if hit and kind == "gz" and gz_cached_row_stale(hit[3], clen, hit[2]):
+            hit = None  # one-time re-measure under the current trigger
         if hit:
             _etag, _clen, uncomp, method, det = hit
             results.put({"name": name, "clen": clen, "uncomp": uncomp,
@@ -724,7 +812,7 @@ def enumerate_and_size(cache, matcher):
                          "cached": True, "err": None})
             return
         inflight.acquire()
-        fut = size_pool.submit(size_blob, name, clen, etag, kind, matcher)
+        fut = size_pool.submit(size_blob, name, clen, etag, kind, matcher, budget)
 
         def done(f):
             inflight.release()
@@ -791,6 +879,11 @@ def write_summary(agg, dur_s):
         f"{'datasource':<22}{'files':>10}{'compressed_GB':>16}"
         f"{'uncompressed_GB':>18}{'ratio':>9}",
     ]
+    if agg.gz_streamed or agg.gz_uncertain:
+        lines.insert(8, f"gz: {agg.gz_streamed} streamed exact "
+                        f"({agg.gz_streamed_bytes/1e9:.2f} GB), "
+                        f"{agg.gz_uncertain} uncertain "
+                        f"({agg.gz_uncertain_bytes/1e9:.2f} GB compressed)")
     for k in sorted(agg.per, key=lambda k: -agg.per[k][2]):
         f_, c_, u_ = agg.per[k]
         r_ = (u_ / c_) if c_ else 0.0
@@ -812,6 +905,10 @@ def write_summary(agg, dur_s):
         "src": {k: v for k, v in sorted(agg.per.items(),
                                         key=lambda kv: -kv[1][2])},
         "cache": {"hits": agg.cache_hits, "misses": agg.cache_misses},
+        "gz": {"streamed": agg.gz_streamed,
+               "streamed_bytes": agg.gz_streamed_bytes,
+               "uncertain": agg.gz_uncertain,
+               "uncertain_bytes": agg.gz_uncertain_bytes},
         "detected_services": {k: v for k, v in sorted(
             agg.detected.items(), key=lambda kv: -kv[1]["bytes"])},
         "sources_l2": rollup_l2(agg.l2),

@@ -672,6 +672,167 @@ def main() -> int:
         for k in list(sizer_env) + ["CACHE_FILE", "SEED_TSV"]:
             os.environ.pop(k, None)
 
+    print("\n— sizer: gz streaming end-to-end (trigger, budget, cache) —")
+    gzc = {
+        # floored (bgzip-style) 9000-logical, small clen -> floor-min trigger
+        "gz/a-multi.gz": gzip.compress(b"x" * 9000) + gzip.compress(b""),
+        # floored, second in listing order — budget will exclude it
+        "gz/b-multi.gz": gzip.compress(b"y" * 4000) + gzip.compress(b""),
+        # garbage trailer: gzip magic + junk + huge ISIZE; stream must FAIL -> fallback
+        "gz/c-junk.gz": b"\x1f\x8b" + b"\x00" * 60 + struct.pack("<I", 0xFFFFFFFF),
+        # plausible trailer, clen >= threshold -> streamed exact
+        # (30000 -> clen ~64, ratio ~469: safely under the 1032x bound)
+        "gz/d-big.gz": gzip.compress(b"z" * 30000),
+        # plausible trailer, below every trigger -> stays gz-trailer, certain
+        "gz/e-small.gz": gzip.compress(b"w" * 2000),
+    }
+    getags = {n: f"0xGZ{i:02d}" for i, n in enumerate(sorted(gzc))}
+    stream_calls = []
+
+    def gz_listing_xml(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        prefix = q.get("prefix", [""])[0]
+        delim = q.get("delimiter", [""])[0]
+        parts, seen = ["<EnumerationResults><Blobs>"], set()
+        for n in sorted(k for k in gzc if k.startswith(prefix)):
+            rest = n[len(prefix):]
+            if delim and delim in rest:
+                p = prefix + rest.split(delim)[0] + delim
+                if p not in seen:
+                    seen.add(p)
+                    parts.append(f"<BlobPrefix><Name>{p}</Name></BlobPrefix>")
+                continue
+            parts.append(f"<Blob><Name>{n}</Name><Properties>"
+                         f"<Content-Length>{len(gzc[n])}</Content-Length>"
+                         f"<Etag>{getags[n]}</Etag></Properties></Blob>")
+        parts.append("</Blobs><NextMarker/></EnumerationResults>")
+        return "".join(parts).encode()
+
+    def gz_http(url, extra_headers=None):
+        if "comp=list" in url:
+            return gz_listing_xml(url)
+        name = urllib.parse.unquote(url.split("/gz-raw/", 1)[1].split("?", 1)[0])
+        data = gzc[name]
+        rng = (extra_headers or {}).get("Range")
+        if rng:
+            a, bb = rng[len("bytes="):].split("-")
+            return data[int(a):int(bb) + 1]
+        return data
+
+    def gz_fake_stream(name, chunk=1 << 20):
+        stream_calls.append(name)
+        data = gzc[name]
+        for i in range(0, len(data), 13):
+            yield data[i:i + 13]
+
+    gzwork = tmp / "gz-work"
+    gzwork.mkdir()
+    candidates_clen = (len(gzc["gz/a-multi.gz"]) + len(gzc["gz/b-multi.gz"])
+                       + len(gzc["gz/c-junk.gz"]) + len(gzc["gz/d-big.gz"]))
+    gz_env = {"SA": "gzsa", "CONTAINER": "gz-raw", "SAS": "sig=g",
+              "TAG": "gzco-sizer", "OUT_DIR": str(gzwork),
+              "SIZER_WORKERS": "1", "LIST_WORKERS": "1",
+              "GZ_STREAM_THRESHOLD": str(len(gzc["gz/d-big.gz"])),
+              "GZ_STREAM_FLOOR_MIN": "1",
+              "GZ_STREAM_BUDGET": str(candidates_clen)}  # run 1: fits ALL
+    os.environ.update(gz_env)
+    for k in ("CACHE_FILE", "SEED_TSV", "EXPECTED_SERVICES"):
+        os.environ.pop(k, None)
+    real_http2, real_stream2 = sizer.http_get, sizer.stream_blob_chunks
+    try:
+        sizer.http_get = gz_http
+        sizer.stream_blob_chunks = gz_fake_stream
+
+        # ── run 1 (cold, budget fits all candidates) ──
+        # a-multi, b-multi: gz-floor (empty last member) -> streamed exact
+        # c-junk: gz-bad-trailer -> stream attempted 3x, zlib.error -> fallback
+        # d-big: gz-trailer with clen == threshold -> streamed exact
+        # e-small: gz-trailer below threshold -> untouched, certain
+        sizer.main()
+        g1 = json.loads((gzwork / "gzco-sizer.summary.json").read_text())
+        tsv = {ln.split("\t")[0]: ln.split("\t")
+               for ln in (gzwork / "gzco-sizer.sizes.tsv").read_text()
+               .rstrip("\n").split("\n")[1:]}
+        check("a-multi gz-exact 9000", tsv["gz/a-multi.gz"][4] == "gz-exact"
+              and tsv["gz/a-multi.gz"][2] == "9000")
+        check("b-multi gz-exact 4000", tsv["gz/b-multi.gz"][4] == "gz-exact"
+              and tsv["gz/b-multi.gz"][2] == "4000")
+        check("c-junk: 3 stream attempts then fallback",
+              stream_calls.count("gz/c-junk.gz") == 3
+              and tsv["gz/c-junk.gz"][4] == "gz-bad-trailer"
+              and tsv["gz/c-junk.gz"][2] == str(len(gzc["gz/c-junk.gz"])))
+        check("d-big gz-exact 30000", tsv["gz/d-big.gz"][4] == "gz-exact"
+              and tsv["gz/d-big.gz"][2] == "30000")
+        check("e-small stays gz-trailer, never streamed",
+              tsv["gz/e-small.gz"][4] == "gz-trailer"
+              and "gz/e-small.gz" not in stream_calls)
+        check("run1 gz stats", g1["gz"]["streamed"] == 3
+              and g1["gz"]["uncertain"] == 1
+              and g1["gz"]["uncertain_bytes"] == len(gzc["gz/c-junk.gz"]))
+
+        # ── warm run: gz-exact rows are permanent hits; the garbage blob is
+        # stale (bad-trailer meeting the trigger) and gets re-attempted ──
+        shutil.copy(gzwork / "gzco-sizer.index.tsv.gz", tmp / "gz-index.tsv.gz")
+        for f in gzwork.glob("gzco-sizer.*"):
+            f.unlink()
+        os.environ["CACHE_FILE"] = str(tmp / "gz-index.tsv.gz")
+        stream_calls.clear()
+        sizer.main()
+        g2 = json.loads((gzwork / "gzco-sizer.summary.json").read_text())
+        check("warm: only the garbage blob re-attempted",
+              set(stream_calls) == {"gz/c-junk.gz"}
+              and g2["cache"]["hits"] >= 3 and g2["gz"]["streamed"] == 0)
+
+        # ── budget starvation (cold, budget fits only a-multi; single worker
+        # makes reservation order = listing order a, b, c, d) ──
+        for f in gzwork.glob("gzco-sizer.*"):
+            f.unlink()
+        os.environ.pop("CACHE_FILE", None)
+        os.environ["GZ_STREAM_BUDGET"] = str(len(gzc["gz/a-multi.gz"]))
+        stream_calls.clear()
+        sizer.main()
+        g3 = json.loads((gzwork / "gzco-sizer.summary.json").read_text())
+        check("starved: one streamed, rest uncertain (b floor, c bad, d big)",
+              g3["gz"]["streamed"] == 1 and g3["gz"]["uncertain"] == 3)
+
+        # ── budget=0: streaming AND staleness off (no perpetual misses) ──
+        for f in gzwork.glob("gzco-sizer.*"):
+            f.unlink()
+        os.environ["CACHE_FILE"] = str(tmp / "gz-index.tsv.gz")  # run-1 index
+        os.environ["GZ_STREAM_BUDGET"] = "0"
+        stream_calls.clear()
+        sizer.main()
+        g4 = json.loads((gzwork / "gzco-sizer.summary.json").read_text())
+        check("budget=0: no streams, exact+bad rows all hit",
+              stream_calls == [] and g4["gz"]["streamed"] == 0
+              and g4["cache"]["hits"] >= 4)
+    finally:
+        sizer.http_get, sizer.stream_blob_chunks = real_http2, real_stream2
+        for k in list(gz_env) + ["CACHE_FILE", "SEED_TSV"]:
+            os.environ.pop(k, None)
+
+    # ── pure predicates (set globals directly; any later sizer.main() call
+    # re-runs _init_from_env, which resets them from env) ──
+    sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD, sizer.GZ_STREAM_FLOOR_MIN = 1, 100, 10
+    check("candidate: threshold", sizer.gz_stream_candidate("gz-trailer", 100))
+    check("candidate: floored above min", sizer.gz_stream_candidate("gz-floor", 10))
+    check("candidate: floored below min",
+          not sizer.gz_stream_candidate("gz-floor", 9))
+    check("candidate: plausible below threshold",
+          not sizer.gz_stream_candidate("gz-trailer", 99))
+    sizer.GZ_STREAM_BUDGET = 0
+    check("candidate: disabled", not sizer.gz_stream_candidate("gz-trailer", 100))
+    check("stale: disabled", not sizer.gz_cached_row_stale("gz-trailer", 500, 500))
+    sizer.GZ_STREAM_BUDGET = 1
+    check("stale: old-gen floored trailer row",
+          sizer.gz_cached_row_stale("gz-trailer", 50, 50))
+    check("stale: exact never", not sizer.gz_cached_row_stale("gz-exact", 500, 500))
+    check("stale: big plausible", sizer.gz_cached_row_stale("gz-trailer", 100, 300))
+    check("uncertain rows", sizer.gz_uncertain_row("gz", "gz-floor", 5)
+          and sizer.gz_uncertain_row("gz", "gz-trailer", 100)
+          and not sizer.gz_uncertain_row("gz", "gz-trailer", 99)
+          and not sizer.gz_uncertain_row("zip", "zip:3entries", 500))
+
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
                "comp": 10, "unc": 20, "zero": 0, "errors": 1,
