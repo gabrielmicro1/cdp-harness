@@ -425,7 +425,21 @@ Runtime ≈ listing time + (zip/gz misses × round-trip cost ÷ SIZER_WORKERS).
 
 ---
 
-## 10. Verifying and debugging
+## 10. History: the retired VM path
+
+Sizing originally ran on in-region VMs via `az vm run-command` (the
+`SIZING-SKILL.md` runbook, retired 2026-08 and preserved in git history along
+with the VM implementation — commit `c3ba27c` and earlier). If a container
+ever appears that is too slow to size over the internet, the facts you'd need
+to resurrect it: run-command allows ONE invocation at a time per VM (a
+VM-side sleep loop jams the slot — poll with instant scripts, wait locally);
+its instance-view output is capped at 4KB; the script and SAS travel
+base64-piped through the command; and an in-region VM cannot be allowed by
+an IP rule — it needs the `Microsoft.Storage` service endpoint on its subnet
+plus a vnet-rule on the storage account. ~40% of companies have no VM at all,
+so discovery (`config.json`'s `vm` block) never assumes one.
+
+## 11. Verifying and debugging
 
 - **Offline suite**: `python3 tests/test_harness.py` (161 checks, no Azure).
   The sizer sections monkeypatch `corpus_sizer_rest.http_get` with a fake
@@ -444,7 +458,7 @@ Runtime ≈ listing time + (zip/gz misses × round-trip cost ÷ SIZER_WORKERS).
   `--no-cache` for cache paranoia; delete `blob-index.tsv.gz` any time — the
   only cost is one full re-size.
 
-## 11. Invariants checklist for future modifications
+## 12. Invariants checklist for future modifications
 
 1. Sizer stays single-file, stdlib-only, import-safe (env read only in
    `_init_from_env`).

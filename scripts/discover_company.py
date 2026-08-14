@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """discover_company.py — Azure discovery for onboarding. Writes config.json.
 
-Discovery logic (from SIZING-SKILL.md Steps 0–1):
+Discovery logic (from the original sizing runbook, retired to git history):
   SA:        first storage account whose resource group name contains the slug
   container: <slug>-raw (ignore -scrubbed and insights-logs-*); warn if absent
   VM:        prefer verify-vm-*, else ANY VM in the SA's RG, else exists:false.

@@ -93,8 +93,9 @@ def service_rows(expected: dict | None, run: dict | None) -> tuple[list[dict], l
 
 
 def lore_notes(run: dict | None) -> list[str]:
-    """Interpretation notes carried from SIZING-SKILL.md, applied when the
-    run's data shows the pattern they explain."""
+    """Interpretation notes from the original sizing runs (now maintained in
+    size-company's sizing-lore.md), applied when the run's data shows the
+    pattern they explain."""
     if not run:
         return []
     notes = []

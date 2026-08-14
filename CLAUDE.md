@@ -6,10 +6,12 @@ in its own resource group, in the **"m1 corpus"** subscription). It measures wha
 each company has pushed, compares it to what they declared in their manifest, and
 produces reports. The single morning entry point is the **daily-brief** skill.
 
-`SIZING-SKILL.md` at the repo root is the original battle-tested sizing skill
-(croplabel / webspiders / latchel runs, 2026-07). It is **source material — leave
-it in place**. Its operational knowledge is restructured into
-`.claude/skills/size-company/` and this file.
+`docs/sizing-internals.md` is the mechanism-level walkthrough of the sizing
+pipeline — read it before modifying the sizer. The original battle-tested
+sizing runbook (`SIZING-SKILL.md`, croplabel / webspiders / latchel runs,
+2026-07) is retired: its knowledge lives in `.claude/skills/size-company/`,
+this file, and `docs/sizing-internals.md`; the runbook itself is preserved in
+git history.
 
 ---
 
@@ -59,7 +61,6 @@ it in place**. Its operational knowledge is restructured into
 
 ```
 CLAUDE.md                    # this file — the spec; keep it current
-SIZING-SKILL.md              # original sizing skill; source material, do not edit
 docs/sizing-internals.md     # mechanism-level walkthrough of the sizer (cache,
                              # concurrency, detection) — read before modifying it
 companies/                   # ALL runtime state; gitignored (local only)
@@ -288,7 +289,8 @@ in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
   managed run commands (create/show/delete, 4KB instance-view cap,
   one-invoke-at-a-time). If a VM path is ever needed again (e.g. a
   webspiders-scale container is too slow over the internet), recover it from
-  git history (commit c3ba27c and earlier) and SIZING-SKILL.md.
+  git history (commit c3ba27c and earlier; the retired SIZING-SKILL.md
+  runbook is preserved there too).
 
 ### Firewall (IP rules — conditional, only touch if needed)
 
