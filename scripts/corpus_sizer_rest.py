@@ -476,13 +476,29 @@ def zip_uncompressed(name, clen, matcher=None):
     return total_uncomp, note, svc
 
 
+DEFLATE_MAX_RATIO = 1032  # DEFLATE's hard compression bound — above = garbage
+
+
 def gz_uncompressed(name, clen):
-    """4-byte ISIZE trailer, floored at compressed size. Never streams."""
+    """4-byte ISIZE trailer (uncompressed length mod 2^32). Methods:
+      gz-trailer     plausible ISIZE — exact for single-member gzips < 4 GiB
+      gz-floor       ISIZE < clen: a >=4GiB wrap, a multi-member gzip (trailer
+                     covers only the LAST member; bgzip ends with an empty
+                     one), or incompressible data — floored to clen
+      gz-bad-trailer ISIZE > clen*1032 (DEFLATE cannot exceed ~1032:1) — a
+                     misnamed/corrupt .gz; floored to clen instead of
+                     reporting up to 4.29 GB of garbage
+      gz-tiny        clen < 4 — no trailer to read
+    Never streams; Task-3 streaming resolves floor/garbage cases exactly."""
     if clen < 4:
         return clen, "gz-tiny"
     trailer = fetch_range(name, clen - 4, clen - 1)
     isize = struct.unpack("<I", trailer[-4:])[0]
-    return max(isize, clen), "gz-trailer"
+    if isize > clen * DEFLATE_MAX_RATIO:
+        return clen, "gz-bad-trailer"
+    if isize < clen:
+        return clen, "gz-floor"
+    return isize, "gz-trailer"
 
 
 def list_url(prefix=None, delimiter=None, marker=""):

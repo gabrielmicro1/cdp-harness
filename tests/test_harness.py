@@ -413,6 +413,27 @@ def main() -> int:
     tot, n, svc = sizer._parse_cd(zb[cd_off:cd_off + cd_size], n_ent, None)
     check("cd no matcher → no svc", tot == 150 and svc == {})
 
+    print("\n— sizer: gz trailer taxonomy —")
+    real_fetch = sizer.fetch_range
+    try:
+        trailers = {}
+        sizer.fetch_range = lambda name, s, e: trailers[name]
+        trailers["a.gz"] = struct.pack("<I", 3000)
+        check("plausible trailer", sizer.gz_uncompressed("a.gz", 1000)
+              == (3000, "gz-trailer"))
+        trailers["b.gz"] = struct.pack("<I", 500)
+        check("floored trailer", sizer.gz_uncompressed("b.gz", 1000)
+              == (1000, "gz-floor"))
+        trailers["c.gz"] = struct.pack("<I", 0xFFFFFFFF)
+        check("garbage trailer (ratio > 1032x)",
+              sizer.gz_uncompressed("c.gz", 1000) == (1000, "gz-bad-trailer"))
+        trailers["d.gz"] = struct.pack("<I", 1032 * 1000)  # exactly at bound
+        check("exactly 1032x is allowed",
+              sizer.gz_uncompressed("d.gz", 1000) == (1032000, "gz-trailer"))
+        check("tiny", sizer.gz_uncompressed("e.gz", 3) == (3, "gz-tiny"))
+    finally:
+        sizer.fetch_range = real_fetch
+
     print("\n— sizer: offline end-to-end (fake container, cold then cached) —")
     container = {
         "gdrive/export.zip": make_zip({"docs/a.txt": 1000,
