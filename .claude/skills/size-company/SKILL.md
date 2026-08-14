@@ -9,9 +9,11 @@ Measures compressed + uncompressed size per source for `<slug>-raw`. The sizer
 runs **locally on this machine** as a detached background process — no VM
 involved (it reads only list pages, zip central directories, and gz trailers:
 kilobytes per blob). Everything is **read-only** against client storage
-(rl SAS, 1-day expiry; we never write blobs/tags/metadata). Output: a new
-`companies/<slug>/sizing-runs/<ts>.json` + updated status.json (gitignored
-runtime state — never committed).
+(rl SAS, 1-day expiry; we never write blobs/tags/metadata). Repeat runs are
+incremental: per-blob results are cached in `companies/<slug>/blob-index.tsv.gz`
+(ETag-validated), so an unchanged container costs only its listing time.
+Output: a new `companies/<slug>/sizing-runs/<ts>.json` + updated status.json
+(gitignored runtime state — never committed).
 
 Prereq: the company is onboarded (config.json exists). If not → onboard-company.
 
@@ -34,6 +36,13 @@ python3 scripts/size_company.py <slug> --phase poll --max-wait 480
 python3 scripts/size_company.py <slug> --phase harvest   # once terminal
 ```
 
+`--no-cache` forces a full re-size (use when numbers look suspicious and you
+want zero reuse). First run for a company has no cache — budget the full
+time; repeat runs skip the per-blob reads for every unchanged blob. Note
+editing a company's `expected-data-sizes.json` services also forces a full
+re-size automatically on the next run (the cache's matcher fingerprint no
+longer matches) — no `--no-cache` needed for that case.
+
 Never reimplement the phases in Bash — the deterministic logic lives in
 `scripts/phases.py` (see CLAUDE.md). Your job is orchestration + judgment.
 
@@ -50,6 +59,12 @@ Never reimplement the phases in Bash — the deterministic logic lives in
 - `sized` — fresh numbers. Sanity-check against the lore in
   [references/sizing-lore.md](references/sizing-lore.md) before presenting
   (store-mode zips, timestamp prefixes, tar.gz undercount, BadZipFile).
+  Check `cache.hits`/`cache.misses` in the run file — a warm run with
+  unexpected mass misses means the client re-uploaded (overwrote) blobs,
+  which is itself worth mentioning to the user. Check `detected_services`:
+  declared services found embedded inside another source (e.g. CRM exports
+  inside a Workspace/Takeout archive) are flagged `found-embedded` in
+  reports — present them as found, with their host prefix, not as missing.
 - `skipped-unchanged` — UsedCapacity metric matched the last run; a
   copied-forward run file was written. Expected on most days. Note the metric
   is account-level: a scrub-side write can force one redundant re-size (harmless).
@@ -73,8 +88,9 @@ Never reimplement the phases in Bash — the deterministic logic lives in
   yesterday), check the run's `errors.by_type` and the log tail before
   reporting; a burst of URLError/timeouts means the laptop's connection
   wobbled and sizes floored to stored — re-size rather than present those.
-- Per-blob detail (`<slug>-sizer.sizes.tsv`) sits in `companies/.sizer-work/`
-  until harvest cleans it up — copy it out before harvesting if the user
-  wants it.
+- Per-blob detail survives harvest in `companies/<slug>/blob-index.tsv.gz`
+  (zip/gz rows: name, etag, sizes, method, embedded-service hits). `zcat` it
+  for on-demand per-blob answers. Deleting the file is always safe — the next
+  run just does a full re-size.
 - Present sizes in decimal GB/TB (÷10⁹); mention the GiB mismatch only if the
   user compares against a pre-harness report.

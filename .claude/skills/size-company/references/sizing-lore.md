@@ -15,6 +15,8 @@ notes where detectable; this file is for explaining them to the user.
 - **Top-level prefix may be an export timestamp** (latchel `20260707T180401Z`,
   a Google Takeout run) rather than a source name — real sources are one level
   deeper. Say so when presenting; optionally re-split on the 2nd path segment.
+  `sources_l2` in the run file now records the second-level split
+  automatically — read it before manually re-splitting.
 - **`.tar.gz` is trailer-floored** (fast): exact <4 GiB, floored at compressed
   size above (gzip ISIZE is mod 2³²) — multi-GB DB-backup tarballs read as
   ~stored, a small undercount. The price of not streaming them for hours.
@@ -22,6 +24,14 @@ notes where detectable; this file is for explaining them to the user.
   scraped/backup trees); counted at stored size; negligible.
 - **Blob COUNT drives runtime, not bytes** (~3–4k blobs/sec): webspiders
   10.9M blobs ≈ 45 min; croplabel 806 ≈ 1 min; latchel 2,289 ≈ 2 min.
+- **Embedded services are real bytes:** zip central directories carry entry
+  names + exact uncompressed sizes; `detected_services` attributes them
+  (deepest path segment wins, so nothing double-counts within a service).
+  `found-embedded` on a declared service = the data arrived, wrapped in
+  another export.
+- **Cache hits are ETag-proof:** a warm run reuses per-blob numbers only when
+  name+ETag+size all match — overwritten blobs always re-size. Mass cache
+  misses on a warm run = the client re-uploaded, not a bug.
 
 ## Reconciling vs declared
 
@@ -35,6 +45,9 @@ notes where detectable; this file is for explaining them to the user.
   services + rounding) — headline % uses the manifest total.
 - **Overshoot (>100%)** often means a wrong manifest — commercially
   significant; raise it, don't bury it.
+- `found-embedded` replaces `declared-empty` when detection locates a
+  declared service inside another source; undeclared detections ≥1 GB get a
+  note — both are talking points, not alarms.
 
 ## Units and presentation
 

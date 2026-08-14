@@ -67,6 +67,8 @@ companies/                   # ALL runtime state; gitignored (local only)
     status.json              # lifecycle + last-run outcome (see schema)
     sizing-runs/             # one JSON per run, <YYYYMMDDTHHMMSSZ>.json
     reports/                 # per-company HTML reports + nudge drafts
+    blob-index.tsv.gz        # per-blob sizing cache (zip/gz rows, ETag-keyed);
+                             # rebuilt by each harvest — the incremental-run seed
   .fleet-state.json          # transient in-flight fleet state; gitignored
   .sizer-work/               # local sizer work files (<slug>-sizer.*); gitignored
 .claude/skills/              # the judgment layer
@@ -185,6 +187,16 @@ Cached so daily runs skip discovery entirely.
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
                                          // gz>0 triggers the tar.gz-undercount caveat in reports
   "errors": {"total": 3, "by_type": {"BadZipFile": 3}},
+  "cache": {"hits": 800, "misses": 6},   // null in copied-forward and pre-cache runs
+  "detected_services": {                 // path + zip-entry service detection (additive
+    "hubspot": {                         // lens — NEVER feeds the headline %)
+      "bytes": 400000000000, "blob_count": 0, "entry_count": 12000,
+      "path_bytes": 0, "zip_entry_bytes": 400000000000,
+      "sources": {"workspace-export": 400000000000}
+    }
+  },
+  "sources_l2": {"workspace-export/hubspot": [4, 0, 400000000000]}, // top-40 second-level
+                                         // [files, comp, unc] triples + "(other)" rollup
   "notes": []                            // free-form strings (e.g. truncation fallback used)
 }
 ```
@@ -232,7 +244,10 @@ in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
 - **Launch:** `phases.launch` starts `scripts/corpus_sizer_rest.py` as a
   **detached local process** (new session, stdin closed, output to
   `<tag>.stdout` — nohup-equivalent), wrapped in `caffeinate -i` on macOS so
-  the machine won't idle-sleep mid-run. Work files go to
+  the machine won't idle-sleep mid-run. It seeds the sizer from
+  `companies/<slug>/blob-index.tsv.gz` (`CACHE_FILE`) plus any crashed run's
+  partial TSV (renamed to `<tag>.seed.tsv`, passed as `SEED_TSV`), and passes
+  the declared service names as `EXPECTED_SERVICES`. Work files go to
   `companies/.sizer-work/<slug>-sizer.*` (gitignored). Belt-and-suspenders:
   if the harness/agent dies, the sizer keeps running and its work files remain
   as the manual rescue path. Stale work files are cleared before each launch
@@ -240,8 +255,21 @@ in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
 - **Poll:** `<tag>.done` exists → Succeeded; else pid alive → Running; else
   Failed (with the stdout tail as the reason). Instant, local, no az calls.
 - **Harvest:** read `<tag>.summary.json` directly, write the sizing-run file,
-  then cleanup (work files + only-ours firewall rule). No output caps, no
-  truncation fallbacks.
+  move the fresh `<tag>.index.tsv.gz` to `companies/<slug>/blob-index.tsv.gz`
+  (per-blob detail now SURVIVES harvest), then cleanup (remaining work files +
+  only-ours firewall rule). No output caps, no truncation fallbacks.
+- **Cache:** hits are ETag-validated (name+etag+size all must match — error
+  rows are never cached), `--no-cache` forces a full re-size. The index and
+  `sizes.tsv` both carry a `#matcher\t<fingerprint>` header line: the
+  fingerprint is derived from the declared service names, so editing a
+  company's `expected-data-sizes.json` services invalidates the whole cache on
+  the next run (full re-size) — intentional, so `detected_services` never goes
+  stale against a changed matcher.
+- **Listing:** the sizer runs prefix-parallel listing (`LIST_WORKERS`, default
+  8) and pooled zip/gz reads (`SIZER_WORKERS`, default 16). Prefix-parallel
+  listing only pays off when data spans multiple top-level prefixes — for a
+  wide-flat container (many top-level prefixes, each with few blobs) it costs
+  one extra listing request per prefix versus the old single marker walk.
 - **Caveats:** `caffeinate -i` does NOT survive a closed lid — keep the laptop
   open/awake for monster containers. A network drop mid-listing kills the run
   (per-blob read errors are merely counted; a listing error is fatal) —
@@ -372,6 +400,11 @@ Preserve these. They are why the code looks the way it does.
   services + rounding) — headline % uses the manifest total.
 - **Sources spanning orders of magnitude** (latchel: 476 MB → 2.6 TB) need a
   log x-axis or the small ones vanish.
+- **Detection is a lens, not a ledger:** `detected_services` (deepest-wins path
+  match + zip central-directory entry names) attributes bytes to services even
+  inside wrapper exports — but the headline % and per-source reconciliation
+  still run on `sources`. A declared service found only inside another
+  source's archives is flagged `found-embedded`, not `declared-empty`.
 
 ---
 
