@@ -252,6 +252,31 @@ def main() -> int:
     check("missing/corrupt cache → empty (fail-safe)",
           sizer.load_cache("") == {} and
           sizer.load_cache(str(tmp / "no-such-file.tsv.gz")) == {})
+
+    print("\n— sizer: service detection matching —")
+    m = sizer.build_matcher(("HubSpot", "My CRM"))
+    check("catalog alias matches", sizer.match_segment("Slack", m) == "slack")
+    check("token match in filename",
+          sizer.match_segment("slack-export-2026.zip", m) == "slack")
+    check("declared name wins with manifest spelling",
+          sizer.match_segment("hubspot", m) == "HubSpot"
+          and sizer.match_segment("my_crm", m) == "My CRM")
+    check("no false positive", sizer.match_segment("miscellaneous", m) is None)
+    check("deepest segment wins",
+          sizer.match_path("gdrive/hubspot/x.csv", m) == "HubSpot")
+    check("filename considered when deep",
+          sizer.match_path("a/b/c/d/slack-log.txt", m) == "slack")
+    check("depth cap: deep dir beyond 3 not matched",
+          sizer.match_path("a/b/c/hubspot/x.csv", m) is None)
+    check("l2_key shapes", sizer.l2_key("a/b/c.txt") == "a/b"
+          and sizer.l2_key("a/c.txt") == "a/(files)"
+          and sizer.l2_key("c.txt") == "(root)")
+    big = {f"top/d{i}": [1, 10, 100 + i] for i in range(45)}
+    rolled = sizer.rollup_l2(big, cap=40)
+    check("rollup keeps 40 + (other)", len(rolled) == 41
+          and "(other)" in rolled and rolled["(other)"][0] == 5
+          and rolled["(other)"][2] == sum(100 + i for i in range(5)),
+          str(rolled.get("(other)")))
     seed_path = tmp / "test-seed.tsv"
     seed_path.write_text(
         "gdrive/a.zip\t123\t456\t3.707\tzip:3entries\t0xAB\t\n"      # good

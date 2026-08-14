@@ -40,6 +40,7 @@ Read-only; writes nothing back to the blob.
 import gzip
 import json
 import os
+import re
 import struct
 import time
 import urllib.parse
@@ -196,6 +197,113 @@ def parse_list_page(xml_bytes):
                       b.findtext(".//Etag") or ""))
     prefixes = [p.findtext("Name") or "" for p in root.findall(".//BlobPrefix")]
     return blobs, prefixes, root.findtext("NextMarker") or ""
+
+
+# ── service detection ────────────────────────────────────────────────────────
+# Canonical service → normalized aliases. Aliases are deliberately specific
+# (no "mail", "code", "box" — too generic); a company's DECLARED services are
+# always added on top via build_matcher, so company-specific names match
+# regardless of this catalog.
+SERVICE_CATALOG = {
+    "gdrive": ("gdrive", "googledrive", "drive", "takeout"),
+    "gmail": ("gmail", "googlemail"),
+    "gcal": ("gcal", "googlecalendar"),
+    "slack": ("slack",),
+    "hubspot": ("hubspot",),
+    "salesforce": ("salesforce", "sfdc"),
+    "zendesk": ("zendesk",),
+    "notion": ("notion",),
+    "jira": ("jira",),
+    "confluence": ("confluence",),
+    "github": ("github",),
+    "gitlab": ("gitlab",),
+    "figma": ("figma",),
+    "asana": ("asana",),
+    "intercom": ("intercom",),
+    "stripe": ("stripe",),
+    "quickbooks": ("quickbooks",),
+    "dropbox": ("dropbox",),
+    "sharepoint": ("sharepoint",),
+    "onedrive": ("onedrive",),
+    "teams": ("msteams", "microsoftteams"),
+    "zoom": ("zoom",),
+    "linear": ("linear",),
+    "airtable": ("airtable",),
+}
+
+_NORM_RE = re.compile(r"[^a-z0-9]")
+_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def norm_seg(s):
+    """Same normalization convention as reconcile.norm (duplicated: the sizer
+    is standalone by design)."""
+    return _NORM_RE.sub("", s.lower())
+
+
+def build_matcher(declared=()):
+    """normalized alias → canonical name. Declared manifest services map to
+    the manifest's own spelling and override catalog aliases, so reconcile's
+    norm()-matching lines up exactly."""
+    m = {}
+    for canon, aliases in SERVICE_CATALOG.items():
+        for a in aliases:
+            m[a] = canon
+    for svc in declared:
+        n = norm_seg(svc)
+        if n:
+            m[n] = svc
+    return m
+
+
+def match_segment(seg, matcher):
+    n = norm_seg(seg)
+    if n in matcher:
+        return matcher[n]
+    for tok in _TOKEN_RE.split(seg.lower()):
+        if tok and tok in matcher:
+            return matcher[tok]
+    return None
+
+
+def match_path(path, matcher, max_depth=3):
+    """Deepest matching candidate wins — one service per path, so per-service
+    attribution stays disjoint. Candidates: first max_depth segments, plus
+    the filename when the path is deeper than max_depth."""
+    segs = [s for s in path.split("/") if s]
+    candidates = segs[:max_depth]
+    if len(segs) > max_depth:
+        candidates = candidates + [segs[-1]]
+    for seg in reversed(candidates):
+        hit = match_segment(seg, matcher)
+        if hit:
+            return hit
+    return None
+
+
+def l2_key(name):
+    segs = name.split("/")
+    if len(segs) >= 3:
+        return f"{segs[0]}/{segs[1]}"
+    if len(segs) == 2:
+        return f"{segs[0]}/(files)"
+    return "(root)"
+
+
+def rollup_l2(l2, cap=40):
+    """Top cap second-level prefixes by uncompressed bytes; rest → '(other)'.
+    Values are [files, comp, unc] triples."""
+    items = sorted(l2.items(), key=lambda kv: -kv[1][2])
+    out = {k: list(v) for k, v in items[:cap]}
+    rest = items[cap:]
+    if rest:
+        other = [0, 0, 0]
+        for _, v in rest:
+            other[0] += v[0]
+            other[1] += v[1]
+            other[2] += v[2]
+        out["(other)"] = other
+    return out
 
 
 def fetch_range(name, start, end):
