@@ -434,6 +434,39 @@ def main() -> int:
     finally:
         sizer.fetch_range = real_fetch
 
+    print("\n— sizer: gz exact streaming primitives —")
+    real_stream = sizer.stream_blob_chunks
+    try:
+        blobs = {}
+
+        def fake_stream(name, chunk=7):  # tiny chunks: exercise boundaries
+            data = blobs[name]
+            for i in range(0, len(data), chunk):
+                yield data[i:i + chunk]
+
+        sizer.stream_blob_chunks = fake_stream
+        blobs["multi.gz"] = gzip.compress(b"a" * 5000) + gzip.compress(b"b" * 7000)
+        check("multi-member exact sum", sizer.gz_stream_exact("multi.gz") == 12000)
+        blobs["bgzip.gz"] = gzip.compress(b"x" * 9000) + gzip.compress(b"")
+        check("bgzip-style empty EOF member", sizer.gz_stream_exact("bgzip.gz") == 9000)
+        blobs["trunc.gz"] = gzip.compress(b"y" * 5000)[:-8]
+        try:
+            sizer.gz_stream_exact("trunc.gz")
+            check("truncated stream raises", False)
+        except ValueError:
+            check("truncated stream raises", True)
+        blobs["junk.gz"] = b"\x00" * 64
+        try:
+            sizer.gz_stream_exact("junk.gz")
+            check("non-gzip bytes raise", False)
+        except Exception:
+            check("non-gzip bytes raise", True)
+    finally:
+        sizer.stream_blob_chunks = real_stream
+    b = sizer.StreamBudget(100)
+    check("budget reserve/deny", b.reserve(60) and not b.reserve(50)
+          and b.reserve(40) and not b.reserve(1) and b.used == 100)
+
     print("\n— sizer: offline end-to-end (fake container, cold then cached) —")
     container = {
         "gdrive/export.zip": make_zip({"docs/a.txt": 1000,

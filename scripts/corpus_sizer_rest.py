@@ -52,6 +52,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -499,6 +500,56 @@ def gz_uncompressed(name, clen):
     if isize < clen:
         return clen, "gz-floor"
     return isize, "gz-trailer"
+
+
+def stream_blob_chunks(name, chunk=1 << 20):
+    """Chunked GET of a whole blob. Deliberately separate from http_get
+    (which buffers entire bodies) — streaming holds one chunk in memory."""
+    req = urllib.request.Request(_auth(blob_base(name)),
+                                 headers={"x-ms-version": "2021-08-06"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        while True:
+            b = r.read(chunk)
+            if not b:
+                return
+            yield b
+
+
+def gz_stream_exact(name):
+    """Exact uncompressed size: stream-decompress every gzip member,
+    counting output bytes only (constant memory). Handles the two cases the
+    trailer cannot: >=4GiB wraps and multi-member/concatenated gzips.
+    Network cost = compressed size — paid once; the result is cached by
+    ETag as method gz-exact. Raises on truncated or non-gzip input."""
+    total = 0
+    d = zlib.decompressobj(wbits=31)  # 31 = gzip container
+    for chunk in stream_blob_chunks(name):
+        while chunk:
+            if d.eof:  # previous member finished — start the next
+                d = zlib.decompressobj(wbits=31)
+            total += len(d.decompress(chunk))
+            chunk = d.unused_data if d.eof else b""
+    if not d.eof:
+        raise ValueError("truncated gzip stream")
+    return total
+
+
+class StreamBudget:
+    """Per-run cap on compressed bytes downloaded for exact gz sizing.
+    reserve() BEFORE downloading so concurrent workers cannot overshoot;
+    no refunds on failure (conservative — bandwidth was likely spent)."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, n):
+        with self._lock:
+            if self.used + n > self.limit:
+                return False
+            self.used += n
+            return True
 
 
 def list_url(prefix=None, delimiter=None, marker=""):
