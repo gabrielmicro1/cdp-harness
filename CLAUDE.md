@@ -261,10 +261,15 @@ in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
 - **Cache:** hits are ETag-validated (name+etag+size all must match — error
   rows are never cached), `--no-cache` forces a full re-size. The index and
   `sizes.tsv` both carry a `#matcher\t<fingerprint>` header line: the
-  fingerprint is derived from the declared service names, so editing a
-  company's `expected-data-sizes.json` services invalidates the whole cache on
-  the next run (full re-size) — intentional, so `detected_services` never goes
-  stale against a changed matcher.
+  fingerprint is a hash of the ENTIRE built matcher (built-in
+  `SERVICE_CATALOG` aliases plus the company's declared service names), not
+  just the declared names — so editing a company's `expected-data-sizes.json`
+  services invalidates only that company's cache, but editing
+  `SERVICE_CATALOG` in a harness upgrade invalidates EVERY company's cache at
+  once (full re-size fleet-wide on the next run). Both are intentional, so
+  `detected_services` never goes stale against a changed matcher — but the
+  fleet-wide case is worth knowing about before a slow morning needs
+  explaining.
 - **Listing:** the sizer runs prefix-parallel listing (`LIST_WORKERS`, default
   8) and pooled zip/gz reads (`SIZER_WORKERS`, default 16). Prefix-parallel
   listing only pays off when data spans multiple top-level prefixes — for a
@@ -454,7 +459,8 @@ The detached-process design means a sizer can outlive a dead harness/agent.
 In `companies/.sizer-work/` (TAG = `<slug>-sizer`):
 
 - `$TAG.log` — timestamped progress (`progress N blobs, errors=M` every 5k)
-- `$TAG.sizes.tsv` — per-blob rows so far (`wc -l` ≈ blobs done)
+- `$TAG.sizes.tsv` — per-blob rows so far (`wc -l` ≈ blobs done **+ 1**: line 1
+  is the `#matcher\t<fingerprint>` header, not a data row)
 - `$TAG.stdout` — sizer stdout/stderr
 - `$TAG.summary` / `$TAG.summary.json` — written at the end
 - `$TAG.done` — exists only on clean completion
@@ -472,8 +478,11 @@ If the state file says `Failed` but `$TAG.done` exists, the sizer finished
 fine (the tracked pid was probably `caffeinate`'s) — just run harvest; it
 reads `$TAG.summary.json` directly. If nothing progresses, check the log tail
 for `403 AuthorizationFailure` (firewall/IP propagation — see above) before
-suspecting the SAS. Note harvest's cleanup deletes `$TAG.sizes.tsv` — copy it
-first if the per-blob detail matters.
+suspecting the SAS. Harvest's cleanup deletes `$TAG.sizes.tsv`, but zip/gz
+per-blob detail (the cacheable rows) survives it in
+`companies/<slug>/blob-index.tsv.gz` — only stored-blob rows (never cached,
+since their size comes free from the listing) are lost with the TSV, so copy
+`$TAG.sizes.tsv` first only if stored-blob-level detail matters.
 
 ## Offline validation
 

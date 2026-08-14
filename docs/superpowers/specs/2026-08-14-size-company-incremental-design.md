@@ -91,9 +91,12 @@ passed via env (`EXPECTED_SERVICES`, launch reads `expected-data-sizes.json`).
   summing). Entry path segments get the same matching; bytes are attributed
   per entry. Pure CPU — zero extra requests. This catches "CRM logs inside
   the Drive export zip."
-- **Run JSON:** `detected_services` maps service → `{uncompressed_bytes,
-  blob_count, entry_count, via}` where `via` records provenance
-  (`path` / `zip-entries`) and the hosting top-level source(s).
+- **Run JSON:** `detected_services` maps service → `{bytes, blob_count,
+  entry_count, path_bytes, zip_entry_bytes, sources}`, splitting the byte
+  total by detection layer (`path_bytes` from path-segment matches,
+  `zip_entry_bytes` from zip central-directory entry matches) plus a
+  `sources` map of hosting top-level prefix → bytes, rather than a single
+  `via` provenance field.
 - **Reconciliation (`reconcile.py`):** a declared service with 0 bytes at
   prefix level but present in `detected_services` gets a new
   `found-embedded` flag (with bytes and location) instead of a misleading
