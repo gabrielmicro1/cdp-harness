@@ -17,9 +17,13 @@ notes where detectable; this file is for explaining them to the user.
   deeper. Say so when presenting; optionally re-split on the 2nd path segment.
   `sources_l2` in the run file now records the second-level split
   automatically — read it before manually re-splitting.
-- **`.tar.gz` is trailer-floored** (fast): exact <4 GiB, floored at compressed
-  size above (gzip ISIZE is mod 2³²) — multi-GB DB-backup tarballs read as
-  ~stored, a small undercount. The price of not streaming them for hours.
+- **gz sizes are tiered:** `gz-exact` (streamed, exact — including
+  multi-member/bgzip files whose trailer only covers the last member),
+  `gz-trailer` (exact below 4 GiB for single-member files), `gz-floor` /
+  `gz-bad-trailer` (floored to compressed size; counted in the run's
+  `gz.uncertain*` fields and called out in reports). A misnamed `.gz` can
+  no longer overcount: trailers implying >1032× (DEFLATE's hard bound) are
+  rejected.
 - **`BadZipFile` errors** = corrupt/mislabeled `.zip` files (common in
   scraped/backup trees); counted at stored size; negligible.
 - **Blob COUNT drives runtime, not bytes** (~3–4k blobs/sec): webspiders

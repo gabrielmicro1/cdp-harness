@@ -33,7 +33,9 @@ sizer reads only:
 - for `.zip`: the End-of-Central-Directory record + the Central Directory,
   via 2–3 HTTP Range requests — the CD contains every entry's exact
   uncompressed size (and filename, which detection uses);
-- for `.gz`/`.tgz`/`.tar.gz`: the last 4 bytes (the gzip ISIZE trailer);
+- for `.gz`/`.tgz`/`.tar.gz`: the last 4 bytes (the gzip ISIZE trailer) first;
+  large or floored/implausible blobs get an exact streaming decompress
+  instead, under a per-run byte budget (§8, §9);
 - everything else ("stored"): nothing — uncompressed = `Content-Length`.
 
 So cost scales with **blob count** (HTTP round trips), not bytes. The two big
@@ -279,6 +281,14 @@ time, never correctness*:
    company's cache at once — the first fleet run after such a harness upgrade
    does full re-sizes fleet-wide. Both intentional; the second is worth
    remembering when a morning run is mysteriously slow.
+5. **gz staleness** (`gz_cached_row_stale`): a cached gz row that is not
+   `gz-exact` but that the *current* streaming trigger would now stream
+   (threshold/floor-min in effect this run) is re-measured once — a
+   deliberate one-time miss, not a bug. Pre-taxonomy cache rows report
+   `gz-trailer` even when floored; `uncompressed == compressed` is the tell
+   that catches those too. Disabled entirely when streaming is off
+   (`GZ_STREAM_BUDGET <= 0`) — re-reading the trailer every run would gain
+   nothing.
 
 Cache stats: `hits` = zip/gz served from cache; `misses` = zip/gz that needed
 a fetch (error rows count as misses); stored blobs count as neither. Mass
@@ -396,8 +406,16 @@ Consumers (all via `reconcile.company_summary` — nobody re-derives math):
 
 Sharp edges that are *by design* (don't "fix" without understanding):
 
-- **tar.gz trailer floor**: ISIZE is mod 2³², so >4 GiB gzips read as ~stored
-  size. Known undercount; the alternative is streaming for hours.
+- **gz trailer taxonomy**: `gz-trailer` (plausible ISIZE, exact below 4 GiB),
+  `gz-floor` (ISIZE < compressed size — a ≥4 GiB wrap or a multi-member/bgzip
+  file whose trailer only covers the last member), `gz-bad-trailer` (ISIZE
+  implies >1032:1, DEFLATE's hard bound — garbage, floored to compressed
+  size, no more silent overcounts). Large or floored/bad blobs get an exact
+  streaming decompress under a per-run byte budget and become `gz-exact`;
+  transport failures retry (re-reserving budget), decode failures are
+  terminal and fall back to the floored value. Whatever stays unmeasured
+  after the budget runs out is quantified, never silent, in the run's
+  `gz.uncertain` / `gz.uncertain_bytes` fields.
 - **Zips are non-recursive**: a zip inside a zip contributes its compressed
   size via the outer CD; nested contents are not expanded.
 - **`MAX_ZIP_ENTRIES` cap** (5M): a monster CD parses partially
@@ -420,8 +438,20 @@ Runtime ≈ listing time + (zip/gz misses × round-trip cost ÷ SIZER_WORKERS).
   the cache attack from both sides.
 - Warm run on unchanged container: listing time only; the offline test
   asserts literally zero range GETs.
-- Knobs (env): `SIZER_WORKERS`, `LIST_WORKERS`, `MAX_ZIP_ENTRIES`. Flags:
-  `--no-cache` (full re-size). None normally need touching.
+- Warm-run cost of a dump-heavy container = listing + budgeted streams, then
+  cached: the first run after a gz-heavy push pays for `gz-exact` streaming
+  up to `GZ_STREAM_BUDGET`; every subsequent run replays those rows from
+  cache at zero HTTP (until an ETag changes or the staleness rule in §5
+  re-triggers one).
+- Knobs (env): `SIZER_WORKERS`, `LIST_WORKERS`, `MAX_ZIP_ENTRIES`,
+  `GZ_STREAM_THRESHOLD` (compressed-byte size at/above which a gz blob is
+  always exact-streamed; default 256 MB), `GZ_STREAM_FLOOR_MIN` (minimum
+  compressed size before a floored/bad-trailer blob is worth streaming;
+  default 8 MB), `GZ_STREAM_BUDGET` (per-run cap on compressed bytes spent
+  exact-streaming gz; default 50 GB; `0` disables streaming entirely — every
+  floored/bad gz stays uncertain). Flags: `--no-cache` (full re-size). None
+  normally need touching; raise `GZ_STREAM_BUDGET` for a dump-heavy container
+  whose run shows a large `gz.uncertain_bytes`.
 
 ---
 

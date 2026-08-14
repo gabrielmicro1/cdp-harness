@@ -191,9 +191,13 @@ Cached so daily runs skip discovery entirely.
     "gdrive": {"blob_count": 400, "compressed_bytes": 1, "uncompressed_bytes": 2}
   },
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
-                                         // gz>0 triggers the tar.gz-undercount caveat in reports
+                                         // now tiered: gz-trailer/gz-floor/gz-bad-trailer/gz-exact
+                                         // (see "gz" below for the quantified undercount)
   "errors": {"total": 3, "by_type": {"BadZipFile": 3}},
   "cache": {"hits": 800, "misses": 6},   // null in copied-forward and pre-cache runs
+  "gz": {"streamed": 2, "streamed_bytes": 900000000000,   // exact-streamed gz blobs
+         "uncertain": 1, "uncertain_bytes": 5000000000},  // trailer-unmeasurable
+                                         // (compressed bytes); null in old runs
   "detected_services": {                 // path + zip-entry service detection (additive
     "hubspot": {                         // lens — NEVER feeds the headline %)
       "bytes": 400000000000, "blob_count": 0, "entry_count": 12000,
@@ -275,7 +279,8 @@ in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
   once (full re-size fleet-wide on the next run). Both are intentional, so
   `detected_services` never goes stale against a changed matcher — but the
   fleet-wide case is worth knowing about before a slow morning needs
-  explaining.
+  explaining. Cached gz rows that the current streaming trigger covers but
+  that aren't `gz-exact` are re-measured once (a deliberate one-time miss).
 - **Listing:** the sizer runs prefix-parallel listing (`LIST_WORKERS`, default
   8) and pooled zip/gz reads (`SIZER_WORKERS`, default 16). Prefix-parallel
   listing only pays off when data spans multiple top-level prefixes — for a
@@ -392,10 +397,14 @@ Preserve these. They are why the code looks the way it does.
   *timestamp* (latchel `20260707T180401Z`, a Google Takeout run), not a source
   name — real sources are one level deeper. Reports must say so; optionally
   re-split on the 2nd path segment.
-- **tar.gz is trailer-floored:** the sizer reads the 4-byte gzip ISIZE trailer
-  — exact below 4 GiB, floored at compressed size above (ISIZE is mod 2³²). So
-  multi-GB DB-backup tarballs read as ~stored size: a small, known undercount,
-  the price of not streaming them for hours.
+- **gz trailers lie two ways:** ISIZE is mod 2³² (≥4 GiB logical wraps —
+  sometimes undetectably) and covers only the LAST member of concatenated/
+  bgzip files; garbage trailers on misnamed .gz would overcount up to
+  4.29 GB each (DEFLATE's 1032:1 bound now rejects them). Large or floored
+  gz blobs are stream-measured exactly (GZ_STREAM_THRESHOLD 256 MB /
+  GZ_STREAM_FLOOR_MIN 8 MB, GZ_STREAM_BUDGET 50 GB compressed per run,
+  0=off), cached forever by ETag; whatever stays unmeasured is quantified
+  in the run's `gz.uncertain*` fields, never silent.
 - **BadZipFile errors** = corrupt/mislabeled `.zip` files (common in scraped/
   backup trees); counted at stored size; negligible.
 - **Blob COUNT drives runtime, not bytes:** ~3–4k blobs/sec *in-region*.

@@ -58,13 +58,17 @@ Never reimplement the phases in Bash — the deterministic logic lives in
 
 - `sized` — fresh numbers. Sanity-check against the lore in
   [references/sizing-lore.md](references/sizing-lore.md) before presenting
-  (store-mode zips, timestamp prefixes, tar.gz undercount, BadZipFile).
+  (store-mode zips, timestamp prefixes, gz size tiers, BadZipFile).
   Check `cache.hits`/`cache.misses` in the run file — a warm run with
   unexpected mass misses means the client re-uploaded (overwrote) blobs,
   which is itself worth mentioning to the user. Check `detected_services`:
   declared services found embedded inside another source (e.g. CRM exports
   inside a Workspace/Takeout archive) are flagged `found-embedded` in
   reports — present them as found, with their host prefix, not as missing.
+  Check `gz.uncertain` in the run file — nonzero means some gz logical sizes
+  are floors, not measurements; for a dump-heavy container raise
+  `GZ_STREAM_BUDGET` (compressed bytes; the streams are one-time, cached by
+  ETag) and re-size.
 - `skipped-unchanged` — UsedCapacity metric matched the last run; a
   copied-forward run file was written. Expected on most days. Note the metric
   is account-level: a scrub-side write can force one redundant re-size (harmless).
