@@ -51,7 +51,8 @@ class Spec:
                  loc_tag: str, loc_argname: str, loc_required: bool,
                  default_dest_prefix: str, authorize_target: str,
                  remote_type: str, extra_rclone_flags: str = "",
-                 default_transfers: int = 32, default_checkers: int = 64):
+                 default_transfers: int = 32, default_checkers: int = 64,
+                 remote_extra: str = "", extra_cli_opts: list | None = None):
         self.source_name = source_name          # rclone remote name ("gcs")
         self.vm_prefix = vm_prefix              # "xfer-" / "xfer-dbx-"
         self.purpose = purpose                  # purpose=<...> tag
@@ -64,6 +65,11 @@ class Spec:
         self.extra_rclone_flags = extra_rclone_flags
         self.default_transfers = default_transfers
         self.default_checkers = default_checkers
+        self.remote_extra = remote_extra        # fixed conf lines ("scope = …")
+        # Optional source-specific settings that flow CLI flag → VM tag →
+        # rclone.conf key (e.g. gdrive --team-drive). Each entry:
+        # {"flag", "argname", "tag", "conf_key", "help"}
+        self.extra_cli_opts = extra_cli_opts or []
 
     def vm_name(self, slug: str) -> str:
         return f"{self.vm_prefix}{slug}"
@@ -74,7 +80,7 @@ class Spec:
 
     def remote_section(self, token_json: str) -> str:
         return (f"[{self.source_name}]\ntype = {self.remote_type}\n"
-                f"token = {token_json}\n")
+                + self.remote_extra + f"token = {token_json}\n")
 
 
 # ── ssh plumbing ─────────────────────────────────────────────────────────────
@@ -273,6 +279,10 @@ def cmd_create_vm(spec: Spec, root: Path, args) -> dict:
                    f"{spec.loc_tag}={loc}",
                    f"dest_container={cfg['container']}",
                    f"dest_prefix={args.dest_prefix}"]
+    for opt in spec.extra_cli_opts:  # e.g. gdrive team-drive id → tag
+        val = getattr(args, opt["argname"], None)
+        if val:
+            create_args.append(f"{opt['tag']}={val}")
     if region and not region.startswith("("):
         create_args += ["--location", region]
     proc = common.run_az(create_args, dry_run=args.dry_run, timeout=900,
@@ -380,6 +390,11 @@ def cmd_write_source_remote(spec: Spec, root: Path, args) -> dict:
                 "stdin was not valid JSON — paste exactly the token block "
                 "between the ---> markers from `rclone authorize`")
     section = spec.remote_section(" ".join(token.split()))
+    for opt in spec.extra_cli_opts:  # flag wins, else the VM tag from create
+        val = (getattr(args, opt["argname"], None)
+               or vm["tags"].get(opt["tag"]))
+        if val:
+            section += f"{opt['conf_key']} = {val}\n"
     write_conf_section(vm["public_ip"], spec.source_name, section,
                        dry_run=args.dry_run)
     src = spec.source_ref(loc)
@@ -600,6 +615,9 @@ def main(spec: Spec, doc: str) -> int:
     p.add_argument(loc_flag, dest=spec.loc_argname, default=None,
                    help="source location (required for plan/create-vm if the "
                         "source needs one; later read from VM tags)")
+    for opt in spec.extra_cli_opts:
+        p.add_argument(opt["flag"], dest=opt["argname"], default=None,
+                       help=opt["help"])
     p.add_argument("--rg", help="override VM resource group "
                                "(default: company's RG)")
     p.add_argument("--vm-size", default="Standard_D8s_v7")

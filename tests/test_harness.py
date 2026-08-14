@@ -851,6 +851,42 @@ def main() -> int:
                       "--root", root, "--dry-run", expect_rc=2)
     check("dropbox teardown also gated", '"not-confirmed"' in proc.stdout)
 
+    print("\n— gdrive_transfer --dry-run (shared engine, gdrive Spec) —")
+    import gdrive_transfer  # noqa: E402  (scripts/ already on sys.path)
+    section = gdrive_transfer.SPEC.remote_section('{"t":1}')
+    check("gdrive remote section: drive type + scope + token",
+          "type = drive" in section and "scope = drive" in section
+          and 'token = {"t":1}' in section)
+    proc = run_script("gdrive_transfer.py", "plan", "democo", "--root", root,
+                      "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("gdrive plan: xfer-gdr VM + gdrive-export dest + root source",
+          plan["vm_name"] == "xfer-gdr-democo"
+          and plan["dest"] == "democo-raw/gdrive-export"
+          and plan["source"] == "gdrive:")
+    proc = run_script("gdrive_transfer.py", "create-vm", "democo",
+                      "--path", "Corp Docs", "--team-drive", "0AAbCdEfGh",
+                      "--root", root, "--dry-run")
+    check("gdrive create-vm: purpose + path + team-drive tags",
+          "purpose=gdrive-transfer" in proc.stdout
+          and "gdrive_path=Corp Docs" in proc.stdout
+          and "gdrive_team_drive=0AAbCdEfGh" in proc.stdout
+          and "-n xfer-gdr-democo" in proc.stdout)
+    proc = run_script("gdrive_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run")
+    check("gdrive transfer: throttled defaults",
+          "--transfers 8" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "gdrive_transfer.py"),
+         "write-gdrive-remote", "democo", "--root", str(root), "--dry-run"],
+        input='{"access_token":"GDRSECRET"}', capture_output=True, text=True)
+    check("gdrive token never echoed",
+          proc.returncode == 0 and "GDRSECRET" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = run_script("gdrive_transfer.py", "teardown", "democo",
+                      "--root", root, "--dry-run", expect_rc=2)
+    check("gdrive teardown also gated", '"not-confirmed"' in proc.stdout)
+
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]
     print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")
