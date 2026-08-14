@@ -213,6 +213,25 @@ def main() -> int:
     finally:
         phases.read_used_capacity = real
 
+    print("\n— sizer: import-safety + listing parse —")
+    # Import must not require env vars (module was previously KeyError-on-import).
+    import corpus_sizer_rest as sizer  # noqa: E402
+    page = (b"<EnumerationResults><Blobs>"
+            b"<Blob><Name>gdrive/a.zip</Name><Properties>"
+            b"<Content-Length>123</Content-Length><Etag>0xAB</Etag>"
+            b"</Properties></Blob>"
+            b"<BlobPrefix><Name>gdrive/</Name></BlobPrefix>"
+            b"</Blobs><NextMarker>tok</NextMarker></EnumerationResults>")
+    blobs, prefixes, marker = sizer.parse_list_page(page)
+    check("parse_list_page blobs incl etag",
+          blobs == [("gdrive/a.zip", 123, "0xAB")], str(blobs))
+    check("parse_list_page prefixes", prefixes == ["gdrive/"], str(prefixes))
+    check("parse_list_page marker", marker == "tok")
+    check("blob_kind", sizer.blob_kind("A.ZIP") == "zip"
+          and sizer.blob_kind("x.tar.gz") == "gz"
+          and sizer.blob_kind("x.tgz") == "gz"
+          and sizer.blob_kind("x.bin") == "stored")
+
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
                "comp": 10, "unc": 20, "zero": 0, "errors": 1,

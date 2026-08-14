@@ -14,12 +14,18 @@ Env:
   TAG                short label for output files (default: CONTAINER)
   OUT_DIR            directory for output files (default /var/tmp)
   MAX_ZIP_ENTRIES    safety cap on entries parsed per zip (default 5_000_000)
+  SIZER_WORKERS      zip/gz range-read worker threads (default 16)
+  LIST_WORKERS       concurrent top-level-prefix listers (default 8)
+  CACHE_FILE         optional cache file path (default "")
+  SEED_TSV           optional seed TSV path (default "")
+  EXPECTED_SERVICES  comma-separated service names (default "")
 
 Writes in OUT_DIR:
   <TAG>.log           progress
   <TAG>.sizes.tsv     name<TAB>compressed<TAB>uncompressed<TAB>ratio<TAB>method
   <TAG>.summary       human per-datasource table + totals (decimal GB, /1e9)
   <TAG>.summary.json  compact machine summary (what harvest reads)
+  <TAG>.index.tsv.gz  incremental index (for future tasks)
   <TAG>.done          written on clean completion
 
 Sizing (no bulk download — reads only indexes/trailers):
@@ -40,15 +46,36 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
-SA = os.environ["SA"]
-CONTAINER = os.environ["CONTAINER"]
-SAS = os.environ.get("AZURE_STORAGE_SAS") or os.environ["SAS"]
-TAG = os.environ.get("TAG", CONTAINER)
-MAX_ZIP_ENTRIES = int(os.environ.get("MAX_ZIP_ENTRIES", "5000000"))
+# ── config (import-safe: real values come from _init_from_env in main) ───────
+SA = CONTAINER = SAS = TAG = ""
+MAX_ZIP_ENTRIES = 5_000_000
+SIZER_WORKERS = 16      # zip/gz range-read worker threads
+LIST_WORKERS = 8        # concurrent top-level-prefix listers
+CACHE_FILE = SEED_TSV = ""
+EXPECTED_SERVICES: tuple = ()
+BASE = LOG = OUT = SUMMARY = SUMMARY_JSON = DONE = INDEX = ""
 
-BASE = os.path.join(os.environ.get("OUT_DIR", "/var/tmp"), TAG)
-LOG, OUT = f"{BASE}.log", f"{BASE}.sizes.tsv"
-SUMMARY, SUMMARY_JSON, DONE = f"{BASE}.summary", f"{BASE}.summary.json", f"{BASE}.done"
+
+def _init_from_env():
+    global SA, CONTAINER, SAS, TAG, MAX_ZIP_ENTRIES, SIZER_WORKERS, LIST_WORKERS
+    global CACHE_FILE, SEED_TSV, EXPECTED_SERVICES
+    global BASE, LOG, OUT, SUMMARY, SUMMARY_JSON, DONE, INDEX
+    SA = os.environ["SA"]
+    CONTAINER = os.environ["CONTAINER"]
+    SAS = os.environ.get("AZURE_STORAGE_SAS") or os.environ["SAS"]
+    TAG = os.environ.get("TAG", CONTAINER)
+    MAX_ZIP_ENTRIES = int(os.environ.get("MAX_ZIP_ENTRIES", "5000000"))
+    SIZER_WORKERS = int(os.environ.get("SIZER_WORKERS", "16"))
+    LIST_WORKERS = int(os.environ.get("LIST_WORKERS", "8"))
+    CACHE_FILE = os.environ.get("CACHE_FILE", "")
+    SEED_TSV = os.environ.get("SEED_TSV", "")
+    EXPECTED_SERVICES = tuple(
+        s.strip() for s in os.environ.get("EXPECTED_SERVICES", "").split(",")
+        if s.strip())
+    BASE = os.path.join(os.environ.get("OUT_DIR", "/var/tmp"), TAG)
+    LOG, OUT = f"{BASE}.log", f"{BASE}.sizes.tsv"
+    SUMMARY, SUMMARY_JSON = f"{BASE}.summary", f"{BASE}.summary.json"
+    DONE, INDEX = f"{BASE}.done", f"{BASE}.index.tsv.gz"
 
 
 def logmsg(m):
@@ -78,6 +105,29 @@ def http_get(url, extra_headers=None):
 
 def blob_base(name):
     return f"https://{SA}.blob.core.windows.net/{CONTAINER}/{urllib.parse.quote(name, safe='/')}"
+
+
+def blob_kind(name):
+    lname = name.lower()
+    if lname.endswith(".zip"):
+        return "zip"
+    if lname.endswith((".tar.gz", ".tgz", ".gz")):
+        return "gz"
+    return "stored"
+
+
+def parse_list_page(xml_bytes):
+    """One list-blobs response page → (blobs, prefixes, next_marker).
+    blobs are (name, content_length, etag); prefixes only appear on
+    delimiter listings."""
+    root = ET.fromstring(xml_bytes)
+    blobs = []
+    for b in root.findall(".//Blob"):
+        blobs.append((b.findtext("Name") or "",
+                      int(b.findtext(".//Content-Length") or "0"),
+                      b.findtext(".//Etag") or ""))
+    prefixes = [p.findtext("Name") or "" for p in root.findall(".//BlobPrefix")]
+    return blobs, prefixes, root.findtext("NextMarker") or ""
 
 
 def fetch_range(name, start, end):
@@ -252,6 +302,7 @@ def write_summary(per, n, zero, errors, err_types, methods, dur_s):
 
 
 def main():
+    _init_from_env()
     open(LOG, "w").close()
     t0 = time.time()
     logmsg(f"start SA={SA} CONTAINER={CONTAINER} (stdlib+SAS)")
