@@ -37,6 +37,7 @@ Sizing (no bulk download — reads only indexes/trailers):
   everything else -> uncompressed = content-length (accurate for loose files).
 Read-only; writes nothing back to the blob.
 """
+import gzip
 import json
 import os
 import struct
@@ -114,6 +115,73 @@ def blob_kind(name):
     if lname.endswith((".tar.gz", ".tgz", ".gz")):
         return "gz"
     return "stored"
+
+
+# ── per-blob cache (blob-index) ──────────────────────────────────────────────
+# Rows exist only for zip/gz blobs (stored blobs cost nothing to size — the
+# listing already carries their size). Error rows are never cached, so
+# transient failures retry next run. A cache can only cost time, never
+# correctness: any doubt → miss.
+CACHEABLE_KINDS = ("zip", "gz")
+
+
+def load_cache(path):
+    """blob-index.tsv.gz → {name: (etag, clen, uncomp, method, det_json)}."""
+    out = {}
+    if not path:
+        return out
+    try:
+        with gzip.open(path, "rt", newline="") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 6:
+                    continue
+                name, etag, clen, uncomp, method, det = parts[:6]
+                if method.startswith("err:") or not etag:
+                    continue
+                out[name] = (etag, int(clen), int(uncomp), method, det)
+    except Exception:  # noqa: BLE001 — corrupt cache = no cache
+        return {}
+    return out
+
+
+def load_seed_tsv(path):
+    """A crashed run's partial sizes.tsv as a second seed. TSV columns:
+    name, clen, uncomp, ratio, method, etag, det_json (rows from older TSVs
+    without the etag column are skipped)."""
+    out = {}
+    if not path:
+        return out
+    try:
+        with open(path, newline="") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 7:
+                    continue
+                name, clen, uncomp, _ratio, method, etag, det = parts[:7]
+                if (method.startswith("err:") or not etag
+                        or blob_kind(name) not in CACHEABLE_KINDS):
+                    continue
+                out[name] = (etag, int(clen), int(uncomp), method, det)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def cache_lookup(cache, name, etag, clen):
+    """Hit only when name AND etag AND compressed size all match."""
+    row = cache.get(name)
+    if row and etag and row[0] == etag and row[1] == clen:
+        return row
+    return None
+
+
+def write_index(path, rows):
+    tmp_path = str(path) + ".tmp"
+    with gzip.open(tmp_path, "wt", newline="") as f:
+        for r in rows:
+            f.write("\t".join(map(str, r)) + "\n")
+    os.replace(tmp_path, path)
 
 
 def parse_list_page(xml_bytes):

@@ -232,6 +232,37 @@ def main() -> int:
           and sizer.blob_kind("x.tgz") == "gz"
           and sizer.blob_kind("x.bin") == "stored")
 
+    print("\n— sizer: cache roundtrip —")
+    idx_path = str(tmp / "test-index.tsv.gz")
+    rows = [("gdrive/a.zip", "0xAB", 123, 456, "zip:3entries",
+             '{"hubspot":[100,2]}'),
+            ("slack/b.gz", "0xCD", 10, 30, "gz-trailer", "")]
+    sizer.write_index(idx_path, rows)
+    cache = sizer.load_cache(idx_path)
+    check("cache roundtrip", cache["gdrive/a.zip"] ==
+          ("0xAB", 123, 456, "zip:3entries", '{"hubspot":[100,2]}')
+          and cache["slack/b.gz"] == ("0xCD", 10, 30, "gz-trailer", ""),
+          str(cache))
+    check("cache hit needs etag+clen match",
+          sizer.cache_lookup(cache, "gdrive/a.zip", "0xAB", 123) is not None
+          and sizer.cache_lookup(cache, "gdrive/a.zip", "0xZZ", 123) is None
+          and sizer.cache_lookup(cache, "gdrive/a.zip", "0xAB", 999) is None
+          and sizer.cache_lookup(cache, "gdrive/a.zip", "", 123) is None
+          and sizer.cache_lookup(cache, "nope", "0xAB", 123) is None)
+    check("missing/corrupt cache → empty (fail-safe)",
+          sizer.load_cache("") == {} and
+          sizer.load_cache(str(tmp / "no-such-file.tsv.gz")) == {})
+    seed_path = tmp / "test-seed.tsv"
+    seed_path.write_text(
+        "gdrive/a.zip\t123\t456\t3.707\tzip:3entries\t0xAB\t\n"      # good
+        "old/no-etag.zip\t5\t5\t1.0\tzip:1entries\n"                  # old format
+        "bad/err.zip\t9\t9\t1.0\terr:BadZipFile\t0xEE\t\n"            # error row
+        "plain/file.txt\t7\t7\t1.0\tstored\t0xFF\t\n")                # not cacheable
+    seed = sizer.load_seed_tsv(str(seed_path))
+    check("seed: keeps good zip row only", list(seed) == ["gdrive/a.zip"]
+          and seed["gdrive/a.zip"] == ("0xAB", 123, 456, "zip:3entries", ""),
+          str(seed))
+
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
                "comp": 10, "unc": 20, "zero": 0, "errors": 1,
