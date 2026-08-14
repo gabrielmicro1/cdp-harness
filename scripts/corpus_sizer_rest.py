@@ -22,10 +22,13 @@ Env:
 
 Writes in OUT_DIR:
   <TAG>.log           progress
-  <TAG>.sizes.tsv     name, clen, uncomp, ratio, method, etag, det_json
+  <TAG>.sizes.tsv     line 1: `#matcher\t<fingerprint>` header; then rows of
+                      name, clen, uncomp, ratio, method, etag, det_json
   <TAG>.summary       human per-datasource table + totals (decimal GB, /1e9)
   <TAG>.summary.json  compact machine summary (what harvest reads)
-  <TAG>.index.tsv.gz  incremental index (cache seed for the next run)
+  <TAG>.index.tsv.gz  incremental index (cache seed for the next run; same
+                      `#matcher` header, used to fail-safe-invalidate the
+                      cache when EXPECTED_SERVICES changes)
   <TAG>.done          written on clean completion
 
 Sizing (no bulk download — reads only indexes/trailers):
@@ -38,6 +41,7 @@ Sizing (no bulk download — reads only indexes/trailers):
 Read-only; writes nothing back to the blob.
 """
 import gzip
+import hashlib
 import json
 import os
 import queue
@@ -132,15 +136,40 @@ def blob_kind(name):
 CACHEABLE_KINDS = ("zip", "gz")
 
 
-def load_cache(path):
-    """blob-index.tsv.gz → {name: (etag, clen, uncomp, method, det_json)}."""
+def _check_header(line, fingerprint):
+    """First line of a cache/seed file may be a `#matcher\\t<fp>` header.
+    Returns (is_header, ok): ok is False when a fingerprint was demanded and
+    the header is missing or doesn't match — the caller must then treat the
+    WHOLE file as a miss (fail-safe: stale zip-entry detection is worse than
+    a slower re-read)."""
+    if line.startswith("#matcher\t"):
+        if fingerprint is not None and line.split("\t", 1)[1] != fingerprint:
+            return True, False
+        return True, True
+    if fingerprint is not None:
+        return False, False  # no header at all but a fingerprint was demanded
+    return False, True  # headerless + no fingerprint demanded → back-compat
+
+
+def load_cache(path, fingerprint=None):
+    """blob-index.tsv.gz → {name: (etag, clen, uncomp, method, det_json)}.
+    See `_check_header` for the optional `#matcher` freshness check."""
     out = {}
     if not path:
         return out
     try:
         with gzip.open(path, "rt", newline="") as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
+            for i, raw in enumerate(f):
+                line = raw.rstrip("\n")
+                if i == 0:
+                    is_header, ok = _check_header(line, fingerprint)
+                    if not ok:
+                        return {}
+                    if is_header:
+                        continue
+                if line.startswith("#"):
+                    continue
+                parts = line.split("\t")
                 if len(parts) < 6:
                     continue
                 name, etag, clen, uncomp, method, det = parts[:6]
@@ -152,17 +181,27 @@ def load_cache(path):
     return out
 
 
-def load_seed_tsv(path):
+def load_seed_tsv(path, fingerprint=None):
     """A crashed run's partial sizes.tsv as a second seed. TSV columns:
     name, clen, uncomp, ratio, method, etag, det_json (rows from older TSVs
-    without the etag column are skipped)."""
+    without the etag column are skipped). See `_check_header` for the
+    optional `#matcher` freshness check."""
     out = {}
     if not path:
         return out
     try:
         with open(path, newline="") as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
+            for i, raw in enumerate(f):
+                line = raw.rstrip("\n")
+                if i == 0:
+                    is_header, ok = _check_header(line, fingerprint)
+                    if not ok:
+                        return {}
+                    if is_header:
+                        continue
+                if line.startswith("#"):
+                    continue
+                parts = line.split("\t")
                 if len(parts) < 7:
                     continue
                 name, clen, uncomp, _ratio, method, etag, det = parts[:7]
@@ -183,9 +222,10 @@ def cache_lookup(cache, name, etag, clen):
     return None
 
 
-def write_index(path, rows):
+def write_index(path, rows, fingerprint):
     tmp_path = str(path) + ".tmp"
     with gzip.open(tmp_path, "wt", newline="") as f:
+        f.write(f"#matcher\t{fingerprint}\n")
         for r in rows:
             f.write("\t".join(map(str, r)) + "\n")
     os.replace(tmp_path, path)
@@ -260,6 +300,15 @@ def build_matcher(declared=()):
         if n:
             m[n] = svc
     return m
+
+
+def matcher_fingerprint(matcher):
+    """Short stable hash of a built matcher. Changes whenever EXPECTED_SERVICES
+    (or the service catalog) changes the matcher's content, so cached
+    zip-entry detection can be fail-safe-invalidated instead of silently
+    going stale when a company's declared services change."""
+    payload = json.dumps(sorted(matcher.items()), separators=(",", ":"))
+    return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
 def match_segment(seg, matcher):
@@ -420,12 +469,18 @@ def list_url(prefix=None, delimiter=None, marker=""):
 
 
 def discover_prefixes():
-    """Delimiter listing → (top-level prefixes, root-level blobs)."""
+    """Delimiter listing → (top-level prefixes, root-level blobs). Dedupes
+    BlobPrefix names across pages (order-preserving) — a repeat would
+    otherwise double-count an entire prefix."""
     prefixes, root_blobs, marker = [], [], ""
+    seen = set()
     while True:
         blobs, prefs, marker = parse_list_page(
             http_get(list_url(delimiter="/", marker=marker)))
-        prefixes += prefs
+        for p in prefs:
+            if p not in seen:
+                seen.add(p)
+                prefixes.append(p)
         root_blobs += blobs
         if not marker:
             return prefixes, root_blobs
@@ -452,7 +507,7 @@ class Aggregator:
     """Single-threaded consumer of sized-blob rows: writes the TSV and owns
     every aggregate, so nothing here needs a lock."""
 
-    def __init__(self, tsv_path, matcher):
+    def __init__(self, tsv_path, matcher, fingerprint):
         self.per = defaultdict(lambda: [0, 0, 0])   # top prefix
         self.l2 = defaultdict(lambda: [0, 0, 0])    # second level
         self.detected = {}
@@ -463,6 +518,7 @@ class Aggregator:
         self.cache_hits = self.cache_misses = 0
         self.matcher = matcher
         self.tsv = open(tsv_path, "w", buffering=1)
+        self.tsv.write(f"#matcher\t{fingerprint}\n")
 
     def _svc(self, svc):
         return self.detected.setdefault(svc, {
@@ -527,19 +583,30 @@ class Aggregator:
 def enumerate_and_size(cache, matcher):
     """Prefix-parallel listing + pooled zip/gz reads + cache short-circuit.
     A listing failure is fatal (raised after draining workers) — the partial
-    TSV stays behind as next launch's seed. Per-blob failures are just rows."""
-    agg = Aggregator(OUT, matcher)
+    TSV stays behind as next launch's seed. Per-blob failures are just rows.
+    A consumer (aggregation) failure is ALSO fatal — e.g. a poisoned cached
+    det_json of the wrong shape — so main() never writes .done over a
+    truncated summary; the consumer keeps draining to the sentinel first so
+    producers (workers/listers) never block on a full queue."""
+    fp = matcher_fingerprint(matcher)
+    agg = Aggregator(OUT, matcher, fp)
     results = queue.Queue(maxsize=10000)          # backpressure bound
     inflight = threading.BoundedSemaphore(SIZER_WORKERS * 4)
     stop = threading.Event()
     size_pool = ThreadPoolExecutor(max_workers=SIZER_WORKERS)
+    consumer_exc = []
 
     def consume():
         while True:
             r = results.get()
             if r is None:
                 return
-            agg.add(r)
+            try:
+                agg.add(r)
+            except Exception as exc:  # noqa: BLE001 — never wedge producers
+                consumer_exc.append(exc)
+                logmsg(f"ERROR consumer: {type(exc).__name__}: "
+                       f"{str(exc)[:160]}")
 
     consumer = threading.Thread(target=consume, daemon=True)
     consumer.start()
@@ -603,6 +670,8 @@ def enumerate_and_size(cache, matcher):
     results.put(None)
     consumer.join()
     agg.close()
+    if fatal is None and consumer_exc:
+        fatal = consumer_exc[0]
     if fatal is not None:
         raise fatal
     return agg
@@ -659,14 +728,15 @@ def main():
     _init_from_env()
     open(LOG, "w").close()
     t0 = time.time()
-    cache = load_cache(CACHE_FILE)
-    cache.update(load_seed_tsv(SEED_TSV))
     matcher = build_matcher(EXPECTED_SERVICES)
+    fp = matcher_fingerprint(matcher)
+    cache = load_cache(CACHE_FILE, fp)
+    cache.update(load_seed_tsv(SEED_TSV, fp))
     logmsg(f"start SA={SA} CONTAINER={CONTAINER} cache={len(cache)} rows "
-           f"workers={SIZER_WORKERS} (stdlib+SAS)")
+           f"workers={SIZER_WORKERS} matcher_fp={fp} (stdlib+SAS)")
     agg = enumerate_and_size(cache, matcher)
     write_summary(agg, time.time() - t0)
-    write_index(INDEX, agg.index_rows)
+    write_index(INDEX, agg.index_rows, fp)
     logmsg(f"size done blobs={agg.n} errors={agg.errors} "
            f"cache hits={agg.cache_hits} misses={agg.cache_misses}")
     open(DONE, "w").close()

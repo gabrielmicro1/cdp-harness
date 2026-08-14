@@ -242,8 +242,9 @@ def main() -> int:
     rows = [("gdrive/a.zip", "0xAB", 123, 456, "zip:3entries",
              '{"hubspot":[100,2]}'),
             ("slack/b.gz", "0xCD", 10, 30, "gz-trailer", "")]
-    sizer.write_index(idx_path, rows)
-    cache = sizer.load_cache(idx_path)
+    idx_fp = sizer.matcher_fingerprint(sizer.build_matcher(("gdrive",)))
+    sizer.write_index(idx_path, rows, idx_fp)
+    cache = sizer.load_cache(idx_path, idx_fp)
     check("cache roundtrip", cache["gdrive/a.zip"] ==
           ("0xAB", 123, 456, "zip:3entries", '{"hubspot":[100,2]}')
           and cache["slack/b.gz"] == ("0xCD", 10, 30, "gz-trailer", ""),
@@ -257,6 +258,10 @@ def main() -> int:
     check("missing/corrupt cache → empty (fail-safe)",
           sizer.load_cache("") == {} and
           sizer.load_cache(str(tmp / "no-such-file.tsv.gz")) == {})
+    check("wrong matcher fingerprint → full miss (fail-safe)",
+          sizer.load_cache(idx_path, "deadbeef0000") == {})
+    check("no fingerprint demanded → header just skipped, still loads",
+          sizer.load_cache(idx_path) == cache)
 
     print("\n— sizer: service detection matching —")
     m = sizer.build_matcher(("HubSpot", "My CRM"))
@@ -292,6 +297,17 @@ def main() -> int:
     check("seed: keeps good zip row only", list(seed) == ["gdrive/a.zip"]
           and seed["gdrive/a.zip"] == ("0xAB", 123, 456, "zip:3entries", ""),
           str(seed))
+    check("seed: headerless but fingerprint demanded → fail-safe miss",
+          sizer.load_seed_tsv(str(seed_path), idx_fp) == {})
+    seed_headered = tmp / "test-seed-headered.tsv"
+    seed_headered.write_text(
+        f"#matcher\t{idx_fp}\n"
+        "gdrive/a.zip\t123\t456\t3.707\tzip:3entries\t0xAB\t\n")
+    check("seed: matching header fingerprint loads",
+          sizer.load_seed_tsv(str(seed_headered), idx_fp) ==
+          {"gdrive/a.zip": ("0xAB", 123, 456, "zip:3entries", "")})
+    check("seed: mismatched header fingerprint → miss",
+          sizer.load_seed_tsv(str(seed_headered), "deadbeef0000") == {})
 
     print("\n— sizer: zip entry detection —")
 
@@ -418,9 +434,65 @@ def main() -> int:
         check("warm run keeps zip-entry detection (from cached det_json)",
               s2["detected_services"]["hubspot"]["bytes"] == 5000,
               str(s2["detected_services"].get("hubspot")))
-        tsv = (swork / "fakeco-sizer.sizes.tsv").read_text().rstrip("\n").split("\n")
-        check("tsv has 4 rows x 7 cols", len(tsv) == 4
-              and all(len(r.split("\t")) == 7 for r in tsv), tsv[0])
+        tsv_lines = (swork / "fakeco-sizer.sizes.tsv").read_text() \
+            .rstrip("\n").split("\n")
+        check("tsv line 1 is the #matcher header",
+              tsv_lines[0].startswith("#matcher\t"), tsv_lines[0])
+        data_rows = tsv_lines[1:]
+        check("tsv has 4 data rows x 7 cols", len(data_rows) == 4
+              and all(len(r.split("\t")) == 7 for r in data_rows),
+              tsv_lines[0])
+
+        # ── staleness: EXPECTED_SERVICES changes → the matcher fingerprint
+        # changes → the on-disk cache (built under the OLD matcher) must be
+        # a full miss, not a replay of stale zip-entry detection. Dropping
+        # "hubspot" wouldn't actually change the matcher (it's already a
+        # built-in catalog alias) — declaring a DIFFERENT SPELLING for the
+        # same normalized key does: catalog gives hubspot -> "hubspot";
+        # declaring "HubSpot" overrides the mapped VALUE (not the key) to
+        # "HubSpot", so a correctly-invalidated re-read must attribute the
+        # embedded contacts.csv entry to "HubSpot", not the stale "hubspot".
+        for f in swork.glob("fakeco-sizer.*"):
+            f.unlink()
+        os.environ["EXPECTED_SERVICES"] = "gdrive,HubSpot,slack"
+        counters["range_gets"] = 0
+        sizer.main()
+        s3 = json.loads((swork / "fakeco-sizer.summary.json").read_text())
+        check("staleness: matcher change forces full re-read (cache miss)",
+              s3["cache"] == {"hits": 0, "misses": 2}, str(s3["cache"]))
+        check("staleness: detection reflects the NEW matcher, not a stale "
+              "cached det_json",
+              "HubSpot" in s3["detected_services"]
+              and "hubspot" not in s3["detected_services"]
+              and s3["detected_services"]["HubSpot"]["bytes"] == 5000,
+              str(s3["detected_services"]))
+
+        # ── Finding 1: a poisoned cached det_json (right shape of JSON,
+        # wrong shape of value — e.g. from a future format change) must not
+        # silently truncate a run. main() must raise and never write .done. ──
+        for f in swork.glob("fakeco-sizer.*"):
+            f.unlink()
+        os.environ["EXPECTED_SERVICES"] = "gdrive,hubspot,slack"
+        poison_fp = sizer.matcher_fingerprint(
+            sizer.build_matcher(("gdrive", "hubspot", "slack")))
+        zip_name = "gdrive/export.zip"
+        poison_path = tmp / "fakeco-poison.tsv.gz"
+        with gzip.open(poison_path, "wt", newline="") as pf:
+            pf.write(f"#matcher\t{poison_fp}\n")
+            pf.write(f"{zip_name}\t{etags[zip_name]}\t"
+                     f"{len(container[zip_name])}\t6000\tzip:2entries\t"
+                     '{"hubspot":5}\n')  # malformed: not [bytes, count]
+        os.environ["CACHE_FILE"] = str(poison_path)
+        counters["range_gets"] = 0
+        raised = None
+        try:
+            sizer.main()
+        except Exception as exc:  # noqa: BLE001
+            raised = exc
+        check("poisoned cache: main() raises instead of a truncated run",
+              raised is not None, repr(raised))
+        check("poisoned cache: no .done written",
+              not (swork / "fakeco-sizer.done").exists())
     finally:
         sizer.http_get = real_http
         for k in list(sizer_env) + ["CACHE_FILE", "SEED_TSV"]:
