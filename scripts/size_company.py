@@ -34,6 +34,8 @@ def main() -> int:
                     default="all")
     ap.add_argument("--root", type=Path, default=common.DEFAULT_COMPANIES_ROOT)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore the per-company blob index (full re-size)")
     ap.add_argument("--max-wait", type=int, default=480)
     args = ap.parse_args()
     args.slugs = [args.slug]

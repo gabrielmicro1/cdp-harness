@@ -7,9 +7,12 @@ pages, zip central directories, and gzip trailers: kilobytes per blob, so
 nothing large flows). Phases (see CLAUDE.md "Azure operational model"):
 
   0. skip_check      — UsedCapacity metric vs last run; unchanged → copied-forward
-  1. launch          — IP firewall rule if needed, mint rl SAS, start the sizer
-                       as a DETACHED local process (survives the harness dying;
-                       its work files are the manual-rescue path)
+  1. launch          — IP firewall rule if needed, mint rl SAS, seed the sizer's
+                       cache from the company's blob-index.tsv.gz + any crashed
+                       -run progress tsv (unless use_cache=False / --no-cache),
+                       pass declared service names, start the sizer as a
+                       DETACHED local process (survives the harness dying; its
+                       work files are the manual-rescue path)
   2. poll            — .done file → Succeeded; else pid alive → Running
   3. harvest         — read <tag>.summary.json, write sizing-run file, update
                        status, cleanup (work files + only-ours IP rule)
@@ -136,6 +139,9 @@ def write_copied_forward_run(root: Path, slug: str, metric, metric_at) -> Path:
         "sources": prev["sources"],
         "methods": prev.get("methods", {}),
         "errors": prev.get("errors", {"total": 0, "by_type": {}}),
+        "cache": None,
+        "detected_services": prev.get("detected_services", {}),
+        "sources_l2": prev.get("sources_l2", {}),
         "notes": [f"copied forward from {prev['timestamp']} (UsedCapacity unchanged)"],
     }
     common.write_json(path, run)
@@ -222,11 +228,14 @@ def _sizer_cmd() -> list[str]:
     return cmd
 
 
-def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False) -> dict:
+def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False,
+          use_cache: bool = True) -> dict:
     """Start the sizer as a detached local process (nohup-equivalent: new
     session, stdin closed, output to <tag>.stdout). It keeps running if the
-    harness/agent dies — the work files are the rescue path. Returns the
-    per-company in-flight state dict."""
+    harness/agent dies — the work files are the rescue path. When use_cache,
+    seeds the sizer from the company's blob-index.tsv.gz (prior harvest) and
+    any crashed-run progress tsv, and passes the manifest's declared service
+    names for detection. Returns the per-company in-flight state dict."""
     we_added_ip, ip = ip_rule_ensure(cfg, dry_run=dry_run)
     sas = mint_sas(cfg, dry_run=dry_run)
     tag = tag_for(slug)
@@ -241,11 +250,28 @@ def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False) -> dict:
                 "we_added_ip": we_added_ip, "ip": ip,
                 "launched_at": common.iso_now(), "outcome": None, "reason": None}
     wd.mkdir(parents=True, exist_ok=True)
+    seed = wd / f"{tag}.seed.tsv"
+    stale_tsv = wd / f"{tag}.sizes.tsv"
+    if use_cache and stale_tsv.exists():
+        os.replace(stale_tsv, seed)  # crashed-run progress becomes a seed
     for stale in wd.glob(f"{tag}.*"):  # a stale .done would fake completion
-        stale.unlink()
+        if stale != seed:
+            stale.unlink()
     env = os.environ.copy()
+    env.pop("CACHE_FILE", None)   # never inherit these from our own process
+    env.pop("SEED_TSV", None)
+    env.pop("EXPECTED_SERVICES", None)
     env.update({"SA": cfg["storage_account"], "CONTAINER": cfg["container"],
                 "TAG": tag, "OUT_DIR": str(wd), "AZURE_STORAGE_SAS": sas})
+    index = common.company_dir(root, slug) / "blob-index.tsv.gz"
+    if use_cache and index.exists():
+        env["CACHE_FILE"] = str(index)
+    if use_cache and seed.exists():
+        env["SEED_TSV"] = str(seed)
+    expected = common.load_expected(root, slug)
+    services = ",".join((expected or {}).get("services", {}).keys())
+    if services:
+        env["EXPECTED_SERVICES"] = services
     with open(wd / f"{tag}.stdout", "w") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,
@@ -315,6 +341,9 @@ def summary_to_run(slug: str, summary: dict, skip_info: dict,
         "methods": summary.get("methods", {}),
         "errors": {"total": summary.get("errors", 0),
                    "by_type": summary.get("err_types", {})},
+        "cache": summary.get("cache"),
+        "detected_services": summary.get("detected_services", {}),
+        "sources_l2": summary.get("sources_l2", {}),
         "notes": notes,
     }
 
@@ -340,6 +369,9 @@ def harvest_one(root: Path, slug: str, cfg: dict, comp_state: dict,
     run = summary_to_run(slug, summary, skip_info, [])
     path = _run_path(root, slug)
     common.write_json(path, run)
+    idx = wd / f"{tag}.index.tsv.gz"
+    if idx.exists():  # per-blob detail survives harvest as the company's cache
+        os.replace(idx, common.company_dir(root, slug) / "blob-index.tsv.gz")
     cleanup(root, slug, cfg, comp_state, dry_run=dry_run)
     return path
 
@@ -347,8 +379,9 @@ def harvest_one(root: Path, slug: str, cfg: dict, comp_state: dict,
 def cleanup(root: Path, slug: str, cfg: dict, comp_state: dict,
             dry_run: bool = False) -> None:
     """Remove work files; remove the IP firewall rule only if WE added it.
-    The per-blob sizes.tsv is deleted too — the sizing-run JSON keeps
-    everything the harness needs; re-size if per-blob detail is wanted."""
+    The per-blob sizes.tsv is deleted too — its detail lives on in
+    companies/<slug>/blob-index.tsv.gz (moved there by harvest_one), which
+    seeds the next run's cache; re-size with --no-cache to ignore it."""
     if not dry_run:
         for f in work_dir(root).glob(f"{comp_state.get('tag') or tag_for(slug)}.*"):
             f.unlink()

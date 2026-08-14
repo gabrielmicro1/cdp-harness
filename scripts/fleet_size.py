@@ -90,7 +90,9 @@ def cmd_launch_all(args) -> dict:
     for slug, cfg in to_launch:
         comp = state["companies"][slug]
         try:
-            launched = phases.launch(root, slug, cfg, dry_run=args.dry_run)
+            launched = phases.launch(root, slug, cfg, dry_run=args.dry_run,
+                                     use_cache=not getattr(args, "no_cache",
+                                                           False))
             comp.update(launched)
         except HarnessError as exc:
             phases.update_status(root, slug, "failed", str(exc))
@@ -190,6 +192,8 @@ def main() -> int:
                     help="subset of companies (default: all onboarded)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print az commands instead of running them")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore the per-company blob index (full re-size)")
     ap.add_argument("--max-wait", type=int, default=480,
                     help="poll-all/run: seconds to keep polling before returning "
                          "(keep under the 10-min Bash timeout; resumable)")

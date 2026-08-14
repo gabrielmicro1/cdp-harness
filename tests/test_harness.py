@@ -174,6 +174,8 @@ def main() -> int:
     check("copied-forward totals preserved",
           cf["totals"]["uncompressed_bytes"] == 3_665_000_000_000)
     check("copied_from set", cf["copied_from"] == "2026-08-12T09:00:00Z")
+    check("copied-forward tolerates old runs (empty detection)",
+          cf.get("detected_services", {}) == {} and cf.get("cache") is None)
     st = phases.update_status(root, "democo", "skipped-unchanged", "test")
     check("no growth → stage still pushing (only 1 day)", st["stage"] == "pushing")
     check("last_run outcome recorded",
@@ -502,12 +504,29 @@ def main() -> int:
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
                "comp": 10, "unc": 20, "zero": 0, "errors": 1,
                "err_types": {"BadZipFile": 1}, "methods": {"zip": 5},
-               "dur_s": 3, "src": {"a": [5, 10, 20]}}
+               "dur_s": 3, "src": {"a": [5, 10, 20]},
+               "cache": {"hits": 3, "misses": 2},
+               "detected_services": {"hubspot": {
+                   "bytes": 7, "blob_count": 0, "entry_count": 1,
+                   "path_bytes": 0, "zip_entry_bytes": 7,
+                   "sources": {"a": 7}}},
+               "sources_l2": {"a/(files)": [5, 10, 20]}}
     run = phases.summary_to_run("democo", summary,
                                 {"metric": 1, "metric_at": "t"}, [])
     check("summary_to_run totals", run["totals"]["uncompressed_bytes"] == 20
           and run["sources"]["a"]["blob_count"] == 5
           and run["errors"]["by_type"] == {"BadZipFile": 1})
+    check("summary_to_run new fields", run["cache"] == {"hits": 3, "misses": 2}
+          and run["detected_services"]["hubspot"]["bytes"] == 7
+          and run["sources_l2"] == {"a/(files)": [5, 10, 20]})
+    old_run = phases.summary_to_run("democo",
+                                    {k: v for k, v in summary.items()
+                                     if k not in ("cache", "detected_services",
+                                                  "sources_l2")},
+                                    {"metric": 1, "metric_at": "t"}, [])
+    check("summary_to_run tolerates old summaries",
+          old_run["cache"] is None and old_run["detected_services"] == {}
+          and old_run["sources_l2"] == {})
 
     fake_sizer = tmp / "fake_sizer.py"
     fake_sizer.write_text(
@@ -516,7 +535,14 @@ def main() -> int:
         "assert os.environ['AZURE_STORAGE_SAS'] == 'sig=fake'\n"
         "base = os.path.join(out, tag)\n"
         "open(base + '.log', 'w').write('start\\n')\n"
+        "json.dump({k: os.environ.get(k) for k in\n"
+        "           ('CACHE_FILE', 'SEED_TSV', 'EXPECTED_SERVICES')},\n"
+        "          open(base + '.envdump.json', 'w'))\n"
         "time.sleep(1)\n"
+        "import gzip\n"
+        "gf = gzip.open(base + '.index.tsv.gz', 'wt')\n"
+        "gf.write('a/x.zip\\t0xAA\\t10\\t20\\tzip:1entries\\t\\n')\n"
+        "gf.close()\n"
         f"json.dump({json.dumps(summary)}, open(base + '.summary.json', 'w'))\n"
         "open(base + '.done', 'w').close()\n")
     os.environ["CDP_SIZER_SCRIPT"] = str(fake_sizer)
@@ -528,6 +554,14 @@ def main() -> int:
         phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
         phases.ip_rule_remove_if_ours = \
             lambda cfg, ip, we, dry_run=False: removed.append((ip, we))
+        wd = phases.work_dir(root)
+        wd.mkdir(parents=True, exist_ok=True)
+        import gzip as _gz
+        prior_index = root / "democo" / "blob-index.tsv.gz"
+        with _gz.open(prior_index, "wt") as f:
+            f.write("old/x.zip\t0x01\t1\t2\tzip:1entries\t\n")
+        (wd / "democo-sizer.sizes.tsv").write_text(
+            "crash/y.zip\t3\t4\t1.3\tzip:1entries\t0x02\t\n")
         st = phases.launch(root, "democo", cfg)
         check("launch detached with pid", st["phase"] == "launched"
               and st["pid"] and st["we_added_ip"] is True)
@@ -539,6 +573,15 @@ def main() -> int:
             time.sleep(0.3)
             res = phases.poll_one(root, "democo", st)
         check("reaches Succeeded via .done", res["state"] == "Succeeded")
+        env_dump = json.loads((wd / "democo-sizer.envdump.json").read_text())
+        check("launch passed CACHE_FILE (prior index)",
+              env_dump["CACHE_FILE"] == str(prior_index), str(env_dump))
+        check("launch renamed stale tsv to seed and passed SEED_TSV",
+              env_dump["SEED_TSV"] == str(wd / "democo-sizer.seed.tsv")
+              and Path(env_dump["SEED_TSV"]).exists())
+        check("launch passed EXPECTED_SERVICES from manifest",
+              "hubspot" in (env_dump["EXPECTED_SERVICES"] or ""),
+              str(env_dump))
         n_runs_before = len(common.sizing_runs(root, "democo"))
         run_path = phases.harvest_one(
             root, "democo", cfg, {**st, "metric": 111, "metric_at": "m-t"})
@@ -551,6 +594,37 @@ def main() -> int:
         check("cleanup removed work files",
               not list(phases.work_dir(root).glob("democo-sizer.*")))
         check("cleanup removed only-ours IP rule", removed == [("1.2.3.4", True)])
+        check("harvest run has detected_services",
+              harvested["detected_services"]["hubspot"]["bytes"] == 7)
+        check("harvest moved index into company dir",
+              prior_index.exists() and _gz.open(prior_index, "rt").read()
+              .startswith("a/x.zip"))
+        check("cleanup removed seed + work files",
+              not list(wd.glob("democo-sizer.*")))
+        # --no-cache: fresh launch must not pass cache env
+        st2 = phases.launch(root, "democo", cfg, use_cache=False)
+        deadline = time.time() + 15
+        res2 = phases.poll_one(root, "democo", st2)
+        while res2["state"] not in phases.TERMINAL_STATES and time.time() < deadline:
+            time.sleep(0.3)
+            res2 = phases.poll_one(root, "democo", st2)
+        env_dump2 = json.loads((wd / "democo-sizer.envdump.json").read_text())
+        check("--no-cache: no CACHE_FILE/SEED_TSV",
+              not env_dump2["CACHE_FILE"] and not env_dump2["SEED_TSV"],
+              str(env_dump2))
+        phases.harvest_one(root, "democo", cfg,
+                           {**st2, "metric": 1, "metric_at": "t"})
+        # The far-future-dated run file from the earlier stall/"growth resumed"
+        # test (20261231T000000Z.json) sorts after any real-clock run and would
+        # otherwise outrank the harvest above as "latest" — its job there is
+        # done, so drop it here for this check to see the real latest run.
+        (root / "democo" / "sizing-runs" / "20261231T000000Z.json").unlink()
+        cf2 = common.read_json(phases.write_copied_forward_run(
+            root, "democo", 999, "t2"))
+        check("copied-forward carries detected_services",
+              cf2["detected_services"]["hubspot"]["bytes"] == 7
+              and cf2["sources_l2"] == {"a/(files)": [5, 10, 20]}
+              and cf2["cache"] is None)
     finally:
         phases.ip_rule_ensure, phases.mint_sas = real_ensure, real_sas
         phases.ip_rule_remove_if_ours = real_remove
@@ -578,6 +652,9 @@ def main() -> int:
           state["companies"]["democo"]["phase"] == "launched"
           and state["companies"]["emptyco"]["phase"] == "launched")
     check("no real az was needed (dry-run)", True)
+    proc = run_script("fleet_size.py", "launch-all", "--root", root,
+                      "--dry-run", "--no-cache", "--slugs", "democo")
+    check("--no-cache flag accepted", proc.returncode == 0)
 
     print("\n— gcs_transfer --dry-run —")
     proc = run_script("gcs_transfer.py", "plan", "democo",
