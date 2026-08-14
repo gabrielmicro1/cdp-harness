@@ -300,6 +300,27 @@ def main() -> int:
           and sizer.blob_kind("x.tgz") == "gz"
           and sizer.blob_kind("x.bin") == "stored")
 
+    # Finding 8: a repeated BlobPrefix across list pages (a NextMarker page
+    # boundary can land mid-prefix) must be deduped, order-preserving — a
+    # repeat would otherwise double-count an entire prefix's blobs.
+    pages = [
+        b"<EnumerationResults><Blobs>"
+        b"<BlobPrefix><Name>a/</Name></BlobPrefix>"
+        b"</Blobs><NextMarker>tok</NextMarker></EnumerationResults>",
+        b"<EnumerationResults><Blobs>"
+        b"<BlobPrefix><Name>a/</Name></BlobPrefix>"
+        b"<BlobPrefix><Name>b/</Name></BlobPrefix>"
+        b"</Blobs><NextMarker/></EnumerationResults>",
+    ]
+    real_http_get = sizer.http_get
+    try:
+        sizer.http_get = lambda url, extra_headers=None: pages.pop(0)
+        dprefixes, _root_blobs = sizer.discover_prefixes()
+    finally:
+        sizer.http_get = real_http_get
+    check("discover_prefixes dedupes cross-page BlobPrefix (order-preserving)",
+          dprefixes == ["a/", "b/"], str(dprefixes))
+
     print("\n— sizer: cache roundtrip —")
     idx_path = str(tmp / "test-index.tsv.gz")
     rows = [("gdrive/a.zip", "0xAB", 123, 456, "zip:3entries",
@@ -530,9 +551,13 @@ def main() -> int:
               and s3["detected_services"]["HubSpot"]["bytes"] == 5000,
               str(s3["detected_services"]))
 
-        # ── Finding 1: a poisoned cached det_json (right shape of JSON,
-        # wrong shape of value — e.g. from a future format change) must not
-        # silently truncate a run. main() must raise and never write .done. ──
+        # ── Finding 1: a poisoned cached det_json (right shape of JSON, wrong
+        # shape of value — e.g. from a future format change) must degrade to
+        # a cache MISS at load time, not a persistent hard failure — a cache
+        # can only cost time, never correctness. A relaunch that keeps
+        # passing the same poisoned CACHE_FILE must succeed every time (the
+        # poisoned row is just re-fetched), not hard-fail the company until
+        # someone deletes the file by hand. ──
         for f in swork.glob("fakeco-sizer.*"):
             f.unlink()
         os.environ["EXPECTED_SERVICES"] = "gdrive,hubspot,slack"
@@ -547,14 +572,46 @@ def main() -> int:
                      '{"hubspot":5}\n')  # malformed: not [bytes, count]
         os.environ["CACHE_FILE"] = str(poison_path)
         counters["range_gets"] = 0
+        sizer.main()
+        s4 = json.loads((swork / "fakeco-sizer.summary.json").read_text())
+        check("poisoned det_json: run succeeds (fail-safe miss, not fatal)",
+              s4["blobs"] == 4 and s4["unc"] == s1["unc"], json.dumps(s4)[:300])
+        check("poisoned det_json: the poisoned row loaded as a miss "
+              "(cache had only that 1 row; both cacheable blobs re-fetched)",
+              s4["cache"] == {"hits": 0, "misses": 2}, str(s4["cache"]))
+        check("poisoned det_json: correct totals re-derived from the real "
+              "zip central directory, not the poisoned value",
+              s4["detected_services"]["hubspot"]["bytes"] == 5000,
+              str(s4["detected_services"].get("hubspot")))
+        check(".done written despite the poisoned cache row",
+              (swork / "fakeco-sizer.done").exists())
+
+        # ── Finding 1 (consumer-guard backstop): the guard around agg.add()
+        # in the consumer thread must still catch everything ELSE that can
+        # go wrong there (e.g. a TSV OSError) and fail the run rather than
+        # silently truncating it. Fault-inject directly since load-time
+        # validation now closes off the det_json route to this path. ──
+        for f in swork.glob("fakeco-sizer.*"):
+            f.unlink()
+        os.environ.pop("CACHE_FILE", None)
+        os.environ.pop("SEED_TSV", None)
+        real_agg_add = sizer.Aggregator.add
+
+        def _boom(self, r):
+            raise RuntimeError("synthetic consumer failure")
+
+        sizer.Aggregator.add = _boom
+        counters["range_gets"] = 0
         raised = None
         try:
             sizer.main()
         except Exception as exc:  # noqa: BLE001
             raised = exc
-        check("poisoned cache: main() raises instead of a truncated run",
-              raised is not None, repr(raised))
-        check("poisoned cache: no .done written",
+        finally:
+            sizer.Aggregator.add = real_agg_add
+        check("consumer-guard backstop: main() still raises on a broken "
+              "consumer", raised is not None, repr(raised))
+        check("consumer-guard backstop: no .done written",
               not (swork / "fakeco-sizer.done").exists())
     finally:
         sizer.http_get = real_http

@@ -151,6 +151,32 @@ def _check_header(line, fingerprint):
     return False, True  # headerless + no fingerprint demanded → back-compat
 
 
+def _det_valid(det):
+    """Validate a cached det_json field at LOAD time. Empty is valid (no
+    embedded-service hits); non-empty must parse as a JSON object mapping
+    service name -> a 2-element [bytes, count] list/tuple of ints. A cache
+    can only cost time, never correctness: any parse or shape failure means
+    the row is treated as a miss here, rather than being cached and later
+    raising in the consumer (which would fail the whole run and, since the
+    poisoned CACHE_FILE gets reused on every relaunch, keep failing it)."""
+    if not det:
+        return True
+    try:
+        obj = json.loads(det)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    for k, v in obj.items():
+        if not isinstance(k, str):
+            return False
+        if (not isinstance(v, (list, tuple)) or len(v) != 2
+                or any(isinstance(x, bool) or not isinstance(x, int)
+                       for x in v)):
+            return False
+    return True
+
+
 def load_cache(path, fingerprint=None):
     """blob-index.tsv.gz → {name: (etag, clen, uncomp, method, det_json)}.
     See `_check_header` for the optional `#matcher` freshness check."""
@@ -174,6 +200,8 @@ def load_cache(path, fingerprint=None):
                     continue
                 name, etag, clen, uncomp, method, det = parts[:6]
                 if method.startswith("err:") or not etag:
+                    continue
+                if not _det_valid(det):
                     continue
                 out[name] = (etag, int(clen), int(uncomp), method, det)
     except Exception:  # noqa: BLE001 — corrupt cache = no cache
@@ -207,6 +235,8 @@ def load_seed_tsv(path, fingerprint=None):
                 name, clen, uncomp, _ratio, method, etag, det = parts[:7]
                 if (method.startswith("err:") or not etag
                         or blob_kind(name) not in CACHEABLE_KINDS):
+                    continue
+                if not _det_valid(det):
                     continue
                 out[name] = (etag, int(clen), int(uncomp), method, det)
     except Exception:  # noqa: BLE001
@@ -273,7 +303,6 @@ SERVICE_CATALOG = {
     "onedrive": ("onedrive",),
     "teams": ("msteams", "microsoftteams"),
     "zoom": ("zoom",),
-    "linear": ("linear",),
     "airtable": ("airtable",),
 }
 
@@ -533,10 +562,10 @@ class Aggregator:
         self.tsv.write(f"{name}\t{clen}\t{uncomp}\t{ratio:.3f}"
                        f"\t{r['method']}\t{r['etag']}\t{det_json}\n")
         top = name.split("/", 1)[0] if "/" in name else "(root)"
-        for agg in (self.per[top], self.l2[l2_key(name)]):
-            agg[0] += 1
-            agg[1] += clen
-            agg[2] += uncomp
+        for acc in (self.per[top], self.l2[l2_key(name)]):
+            acc[0] += 1
+            acc[1] += clen
+            acc[2] += uncomp
         self.methods[r["kind"]] += 1
         self.n += 1
         if clen == 0:
@@ -605,6 +634,7 @@ def enumerate_and_size(cache, matcher):
                 agg.add(r)
             except Exception as exc:  # noqa: BLE001 — never wedge producers
                 consumer_exc.append(exc)
+                stop.set()  # doomed run — stop paying for more listing/sizing
                 logmsg(f"ERROR consumer: {type(exc).__name__}: "
                        f"{str(exc)[:160]}")
 
