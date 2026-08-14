@@ -745,7 +745,8 @@ def main() -> int:
 
         # ── run 1 (cold, budget fits all candidates) ──
         # a-multi, b-multi: gz-floor (empty last member) -> streamed exact
-        # c-junk: gz-bad-trailer -> stream attempted 3x, zlib.error -> fallback
+        # c-junk: gz-bad-trailer -> stream attempted ONCE, zlib.error is a
+        #   terminal decode failure (not retried) -> fallback
         # d-big: gz-trailer with clen == threshold -> streamed exact
         # e-small: gz-trailer below threshold -> untouched, certain
         sizer.main()
@@ -757,8 +758,9 @@ def main() -> int:
               and tsv["gz/a-multi.gz"][2] == "9000")
         check("b-multi gz-exact 4000", tsv["gz/b-multi.gz"][4] == "gz-exact"
               and tsv["gz/b-multi.gz"][2] == "4000")
-        check("c-junk: 3 stream attempts then fallback",
-              stream_calls.count("gz/c-junk.gz") == 3
+        check("c-junk: 1 stream attempt (terminal zlib.error, no retry) "
+              "then fallback",
+              stream_calls.count("gz/c-junk.gz") == 1
               and tsv["gz/c-junk.gz"][4] == "gz-bad-trailer"
               and tsv["gz/c-junk.gz"][2] == str(len(gzc["gz/c-junk.gz"])))
         check("d-big gz-exact 30000", tsv["gz/d-big.gz"][4] == "gz-exact"
@@ -811,27 +813,80 @@ def main() -> int:
         for k in list(gz_env) + ["CACHE_FILE", "SEED_TSV"]:
             os.environ.pop(k, None)
 
-    # ── pure predicates (set globals directly; any later sizer.main() call
-    # re-runs _init_from_env, which resets them from env) ──
-    sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD, sizer.GZ_STREAM_FLOOR_MIN = 1, 100, 10
-    check("candidate: threshold", sizer.gz_stream_candidate("gz-trailer", 100))
-    check("candidate: floored above min", sizer.gz_stream_candidate("gz-floor", 10))
-    check("candidate: floored below min",
-          not sizer.gz_stream_candidate("gz-floor", 9))
-    check("candidate: plausible below threshold",
-          not sizer.gz_stream_candidate("gz-trailer", 99))
-    sizer.GZ_STREAM_BUDGET = 0
-    check("candidate: disabled", not sizer.gz_stream_candidate("gz-trailer", 100))
-    check("stale: disabled", not sizer.gz_cached_row_stale("gz-trailer", 500, 500))
-    sizer.GZ_STREAM_BUDGET = 1
-    check("stale: old-gen floored trailer row",
-          sizer.gz_cached_row_stale("gz-trailer", 50, 50))
-    check("stale: exact never", not sizer.gz_cached_row_stale("gz-exact", 500, 500))
-    check("stale: big plausible", sizer.gz_cached_row_stale("gz-trailer", 100, 300))
-    check("uncertain rows", sizer.gz_uncertain_row("gz", "gz-floor", 5)
-          and sizer.gz_uncertain_row("gz", "gz-trailer", 100)
-          and not sizer.gz_uncertain_row("gz", "gz-trailer", 99)
-          and not sizer.gz_uncertain_row("zip", "zip:3entries", 500))
+    # ── pure predicates (set globals directly under a try/finally restore —
+    # nothing later in this file calls sizer.main() again to reset them) ──
+    _saved_gz_globals = (sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD,
+                         sizer.GZ_STREAM_FLOOR_MIN)
+    try:
+        sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD, sizer.GZ_STREAM_FLOOR_MIN = 1, 100, 10
+        check("candidate: threshold", sizer.gz_stream_candidate("gz-trailer", 100))
+        check("candidate: floored above min", sizer.gz_stream_candidate("gz-floor", 10))
+        check("candidate: floored below min",
+              not sizer.gz_stream_candidate("gz-floor", 9))
+        check("candidate: plausible below threshold",
+              not sizer.gz_stream_candidate("gz-trailer", 99))
+        sizer.GZ_STREAM_BUDGET = 0
+        check("candidate: disabled", not sizer.gz_stream_candidate("gz-trailer", 100))
+        check("stale: disabled", not sizer.gz_cached_row_stale("gz-trailer", 500, 500))
+        sizer.GZ_STREAM_BUDGET = 1
+        check("stale: old-gen floored trailer row",
+              sizer.gz_cached_row_stale("gz-trailer", 50, 50))
+        check("stale: exact never", not sizer.gz_cached_row_stale("gz-exact", 500, 500))
+        check("stale: big plausible", sizer.gz_cached_row_stale("gz-trailer", 100, 300))
+        check("uncertain rows", sizer.gz_uncertain_row("gz", "gz-floor", 5)
+              and sizer.gz_uncertain_row("gz", "gz-trailer", 100)
+              and not sizer.gz_uncertain_row("gz", "gz-trailer", 99)
+              and not sizer.gz_uncertain_row("zip", "zip:3entries", 500))
+    finally:
+        (sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD,
+         sizer.GZ_STREAM_FLOOR_MIN) = _saved_gz_globals
+
+    print("\n— sizer: gz stream retry classification (terminal vs transport) —")
+    real_fetch3, real_stream3 = sizer.fetch_range, sizer.stream_blob_chunks
+    _saved_gz_globals2 = (sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD,
+                          sizer.GZ_STREAM_FLOOR_MIN)
+    try:
+        # any clen is a stream candidate via the threshold; the per-call
+        # StreamBudget object below is the real cap being exercised
+        sizer.GZ_STREAM_BUDGET = 10 ** 9
+        sizer.GZ_STREAM_THRESHOLD = 1
+        sizer.GZ_STREAM_FLOOR_MIN = 1
+
+        payload = gzip.compress(b"q" * 500)
+        clen = len(payload)
+        sizer.fetch_range = lambda name, s, e: payload[-4:]  # plausible ISIZE=500
+        attempt_state = {"n": 0}
+
+        def transient_then_ok(name, chunk=1 << 20):
+            attempt_state["n"] += 1
+            if attempt_state["n"] <= 2:
+                raise OSError("simulated transport blip")
+            for i in range(0, len(payload), 13):
+                yield payload[i:i + 13]
+
+        sizer.stream_blob_chunks = transient_then_ok
+
+        # budget fits 3 reservations: 2 transport failures then success
+        b_ok = sizer.StreamBudget(clen * 3)
+        r_ok = sizer.size_blob("gz/x.gz", clen, "0xE", "gz", None, b_ok)
+        check("transport retry: succeeds on 3rd attempt, gz-exact",
+              r_ok["method"] == "gz-exact" and r_ok["uncomp"] == 500
+              and attempt_state["n"] == 3 and b_ok.used == clen * 3,
+              str(r_ok))
+
+        # budget fits only the first reservation: retry #2 is denied ->
+        # falls back to the trailer value, one attempt made
+        attempt_state["n"] = 0
+        b_fallback = sizer.StreamBudget(clen)
+        r_fb = sizer.size_blob("gz/x.gz", clen, "0xE", "gz", None, b_fallback)
+        check("transport retry: budget exhausted after 1st attempt -> fallback",
+              r_fb["method"] == "gz-trailer" and r_fb["uncomp"] == 500
+              and attempt_state["n"] == 1 and b_fallback.used == clen,
+              str(r_fb))
+    finally:
+        sizer.fetch_range, sizer.stream_blob_chunks = real_fetch3, real_stream3
+        (sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD,
+         sizer.GZ_STREAM_FLOOR_MIN) = _saved_gz_globals2
 
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,

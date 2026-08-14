@@ -610,14 +610,26 @@ def gz_uncertain_row(kind, method, clen):
     return method == "gz-trailer" and clen >= GZ_STREAM_THRESHOLD
 
 
-def _gz_stream_with_retry(name, attempts=3):
+def _gz_stream_with_retry(name, clen, budget, attempts=3):
+    """Retry only transport-layer failures (network blips) — a decode
+    failure (zlib.error: non-gzip/corrupt bytes; ValueError: truncated
+    stream) is deterministic and re-reading the same bytes can never
+    succeed, so it's raised immediately with no retry or sleep. The first
+    attempt spends the reservation `size_blob` already made; each RETRY
+    must reserve its own re-download budget — if that reservation fails,
+    stop and raise the last error (the caller's fallback handles it)."""
     last = None
     for i in range(attempts):
+        if i > 0 and not budget.reserve(clen):
+            raise last
         try:
             return gz_stream_exact(name)
-        except Exception as exc:  # noqa: BLE001
+        except (zlib.error, ValueError):
+            raise  # deterministic decode failure — retrying can't help
+        except Exception as exc:  # noqa: BLE001 — transport-layer, retry
             last = exc
-            time.sleep(1 + i)
+            if i < attempts - 1:
+                time.sleep(1 + i)
     raise last
 
 
@@ -663,7 +675,8 @@ def size_blob(name, clen, etag, kind, matcher, budget=None):
             if (budget is not None and gz_stream_candidate(method, clen)
                     and budget.reserve(clen)):
                 try:
-                    uncomp, method = _gz_stream_with_retry(name), "gz-exact"
+                    uncomp, method = (_gz_stream_with_retry(name, clen, budget),
+                                       "gz-exact")
                 except Exception as exc:  # noqa: BLE001 — keep trailer value
                     logmsg(f"stream fallback {name}: {type(exc).__name__}: "
                            f"{str(exc)[:120]}")
@@ -880,10 +893,11 @@ def write_summary(agg, dur_s):
         f"{'uncompressed_GB':>18}{'ratio':>9}",
     ]
     if agg.gz_streamed or agg.gz_uncertain:
-        lines.insert(8, f"gz: {agg.gz_streamed} streamed exact "
-                        f"({agg.gz_streamed_bytes/1e9:.2f} GB), "
-                        f"{agg.gz_uncertain} uncertain "
-                        f"({agg.gz_uncertain_bytes/1e9:.2f} GB compressed)")
+        lines.insert(lines.index(""),
+                     f"gz: {agg.gz_streamed} streamed exact "
+                     f"({agg.gz_streamed_bytes/1e9:.2f} GB), "
+                     f"{agg.gz_uncertain} uncertain "
+                     f"({agg.gz_uncertain_bytes/1e9:.2f} GB compressed)")
     for k in sorted(agg.per, key=lambda k: -agg.per[k][2]):
         f_, c_, u_ = agg.per[k]
         r_ = (u_ / c_) if c_ else 0.0
