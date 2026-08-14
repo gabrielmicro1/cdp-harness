@@ -60,6 +60,8 @@ it in place**. Its operational knowledge is restructured into
 ```
 CLAUDE.md                    # this file — the spec; keep it current
 SIZING-SKILL.md              # original sizing skill; source material, do not edit
+docs/sizing-internals.md     # mechanism-level walkthrough of the sizer (cache,
+                             # concurrency, detection) — read before modifying it
 companies/                   # ALL runtime state; gitignored (local only)
   <slug>/
     config.json              # cached Azure discovery (see schema)
@@ -84,6 +86,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   gcs-azure-transfer/references/commands.md
   dropbox-azure-transfer/SKILL.md          # Dropbox → <slug>-raw (same engine)
   dropbox-azure-transfer/references/commands.md
+  gdrive-azure-transfer/SKILL.md           # Google Drive → <slug>-raw (same engine)
+  gdrive-azure-transfer/references/commands.md
 scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
@@ -95,6 +99,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   transfer_engine.py         # cloud→Azure transfer engine (VM, rclone, tmux)
   gcs_transfer.py            # thin GCS CLI over transfer_engine (Spec only)
   dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
+  gdrive_transfer.py         # thin Google Drive CLI over transfer_engine (Spec only)
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
@@ -337,15 +342,17 @@ leftovers. `vm.exists: false` is normal and blocks nothing.
 Some companies' corpora arrive in a cloud source we must pull ourselves:
 Google Workspace Data Export buckets (`dwt-takeout-export-<digits>`, browser
 OAuth by the customer's super admin only — no service accounts, no HMAC
-keys) or a Dropbox account. rclone-with-a-token on a temporary Azure VM is
-the viable path for both. `scripts/transfer_engine.py` is the ONE engine;
-`gcs_transfer.py` / `dropbox_transfer.py` are thin Spec-only CLIs over it,
-driven by the `gcs-azure-transfer` / `dropbox-azure-transfer` skills. The
-workflow: VM `xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, so both can run at
-once) in the company's RG and the SA's region, static Standard-SKU public IP
-(never deallocated before teardown), rclone copy in a tmux session into
-`<slug>-raw/workspace-export/` (Dropbox: `dropbox-export/`). Rules that
-differ from the sizing path — do not cross-contaminate:
+keys), a Dropbox account, or a Google Drive (My Drive or Shared Drive).
+rclone-with-a-token on a temporary Azure VM is the viable path for all of
+them. `scripts/transfer_engine.py` is the ONE engine; `gcs_transfer.py` /
+`dropbox_transfer.py` / `gdrive_transfer.py` are thin Spec-only CLIs over
+it, driven by the matching `*-azure-transfer` skills. The workflow: VM
+`xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive: `xfer-gdr-<slug>`, so
+they can run concurrently) in the company's RG and the SA's region, static
+Standard-SKU public IP (never deallocated before teardown), rclone copy in
+a tmux session into `<slug>-raw/workspace-export/` (Dropbox:
+`dropbox-export/`, Drive: `gdrive-export/`). Rules that differ from the
+sizing path — do not cross-contaminate:
 
 - **Network rules are HUMAN-ONLY for this path.** The transfer VM's IP is
   added via the internal network-rules UI by the user; the harness never runs
