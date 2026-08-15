@@ -410,8 +410,10 @@ Sharp edges that are *by design* (don't "fix" without understanding):
   `gz-floor` (ISIZE < compressed size — a ≥4 GiB wrap or a multi-member/bgzip
   file whose trailer only covers the last member), `gz-bad-trailer` (ISIZE
   implies >1032:1, DEFLATE's hard bound — garbage, floored to compressed
-  size, no more silent overcounts). Large or floored/bad blobs get an exact
-  streaming decompress under a per-run byte budget and become `gz-exact`;
+  size, no more silent overcounts), `gz-tiny` (compressed size < 4 bytes —
+  no trailer to read, counted at stored size). Large or floored/bad blobs
+  get an exact streaming decompress under a per-run byte budget and become
+  `gz-exact`;
   transport failures retry (re-reserving budget), decode failures are
   terminal and fall back to the floored value. Whatever stays unmeasured
   after the budget runs out is quantified, never silent, in the run's

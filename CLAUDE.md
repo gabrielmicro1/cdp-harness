@@ -193,8 +193,8 @@ Cached so daily runs skip discovery entirely.
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
                                          // gz>0 triggers the gz-accuracy notes; the per-blob gz
                                          // method taxonomy (gz-trailer/gz-floor/gz-bad-trailer/
-                                         // gz-exact) lives in the blob-index/TSV, rolled up in
-                                         // "gz" below
+                                         // gz-tiny/gz-exact) lives in the blob-index/TSV, rolled
+                                         // up in "gz" below
   "errors": {"total": 3, "by_type": {"BadZipFile": 3}},
   "cache": {"hits": 800, "misses": 6},   // null in copied-forward and pre-cache runs
   "gz": {"streamed": 2, "streamed_bytes": 900000000000,   // exact-streamed gz blobs
@@ -250,7 +250,9 @@ itself — no handing commands to the user unless they ask.
 
 Sizing runs **on this machine** — no VMs are provisioned or required. This is
 safe because a SIZE job never bulk-downloads: the sizer reads blob-list pages,
-zip central directories, and gzip trailers — kilobytes per blob. (The old
+zip central directories, and gzip trailers — kilobytes per blob — except
+budgeted gz exact-streaming: at most `GZ_STREAM_BUDGET` compressed bytes per
+run (default 50 GB, 0 disables), each blob paid once, cached by ETag. (The old
 in-region-VM rule existed for the EXTRACT path and for latency, not volume.)
 
 - **Launch:** `phases.launch` starts `scripts/corpus_sizer_rest.py` as a

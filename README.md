@@ -43,9 +43,11 @@ and summarize what needs attention. Then open `reports/index.html`.
 The sizer (`scripts/corpus_sizer_rest.py`, stdlib + SAS only) never bulk
 downloads. It reads blob-list pages, **zip central directories** (ZIP64-aware
 range reads — true uncompressed sizes without downloading archives), and
-**gzip ISIZE trailers** (exact under 4 GiB, floored above). Kilobytes per
-blob, grouped by top-level prefix into per-source totals. Runtime scales with
-blob *count*, not bytes.
+**gzip ISIZE trailers** (exact under 4 GiB, floored above) — except budgeted
+gz exact-streaming: at most `GZ_STREAM_BUDGET` compressed bytes per run
+(default 50 GB, 0 disables), each blob paid once, cached by ETag. Kilobytes
+per blob otherwise, grouped by top-level prefix into per-source totals.
+Runtime scales with blob *count*, not bytes.
 
 ### Progress intelligence
 
@@ -61,9 +63,10 @@ blob *count*, not bytes.
   (listed, never byte-compared), and overshoot >100% (often a wrong manifest —
   commercially significant).
 - **Interpretation notes**, applied automatically when the data shows the
-  pattern: store-mode zips, export-timestamp prefixes, tar.gz undercount,
-  BadZipFile noise. Hard-won knowledge from the croplabel / webspiders /
-  latchel runs — see
+  pattern: store-mode zips, export-timestamp prefixes, gz-tiered accuracy
+  (exact for budgeted-streamed blobs, quantified `gz.uncertain` /
+  `gz.uncertain_bytes` for what the budget didn't reach), BadZipFile noise.
+  Hard-won knowledge from the croplabel / webspiders / latchel runs — see
   `.claude/skills/size-company/references/sizing-lore.md`.
 
 ## Safety guarantees

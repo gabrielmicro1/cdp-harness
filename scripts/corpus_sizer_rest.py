@@ -39,7 +39,8 @@ Writes in OUT_DIR:
                       cache when EXPECTED_SERVICES changes)
   <TAG>.done          written on clean completion
 
-Sizing (no bulk download — reads only indexes/trailers):
+Sizing (no bulk download except budgeted gz exact-streaming — otherwise
+reads only indexes/trailers):
   .zip            -> End-of-Central-Directory + Central Directory via Range GETs
                      (ZIP64-aware); sum entry uncompressed sizes. NON-recursive.
   .gz/.tgz/.tar.gz-> 4-byte ISIZE trailer, floored at compressed size (exact

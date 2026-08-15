@@ -36,6 +36,12 @@ scan, error counts surfaced). Your job is the **judgment layer** on top:
    or ambiguous checklist; a wrongly-closed company silently drops out of the
    morning stall radar.
 
-Tolerance is a parameter — the user may loosen it for a company with a known
-tar.gz undercount (trailer-floored multi-GB tarballs legitimately read low).
-Suggest that explicitly rather than fudging numbers.
+Tolerance is a parameter. For a run with a `gz` field (new-style, post
+gz-accuracy-tiers), only loosen it when `gz.uncertain` is nonzero — that
+field quantifies exactly how many bytes are still trailer-floored and
+unmeasured (budget-exhausted or streaming-failed) after exact-streaming ran,
+so check it before assuming an undercount rather than loosening blindly. For
+a run with no `gz` field (old-style, pre-dates the accuracy tiers), the user
+may still loosen tolerance for a company with a known tar.gz undercount
+(trailer-floored multi-GB tarballs legitimately read low), same as before.
+Suggest loosening explicitly rather than fudging numbers.
