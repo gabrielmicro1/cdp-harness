@@ -537,19 +537,26 @@ def stream_blob_chunks(name, chunk=1 << 20):
             yield b
 
 
+_DECOMP_STEP = 64 << 20  # bound per decompress call — caps transient memory
+
+
 def gz_stream_exact(name):
     """Exact uncompressed size: stream-decompress every gzip member,
-    counting output bytes only (constant memory). Handles the two cases the
-    trailer cannot: >=4GiB wraps and multi-member/concatenated gzips.
-    Network cost = compressed size — paid once; the result is cached by
-    ETag as method gz-exact. Raises on truncated or non-gzip input."""
+    counting output bytes only (bounded memory: <= _DECOMP_STEP per step,
+    regardless of the input chunk's compression ratio). Handles the two
+    cases the trailer cannot: >=4GiB wraps and multi-member/concatenated
+    gzips. Network cost = compressed size — paid once; the result is
+    cached by ETag as method gz-exact. Raises on truncated or non-gzip
+    input."""
     total = 0
     d = zlib.decompressobj(wbits=31)  # 31 = gzip container
     for chunk in stream_blob_chunks(name):
         while chunk:
             if d.eof:  # previous member finished — start the next
                 d = zlib.decompressobj(wbits=31)
-            total += len(d.decompress(chunk))
+            total += len(d.decompress(chunk, _DECOMP_STEP))
+            while d.unconsumed_tail:
+                total += len(d.decompress(d.unconsumed_tail, _DECOMP_STEP))
             chunk = d.unused_data if d.eof else b""
     if not d.eof:
         raise ValueError("truncated gzip stream")

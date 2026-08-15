@@ -463,6 +463,21 @@ def main() -> int:
             check("non-gzip bytes raise", True)
     finally:
         sizer.stream_blob_chunks = real_stream
+
+    real_stream_hr = sizer.stream_blob_chunks
+    try:
+        hr_blob = gzip.compress(b"\x00" * 50_000_000)  # ~1032x ratio
+
+        def hr_stream(name, chunk=1 << 20):
+            for i in range(0, len(hr_blob), 1 << 20):
+                yield hr_blob[i:i + (1 << 20)]
+
+        sizer.stream_blob_chunks = hr_stream
+        check("high-ratio stream exact (bounded memory)",
+              sizer.gz_stream_exact("hr.gz") == 50_000_000)
+    finally:
+        sizer.stream_blob_chunks = real_stream_hr
+
     b = sizer.StreamBudget(100)
     check("budget reserve/deny", b.reserve(60) and not b.reserve(50)
           and b.reserve(40) and not b.reserve(1) and b.used == 100)
