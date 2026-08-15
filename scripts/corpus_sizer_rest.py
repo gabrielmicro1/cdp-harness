@@ -556,7 +556,7 @@ def gz_stream_exact(name):
             if d.eof:  # previous member finished — start the next
                 d = zlib.decompressobj(wbits=31)
             total += len(d.decompress(chunk, _DECOMP_STEP))
-            while d.unconsumed_tail:
+            while d.unconsumed_tail and not d.eof:
                 total += len(d.decompress(d.unconsumed_tail, _DECOMP_STEP))
             chunk = d.unused_data if d.eof else b""
     if not d.eof:

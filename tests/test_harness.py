@@ -478,6 +478,37 @@ def main() -> int:
     finally:
         sizer.stream_blob_chunks = real_stream_hr
 
+    # ── drain-loop livelock regression: force _DECOMP_STEP tiny so a single
+    # member's output crosses it (exercising the unconsumed_tail drain loop),
+    # then end that member mid-drain and start a second member. Before the
+    # eof guard this hangs forever; after, it must return promptly. ──
+    real_stream_dr = sizer.stream_blob_chunks
+    real_decomp_step = sizer._DECOMP_STEP
+    try:
+        sizer._DECOMP_STEP = 1024  # function reads the module global at call time
+        dr_blob = gzip.compress(b"\x00" * 100_000) + gzip.compress(b"x" * 500)
+
+        def dr_stream(name, chunk=1 << 20):
+            yield dr_blob  # single chunk: forces the drain loop internally
+
+        sizer.stream_blob_chunks = dr_stream
+        check("drain-crossing multi-member exact (livelock regression)",
+              sizer.gz_stream_exact("dr.gz") == 100_500)
+
+        # re-assert an existing multi-member fixture under the tiny step,
+        # to cover member-end-exactly-at-drain edges too
+        bgzip_blob = gzip.compress(b"x" * 9000) + gzip.compress(b"")
+
+        def bgzip_stream(name, chunk=1 << 20):
+            yield bgzip_blob
+
+        sizer.stream_blob_chunks = bgzip_stream
+        check("bgzip-style empty EOF member under tiny _DECOMP_STEP",
+              sizer.gz_stream_exact("bgzip-tiny-step.gz") == 9000)
+    finally:
+        sizer.stream_blob_chunks = real_stream_dr
+        sizer._DECOMP_STEP = real_decomp_step
+
     b = sizer.StreamBudget(100)
     check("budget reserve/deny", b.reserve(60) and not b.reserve(50)
           and b.reserve(40) and not b.reserve(1) and b.used == 100)
