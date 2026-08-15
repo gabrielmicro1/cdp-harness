@@ -191,8 +191,10 @@ Cached so daily runs skip discovery entirely.
     "gdrive": {"blob_count": 400, "compressed_bytes": 1, "uncompressed_bytes": 2}
   },
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
-                                         // now tiered: gz-trailer/gz-floor/gz-bad-trailer/gz-exact
-                                         // (see "gz" below for the quantified undercount)
+                                         // gz>0 triggers the gz-accuracy notes; the per-blob gz
+                                         // method taxonomy (gz-trailer/gz-floor/gz-bad-trailer/
+                                         // gz-exact) lives in the blob-index/TSV, rolled up in
+                                         // "gz" below
   "errors": {"total": 3, "by_type": {"BadZipFile": 3}},
   "cache": {"hits": 800, "misses": 6},   // null in copied-forward and pre-cache runs
   "gz": {"streamed": 2, "streamed_bytes": 900000000000,   // exact-streamed gz blobs
