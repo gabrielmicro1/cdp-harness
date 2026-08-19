@@ -21,15 +21,14 @@ command templates + troubleshooting:
 
 ## HARD CONSTRAINTS — never violate
 
-1. **Network rules are human-only.** NEVER run
-   `az storage account network-rule add` (or any vnet change) unprompted.
-   Surface what's needed and PAUSE for the user; run the az commands
-   yourself only on an explicit user override. **Same-region caveat
-   (learned 2026-08, song-division):** IP rules do NOT match traffic from
-   a VM in the storage account's own region — the working config is the
-   `Microsoft.Storage` service endpoint on the VM's subnet plus a
-   vnet-rule on the SA. Say so at the pause, don't let the user chase IP
-   rules.
+1. **Network rules go through `allow-network` only.** The engine grants
+   access itself (Microsoft.Storage service endpoint on the VM's subnet +
+   a vnet-rule on the SA — IP rules never match same-region VM traffic;
+   learned 2026-08, song-division) and teardown removes exactly the rule
+   it added. Never hand-roll `network-rule add`, and NEVER remove a rule
+   the engine didn't add — pre-existing rules are the client's own push
+   path. If a 403 reappears mid-run, company infra may have stripped the
+   rule: re-run `allow-network`.
 2. **Dropbox auth is human-in-the-loop.** Never automate the Dropbox
    sign-in. The account owner/admin runs `rclone authorize "dropbox"` on
    their own machine; you wait for the user to paste the token.
@@ -79,24 +78,31 @@ python3 scripts/dropbox_transfer.py plan <slug> [--path "Team Folder/x"]
    minutes.
 3. `write-azure-remote <slug>` — mints the container SAS locally (rwlc,
    21 days) and installs the `azure` remote on the VM.
-4. **PAUSE #1 — network access.** Print the VM's public IP prominently and
-   state BOTH needs: the IP entry via the internal network-rules UI, AND —
-   because the VM is same-region — the `Microsoft.Storage` service
-   endpoint + vnet-rule (internal UI if it supports it; az only on
-   explicit user override). Wait.
-5. On confirmation: `check-azure <slug>`. On 403 it inspects the ruleset
-   (read-only) and reports `vm_vnet_rule_present` / `vm_ip_in_ruleset`:
-   vnet-rule present = propagation, wait ~10s and retry; IP-only = the
-   same-region trap, relay it; neither = the entry didn't land. Never a
-   SAS problem — do not re-mint.
-6. **PAUSE #2 — Dropbox token.** Give the user this snippet for whoever
-   owns the Dropbox account (secure channel; the token grants access to
-   the files it can see and can be revoked afterward under Dropbox
-   Settings → Security → Connected apps):
+4. `allow-network <slug>` — grants the VM storage access (service
+   endpoint + vnet-rule). No pause: the engine runs this itself.
+5. `check-azure <slug>`. On 403 it inspects the ruleset (read-only):
+   vnet-rule present = propagation, wait ~10s and retry; missing =
+   re-run allow-network. Never a SAS problem — do not re-mint.
+6. **PAUSE #2 — Dropbox token.** First check for our own Dropbox App ID:
+   Dropbox rate limits are per app + per user, and rclone's default App ID
+   is shared by every rclone user on the internet — our own app gets its
+   own rate-limit budget and is the single biggest throughput lever. If
+   `companies/.oauth-client-dropbox.json` exists (flat
+   `{"client_id": "<app key>", "client_secret": "<app secret>"}`,
+   gitignored — never commit it), use the custom-app variant of step 2 in
+   the snippet; otherwise ask the user whether to create one (Dropbox App
+   Console: scoped app, Full Dropbox access, `files.metadata.read` +
+   `files.content.read` only) or proceed on the shared default.
+
+   Give the user this snippet for whoever owns the Dropbox account
+   (secure channel; the token grants access to the files it can see and
+   can be revoked afterward under Dropbox Settings → Security →
+   Connected apps):
 
    ```
    1. Install rclone on your machine:  https://rclone.org/downloads/
    2. Run:  rclone authorize "dropbox"
+      (with our own app: rclone authorize "dropbox" "<app key>" "<app secret>")
    3. Sign in with the Dropbox account that owns the data when the
       browser opens.
    4. Send back the token block it prints (the JSON between the --->
@@ -107,10 +113,14 @@ python3 scripts/dropbox_transfer.py plan <slug> [--path "Team Folder/x"]
    folders included); rclone impersonation of other members is out of
    scope — get a token from an account that can see everything in scope.
    Wait for the paste.
-7. Pipe the pasted token via stdin — never argv:
+7. Pipe the pasted token via stdin — never argv. Token and app must
+   match: a token minted with our app key/secret MUST be installed with
+   `--oauth-client-json`, or refresh will fail mid-transfer (and vice
+   versa — a default-app token takes no flag):
 
    ```bash
-   python3 scripts/dropbox_transfer.py write-dropbox-remote <slug> <<'EOF'
+   python3 scripts/dropbox_transfer.py write-dropbox-remote <slug> \
+     --oauth-client-json companies/.oauth-client-dropbox.json <<'EOF'
    <pasted token JSON>
    EOF
    ```
@@ -127,10 +137,17 @@ python3 scripts/dropbox_transfer.py transfer <slug>
 ```
 
 Starts rclone copy in tmux session `transfer` (8 transfers / 16 checkers /
-5 retries / `--tpslimit 12` — Dropbox 429s aggressively; raising
-`--transfers` usually makes it slower, not faster). Confirms the session is
-alive and hands back — do NOT block. Re-running after an interruption
-resumes safely. Refuses if already running.
+5 retries / `--tpslimit 12` + matching burst / `--fast-list` /
+`--order-by size,mixed` — Dropbox 429s aggressively; raising `--transfers`
+usually makes it slower, not faster). `--fast-list` pages the whole tree in
+a handful of calls instead of one list per directory, so the tps budget
+goes to downloads; `--order-by size,mixed` keeps big bandwidth-bound files
+flowing while small tps-bound files queue. `--tpslimit N` overrides the
+cap (0 = uncapped): with our own App ID, 20–24 is worth trying — watch
+status for 15 min and step back if 429 retries dominate. An occasional 429
+is fine (rclone honors Retry-After); a wall of them is thrash. Confirms the
+session is alive and hands back — do NOT block. Re-running after an
+interruption resumes safely. Refuses if already running.
 
 ### 3. status `<slug>` — the most-used command
 
@@ -175,7 +192,13 @@ the data up as the `dropbox-export` source.
 - Dropbox is a LIVE source — users keep editing while you copy. A verify
   with a handful of differences right after a long transfer is usually
   churn, not loss: re-run transfer (cheap, incremental) and re-verify.
-- Millions of small files? Listing and per-file overhead dominate; budget
-  hours and consider `--path` scoping per top-level folder.
+- Millions of small files? Per-file download calls dominate — the ceiling
+  is ~`tpslimit` files/sec regardless of bandwidth; budget days, not
+  hours, on the default cap, and push for the custom App ID + a higher
+  `--tpslimit` before considering `--path` scoping.
+- Brand-new Dropbox apps can start with modest limits that relax with
+  normal usage — don't judge the custom App ID by its first hour.
+- A second rclone/VM on the SAME token shares the per-user budget — it
+  thrashes, never speeds up. Don't parallelize that way.
 - `--dry-run` on every subcommand prints the az/ssh commands instead of
   running them (secrets redacted).

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -1415,14 +1416,21 @@ def main() -> int:
           and "--os-disk-delete-option Delete" in out)
     check("create-vm: tags carry bucket for stateless rediscovery",
           "gcs_bucket=dwt-takeout-export-123" in out)
-    check("create-vm surfaces the human network-rule step",
-          "internal" in out and "network-rule" in out)
+    check("create-vm points at allow-network as the next step",
+          "allow-network" in out)
+    proc = run_script("gcs_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("allow-network: service endpoint + vnet-rule, correct subnet",
+          "subnet update" in proc.stdout
+          and "--service-endpoints Microsoft.Storage" in proc.stdout
+          and "network-rule add" in proc.stdout
+          and "xfer-democoVNET" in proc.stdout)
     proc = run_script("gcs_transfer.py", "write-azure-remote", "democo",
                       "--root", root, "--dry-run")
     check("azure remote: rwlc-class SAS, secrets redacted",
           "--permissions racwl" in proc.stdout
           and "redacted" in proc.stdout)
-    check("transfer path NEVER adds network rules",
+    check("write-azure-remote itself never touches network rules",
           "network-rule add" not in proc.stdout)
     proc = subprocess.run(
         [sys.executable, str(SCRIPTS / "gcs_transfer.py"), "write-gcs-remote",
@@ -1441,8 +1449,9 @@ def main() -> int:
     check("confirmed teardown deletes PIP + NSG + VNET explicitly",
           "public-ip delete" in proc.stdout and "nsg delete" in proc.stdout
           and "vnet delete" in proc.stdout)
-    check("teardown reminds about IP + vnet-rule removal",
-          "internal UI" in proc.stdout and "vnet-rule" in proc.stdout)
+    check("teardown removes our vnet-rule and reminds about UI IP rules",
+          "network-rule remove" in proc.stdout
+          and "internal UI" in proc.stdout)
 
     print("\n— dropbox_transfer --dry-run (shared engine, dropbox Spec) —")
     proc = run_script("dropbox_transfer.py", "plan", "democo", "--root", root,
@@ -1461,7 +1470,25 @@ def main() -> int:
     proc = run_script("dropbox_transfer.py", "transfer", "democo",
                       "--root", root, "--dry-run")
     check("dropbox transfer: rate-limit-friendly defaults",
-          "--transfers 8" in proc.stdout)
+          "--transfers 8" in proc.stdout
+          and "--tpslimit 12 --tpslimit-burst 12" in proc.stdout)
+    import dropbox_transfer  # noqa: E402  (scripts/ already on sys.path)
+    import gcs_transfer  # noqa: E402
+    check("dropbox Spec: fast-list + order-by, tpslimit moved to Spec field",
+          "--fast-list" in dropbox_transfer.SPEC.extra_rclone_flags
+          and "--order-by size,mixed" in dropbox_transfer.SPEC.extra_rclone_flags
+          and "--tpslimit" not in dropbox_transfer.SPEC.extra_rclone_flags
+          and dropbox_transfer.SPEC.default_tpslimit == 12
+          and gcs_transfer.SPEC.default_tpslimit is None)
+    proc = run_script("dropbox_transfer.py", "verify", "democo",
+                      "--root", root, "--dry-run")
+    check("dropbox verify: tpslimit protects the check too",
+          "--tpslimit 12 --tpslimit-burst 12" in proc.stdout
+          and "--one-way" in proc.stdout)
+    proc = run_script("dropbox_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run", "--tpslimit", "0")
+    check("dropbox transfer: --tpslimit 0 removes the cap",
+          "--tpslimit" not in proc.stdout)
     proc = subprocess.run(
         [sys.executable, str(SCRIPTS / "dropbox_transfer.py"),
          "write-dropbox-remote", "democo", "--root", str(root), "--dry-run"],
@@ -1497,7 +1524,8 @@ def main() -> int:
     proc = run_script("gdrive_transfer.py", "transfer", "democo",
                       "--root", root, "--dry-run")
     check("gdrive transfer: throttled defaults",
-          "--transfers 8" in proc.stdout)
+          "--transfers 8" in proc.stdout
+          and "--tpslimit 10 --tpslimit-burst 10" in proc.stdout)
     proc = run_script("gdrive_transfer.py", "transfer", "democo",
                       "--include", "takeout-*.zip", "--root", root,
                       "--dry-run")
@@ -1532,6 +1560,217 @@ def main() -> int:
           proc.returncode == 0 and "GOCSPX-OAUTHSECRET" not in proc.stdout
           and out.get("oauth_client_id")
           == "12345-abc.apps.googleusercontent.com", proc.stdout[-300:])
+
+    print("\n— qwilr_transfer --dry-run (first VM-less ingest) —")
+    proc = run_script("qwilr_transfer.py", "plan", "democo", "--root", root)
+    qplan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("qwilr plan: local pull, dest from config, 1-day SAS, no VM",
+          qplan["dest"] == "democo-raw/qwilr-export"
+          and qplan["storage_account"] == "stdemoco"
+          and qplan["sas_days"] == 1 and "vm_name" not in qplan
+          and "no VM" in qplan["mode"])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "qwilr_transfer.py"), "pull",
+         "democo", "--root", str(root), "--dry-run"],
+        input="QWILRSECRET", capture_output=True, text=True)
+    out = proc.stdout
+    check("qwilr pull dry-run: rc 0, token never echoed, SAS redacted",
+          proc.returncode == 0 and "QWILRSECRET" not in out
+          and "redacted" in out, out[-300:])
+    check("qwilr pull: racwl container SAS on the right container",
+          "generate-sas" in out and "racwl" in out and "-n democo-raw" in out)
+    check("qwilr pull: laptop IP rule path, not the VM vnet path",
+          "network-rule add" in out and "--ip-address" in out
+          and "allow-network" not in out and "vm create" not in out)
+    check("qwilr pull: hits the Qwilr API and PUTs create-only blobs",
+          "api.qwilr.com/v1/pages" in out
+          and "x-ms-blob-type: BlockBlob" in out and "If-None-Match" in out)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "qwilr_transfer.py"), "verify",
+         "democo", "--root", str(root), "--dry-run"],
+        input="QWILRSECRET", capture_output=True, text=True)
+    check("qwilr verify dry-run: read path mints rl, not racwl",
+          proc.returncode == 0 and "--permissions rl" in proc.stdout
+          and "racwl" not in proc.stdout
+          and "QWILRSECRET" not in proc.stdout, proc.stdout[-300:])
+
+    print("\n— qwilr_transfer in-process (stubbed transport) —")
+    import types
+    import qwilr_transfer  # noqa: E402
+
+    # cursor pagination
+    saved = (qwilr_transfer.qwilr_get, qwilr_transfer.azure_list_existing,
+             qwilr_transfer.azure_put_json, qwilr_transfer.mint_write_sas,
+             qwilr_transfer.read_token, qwilr_transfer._http,
+             qwilr_transfer._sleep, common.run_az,
+             phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+             phases.mint_sas)
+    try:
+        get_calls = []
+
+        def fake_get_paged(token, path, params=None):
+            get_calls.append((path, dict(params or {})))
+            if params and params.get("cursor") == "c1":
+                return {"data": [{"id": "p3"}]}
+            return {"data": [{"id": "p1"}, {"id": "p2"}], "cursor": "c1"}
+
+        qwilr_transfer.qwilr_get = fake_get_paged
+        got = qwilr_transfer.list_pages("tok")
+        check("pagination walks the cursor to exhaustion",
+              [qwilr_transfer._page_id(s) for s in got] == ["p1", "p2", "p3"]
+              and get_calls[1][1].get("cursor") == "c1")
+
+        # full pull flow: resume-skip, per-page error, assets, index
+        def fake_get_pull(token, path, params=None):
+            get_calls.append((path, dict(params or {})))
+            if path == "/pages":
+                if params and params.get("limit") == 1:
+                    return {"data": [{"id": "p1"}]}
+                return {"data": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]}
+            if path == "/pages/p2":
+                return {"blocks": [{"img": "https://assets.qwilr.com/a.png"}]}
+            if path == "/pages/p3":
+                raise qwilr_transfer.QwilrHTTPError(500, "boom")
+            return {"placeholder": path}
+
+        puts = []
+
+        def fake_put(cfg, sas, name, obj, dry_run):
+            puts.append(name)
+            return 10
+
+        common.run_az = lambda *a, **k: types.SimpleNamespace(stdout="")
+        phases.ip_rule_ensure = lambda cfg, dry_run=False: (True, "1.2.3.4")
+        removed = []
+        phases.ip_rule_remove_if_ours = (
+            lambda cfg, ip, we, dry_run=False: removed.append((ip, we)))
+        qwilr_transfer.qwilr_get = fake_get_pull
+        qwilr_transfer.mint_write_sas = (
+            lambda cfg, days, dry: ("sig=fake", "2026-08-20T00:00:00Z"))
+        qwilr_transfer.azure_list_existing = (
+            lambda cfg, sas, prefix, dry: {"qwilr-export/pages/p1.json"})
+        qwilr_transfer.azure_put_json = fake_put
+        qwilr_transfer.read_token = lambda dry: "tok"
+
+        get_calls.clear()
+        args = types.SimpleNamespace(slug="democo", dest_prefix="qwilr-export",
+                                     sas_days=1, page_limit=None,
+                                     dry_run=False)
+        res = qwilr_transfer.cmd_pull(root, args)
+        detail_paths = [p for p, _ in get_calls if p.startswith("/pages/")]
+        check("pull: existing blob skipped, never re-fetched",
+              res["skipped_existing"] == 1 and "/pages/p1" not in detail_paths)
+        check("pull: per-page error counted, run completes ok",
+              res["ok"] is True and res["page_errors"]["count"] == 1
+              and res["page_errors"]["ids"] == ["p3"] and res["pulled"] == 1)
+        check("pull: index + assets manifest written, account endpoints too",
+              any(n.startswith("qwilr-export/_meta/pages-index-") for n in puts)
+              and any(n.startswith("qwilr-export/_meta/assets-manifest-")
+                      for n in puts)
+              and "qwilr-export/account/users.json" in puts
+              and res["assets_discovered"] == 1)
+        check("pull: resume hint present with errors, IP rule removed",
+              "resume_hint" in res and removed == [("1.2.3.4", True)])
+
+        # 401 aborts before any write
+        puts.clear()
+
+        def fake_get_401(token, path, params=None):
+            raise common.HarnessError("Qwilr API 401 on /pages -- token bad")
+
+        qwilr_transfer.qwilr_get = fake_get_401
+        try:
+            qwilr_transfer.cmd_pull(root, args)
+            check("pull: 401 aborts", False, "no exception raised")
+        except common.HarnessError:
+            check("pull: 401 aborts immediately, nothing PUT", puts == [])
+
+        # verify math
+        def fake_get_verify(token, path, params=None):
+            return {"data": [{"id": "p1"}, {"id": "p2"}]}
+
+        qwilr_transfer.qwilr_get = fake_get_verify
+        qwilr_transfer.azure_list_existing = (
+            lambda cfg, sas, prefix, dry: {
+                "qwilr-export/pages/p1.json",
+                "qwilr-export/pages/gone.json",
+                "qwilr-export/account/users.json",
+                "qwilr-export/_meta/pages-index-20260819T000000Z.json"})
+        phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
+        vres = qwilr_transfer.cmd_verify(root, args)
+        check("verify: missing/extra sets + rc-2 semantics",
+              vres["ok"] is False and vres["missing"] == ["p2"]
+              and vres["extra"] == ["gone"]
+              and vres["account_blobs"]["users"] is True
+              and vres["index_blobs"] == 1 and "hint" in vres)
+
+        # 429 backoff honors Retry-After; 401 never retries (real qwilr_get)
+        qwilr_transfer.qwilr_get = saved[0]
+        sleeps = []
+        qwilr_transfer._sleep = lambda s: sleeps.append(s)
+
+        class _Resp:
+            def __init__(self, body): self.body = body
+            def read(self): return self.body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        http_calls = {"n": 0}
+
+        def fake_http_429(req, timeout=90):
+            http_calls["n"] += 1
+            if http_calls["n"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "slow down", {"Retry-After": "3"},
+                    io.BytesIO(b""))
+            return _Resp(b'{"data": []}')
+
+        qwilr_transfer._http = fake_http_429
+        data = qwilr_transfer.qwilr_get("tok", "/pages")
+        check("429 backoff honors Retry-After exactly",
+              data == {"data": []} and sleeps == [3])
+
+        http_calls["n"] = 0
+
+        def fake_http_401(req, timeout=90):
+            http_calls["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 401, "no", {},
+                                         io.BytesIO(b""))
+
+        qwilr_transfer._http = fake_http_401
+        try:
+            qwilr_transfer.qwilr_get("tok", "/pages")
+            check("401 raises HarnessError", False, "no exception")
+        except common.HarnessError:
+            check("401 aborts on first attempt, no retries",
+                  http_calls["n"] == 1)
+
+        # PUT request shape (create-only)
+        req = qwilr_transfer.build_put("https://x/y?sas", b"{}")
+        hdrs = {k.lower(): v for k, v in req.headers.items()}
+        check("build_put: PUT, BlockBlob, create-only, versioned",
+              req.get_method() == "PUT"
+              and hdrs.get("x-ms-blob-type") == "BlockBlob"
+              and hdrs.get("if-none-match") == "*"
+              and hdrs.get("x-ms-version") == qwilr_transfer.X_MS_VERSION)
+
+        # asset URL extraction
+        urls = qwilr_transfer.extract_asset_urls(
+            {"a": [{"b": "https://assets.qwilr.com/logo.png"},
+                   {"c": "https://cdn.qwilr.com/v/video.mp4"}],
+             "d": "https://app.qwilr.com/some-page",
+             "e": "https://example.com/x.png"})
+        check("extract_asset_urls: media only, page links excluded",
+              urls == {"https://assets.qwilr.com/logo.png",
+                       "https://cdn.qwilr.com/v/video.mp4",
+                       "https://example.com/x.png"})
+    finally:
+        (qwilr_transfer.qwilr_get, qwilr_transfer.azure_list_existing,
+         qwilr_transfer.azure_put_json, qwilr_transfer.mint_write_sas,
+         qwilr_transfer.read_token, qwilr_transfer._http,
+         qwilr_transfer._sleep, common.run_az,
+         phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+         phases.mint_sas) = saved
 
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]

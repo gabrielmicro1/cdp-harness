@@ -9,8 +9,9 @@ verify, teardown — lives here exactly once. See the corresponding SKILL.md
 files under .claude/skills/.
 
 Hard rules enforced here (identical for every source):
-- NEVER touches storage-account network rules (human-only via internal UI;
-  az only on an explicit user override relayed by the skill layer).
+- Network rules only via allow-network (service endpoint + vnet-rule; IP
+  rules never match same-region VM traffic), and teardown removes exactly
+  the rule allow-network added — pre-existing rules are never touched.
 - Secrets (SAS URL, source OAuth token) go to the VM's rclone.conf over ssh
   stdin only — never argv, never files here, never printed.
 - No state file: Azure is the source of truth (VM name + tags).
@@ -52,6 +53,7 @@ class Spec:
                  default_dest_prefix: str, authorize_target: str,
                  remote_type: str, extra_rclone_flags: str = "",
                  default_transfers: int = 32, default_checkers: int = 64,
+                 default_tpslimit: int | None = None,
                  remote_extra: str = "", extra_cli_opts: list | None = None):
         self.source_name = source_name          # rclone remote name ("gcs")
         self.vm_prefix = vm_prefix              # "xfer-" / "xfer-dbx-"
@@ -65,6 +67,10 @@ class Spec:
         self.extra_rclone_flags = extra_rclone_flags
         self.default_transfers = default_transfers
         self.default_checkers = default_checkers
+        # Source-API transaction cap (rclone --tpslimit, burst = limit),
+        # applied to BOTH copy and check. None = uncapped; the CLI flag
+        # overrides per run (0 disables).
+        self.default_tpslimit = default_tpslimit
         self.remote_extra = remote_extra        # fixed conf lines ("scope = …")
         # Optional source-specific settings that flow CLI flag → VM tag →
         # rclone.conf key (e.g. gdrive --team-drive). Each entry:
@@ -301,13 +307,60 @@ def cmd_create_vm(spec: Spec, root: Path, args) -> dict:
             timeout=600)
     return {"vm": name, "resource_group": rg, "region": region,
             "public_ip": ip,
-            "next": ("HUMAN STEP: allow this VM on storage account "
-                     f"{cfg['storage_account']} via the internal "
-                     "network-rules UI. Same-region caveat: an IP rule "
-                     "alone will NOT work — the VM's subnet needs the "
-                     "Microsoft.Storage service endpoint + a vnet-rule "
-                     "(az only on explicit user override). This harness "
-                     "never adds network rules on its own.")}
+            "next": ("run allow-network next — it grants this VM access "
+                     f"to storage account {cfg['storage_account']} "
+                     "(Microsoft.Storage service endpoint on the subnet + "
+                     "a vnet-rule; IP rules never match same-region VM "
+                     "traffic). Teardown removes exactly that rule.")}
+
+
+def _subnet_id(spec: Spec, rg: str, slug: str, dry_run: bool) -> str | None:
+    name = spec.vm_name(slug)
+    return common.az_json(["network", "vnet", "subnet", "show", "-g", rg,
+                           "--vnet-name", f"{name}VNET",
+                           "-n", f"{name}Subnet", "--query", "id"],
+                          dry_run=dry_run)
+
+
+def cmd_allow_network(spec: Spec, root: Path, args) -> dict:
+    """Grant the transfer VM storage access: service endpoint + vnet-rule.
+
+    Same-region VMs are never matched by IP rules (their traffic arrives
+    over the backbone with a private source address — learned on
+    song-division, 2026-08), so the working grant is the Microsoft.Storage
+    service endpoint on the VM's subnet plus a vnet-rule on the SA. Only
+    OUR VNET's rule is ever added, and teardown removes exactly that one —
+    pre-existing rules (the client's own push path) are never touched.
+    """
+    cfg = load_cfg(root, args.slug)
+    set_subscription(cfg, args.dry_run)
+    rg = args.rg or cfg["resource_group"]
+    name = spec.vm_name(args.slug)
+    common.run_az(["network", "vnet", "subnet", "update", "-g", rg,
+                   "--vnet-name", f"{name}VNET", "-n", f"{name}Subnet",
+                   "--service-endpoints", "Microsoft.Storage"],
+                  dry_run=args.dry_run, timeout=300)
+    subnet_id = _subnet_id(spec, rg, args.slug, args.dry_run)
+    existing = common.az_json(
+        ["storage", "account", "show", "-g", cfg["resource_group"],
+         "-n", cfg["storage_account"], "--query",
+         "networkRuleSet.virtualNetworkRules[].virtualNetworkResourceId"],
+        dry_run=args.dry_run) or []
+    already = bool(subnet_id) and any(
+        v.lower() == subnet_id.lower() for v in existing)
+    if not already:
+        common.run_az(["storage", "account", "network-rule", "add",
+                       "-g", cfg["resource_group"],
+                       "--account-name", cfg["storage_account"],
+                       "--subnet", subnet_id or f"{name}VNET/{name}Subnet"],
+                      dry_run=args.dry_run, timeout=300)
+    return {"ok": True, "vnet": f"{name}VNET", "subnet": f"{name}Subnet",
+            "storage_account": cfg["storage_account"],
+            "vnet_rule": "already-present" if already else "added",
+            "note": "propagation ~10-30s — run check-azure next. If a 403 "
+                    "reappears mid-run, an external reconciler may have "
+                    "stripped the rule (rules added outside the internal "
+                    "UI can be) — re-run allow-network."}
 
 
 def cmd_write_azure_remote(spec: Spec, root: Path, args) -> dict:
@@ -359,14 +412,14 @@ def cmd_check_azure(spec: Spec, root: Path, args) -> dict:
                     "— propagation. Wait ~10s and retry.")
         elif listed:
             hint = ("VM IP is in the ruleset but 403 persists — same-region "
-                    "VMs are NOT matched by IP rules. The subnet needs the "
-                    "Microsoft.Storage service endpoint + a vnet-rule "
-                    "(human/UI first; az only on explicit user override).")
+                    "VMs are NOT matched by IP rules. Run allow-network "
+                    "(service endpoint + vnet-rule).")
         else:
-            hint = (f"VM IP {vm['public_ip']} is NOT in the storage "
-                    "account's rules and no vnet-rule exists — the "
-                    "internal-UI entry didn't land (wrong account or "
-                    "typo?). NOT a SAS problem — do not re-mint.")
+            hint = ("no vnet-rule exists for this VM — run allow-network. "
+                    "If it existed before, an external reconciler may have "
+                    "stripped it (rules added outside the internal UI can "
+                    "be) — re-run allow-network. NOT a SAS problem — do "
+                    "not re-mint.")
         return {"ok": False, "cause": "network-rule",
                 "vm_ip_in_ruleset": listed,
                 "vm_vnet_rule_present": has_vnet_rule, "hint": hint}
@@ -375,6 +428,27 @@ def cmd_check_azure(spec: Spec, root: Path, args) -> dict:
                 "hint": "SAS invalid/expired/wrong container — re-mint via "
                         "write-azure-remote."}
     return {"ok": False, "cause": "other", "output_tail": out.strip()[-400:]}
+
+
+def _oauth_client_conf(path: str) -> tuple[str, str]:
+    """(client_id, conf lines) from an OAuth client JSON file.
+
+    Accepts the raw Google Cloud download ({"installed": {...}} or
+    {"web": {...}}) or a flat {"client_id":..., "client_secret":...}.
+    The values ride the conf section over ssh stdin like every other
+    secret — never argv, VM tags, or logs.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise common.HarnessError(f"--oauth-client-json: {e}")
+    inner = data.get("installed") or data.get("web") or data
+    cid = inner.get("client_id")
+    secret = inner.get("client_secret")
+    if not cid or not secret:
+        raise common.HarnessError(
+            "--oauth-client-json: file has no client_id/client_secret")
+    return cid, f"client_id = {cid}\nclient_secret = {secret}\n"
 
 
 def cmd_write_source_remote(spec: Spec, root: Path, args) -> dict:
@@ -390,6 +464,10 @@ def cmd_write_source_remote(spec: Spec, root: Path, args) -> dict:
                 "stdin was not valid JSON — paste exactly the token block "
                 "between the ---> markers from `rclone authorize`")
     section = spec.remote_section(" ".join(token.split()))
+    oauth_client_id = None
+    if getattr(args, "oauth_client_json", None):
+        oauth_client_id, lines = _oauth_client_conf(args.oauth_client_json)
+        section += lines
     for opt in spec.extra_cli_opts:  # flag wins, else the VM tag from create
         val = (getattr(args, opt["argname"], None)
                or vm["tags"].get(opt["tag"]))
@@ -413,10 +491,25 @@ def cmd_write_source_remote(spec: Spec, root: Path, args) -> dict:
     if not args.dry_run and size.returncode == 0:
         info = json.loads(size.stdout)
     return {"ok": True, "source": src,
+            "oauth_client_id": oauth_client_id,
             "total_bytes": info.get("bytes"),
             "total_human": common.human_bytes(info.get("bytes")),
             "object_count": info.get("count"),
             "listing_head": ls.stdout.strip()[:800] if not args.dry_run else ""}
+
+
+def _include_flags(args) -> str:
+    """rclone --include flags (transfer AND verify must filter alike)."""
+    return "".join(f" --include '{pat}'"
+                   for pat in (getattr(args, "include", None) or []))
+
+
+def _tps_flags(args) -> str:
+    """rclone --tpslimit flags (copy AND check hit the same source API)."""
+    tps = getattr(args, "tpslimit", None)
+    if not tps:  # None or 0 = uncapped
+        return ""
+    return f" --tpslimit {tps} --tpslimit-burst {tps}"
 
 
 def _tmux_alive(ip: str, dry_run: bool) -> bool:
@@ -435,8 +528,9 @@ def cmd_transfer(spec: Spec, root: Path, args) -> dict:
                 "hint": "tmux session 'transfer' is alive — use status."}
     extra = (" " + spec.extra_rclone_flags) if spec.extra_rclone_flags else ""
     rclone_cmd = (f"rclone copy '{spec.source_ref(loc)}' "
-                  f"azure:{cfg['container']}/{prefix} "
-                  f"--transfers {args.transfers} --checkers {args.checkers} "
+                  f"azure:{cfg['container']}/{prefix}{_include_flags(args)} "
+                  f"--transfers {args.transfers} --checkers {args.checkers}"
+                  f"{_tps_flags(args)} "
                   f"--retries 5 --log-file={LOG_PATH} --log-level INFO "
                   f"--stats 1m --stats-log-level NOTICE{extra}")
     run_ssh(vm["public_ip"],
@@ -497,8 +591,9 @@ def cmd_verify(spec: Spec, root: Path, args) -> dict:
     loc, prefix = loc_and_prefix(spec, vm, args)
     proc = run_ssh(vm["public_ip"],
                    f"rclone check '{spec.source_ref(loc)}' "
-                   f"azure:{cfg['container']}/{prefix} --one-way 2>&1 "
-                   "| tail -40",
+                   f"azure:{cfg['container']}/{prefix}{_include_flags(args)}"
+                   f"{_tps_flags(args)} "
+                   "--one-way 2>&1 | tail -40",
                    dry_run=args.dry_run, check=False, timeout=3600)
     out = (proc.stdout or "").strip()
     clean = proc.returncode == 0
@@ -533,11 +628,23 @@ def cmd_teardown(spec: Spec, root: Path, args) -> dict:
                 "hint": "Teardown deletes billable resources. The skill must "
                         "show the plan and get explicit user confirmation, "
                         "then re-run with --confirmed."}
+    # Remove OUR vnet-rule from the SA first, while the subnet still
+    # resolves (only the rule for this VM's VNET — pre-existing rules are
+    # the client's own push path and are never touched).
+    deleted = []
+    subnet_id = _subnet_id(spec, rg, args.slug, args.dry_run)
+    proc = common.run_az(["storage", "account", "network-rule", "remove",
+                          "-g", cfg["resource_group"],
+                          "--account-name", cfg["storage_account"],
+                          "--subnet", subnet_id or f"{name}VNET/{name}Subnet"],
+                         dry_run=args.dry_run, check=False, timeout=300)
+    if proc.returncode == 0:
+        deleted.append(f"sa-vnet-rule:{name}VNET")
     # NIC + OS disk are delete-option-tied to the VM; PIP, NSG and VNET are
     # not. VNET last — its subnet is only free once the NIC died with the VM.
     common.run_az(["vm", "delete", "-g", rg, "-n", name, "--yes"],
                   dry_run=args.dry_run, timeout=900)
-    deleted = [f"vm:{name}", "nic (delete-option)", "os-disk (delete-option)"]
+    deleted += [f"vm:{name}", "nic (delete-option)", "os-disk (delete-option)"]
     for kind, res in (("public-ip", f"{name}PublicIP"), ("nsg", f"{name}NSG"),
                       ("vnet", f"{name}VNET")):
         proc = common.run_az(["network", kind, "delete", "-g", rg, "-n", res],
@@ -546,10 +653,9 @@ def cmd_teardown(spec: Spec, root: Path, args) -> dict:
             deleted.append(f"{kind}:{res}")
     return {"ok": True, "deleted": deleted, "released_ip": ip,
             "reminders": [
-                f"Remove {ip} AND the {name}VNET subnet vnet-rule from "
-                f"storage account {cfg['storage_account']} (internal UI, or "
-                "az only on explicit user override) — the vnet rule goes "
-                "stale once the VNET is deleted",
+                f"The {name}VNET vnet-rule was removed automatically; if an "
+                f"IP rule for {ip} was ever added via the internal UI, "
+                f"remove it there (storage account {cfg['storage_account']})",
                 "The rwlc container SAS lapses on its own at its expiry — "
                 "no revocation needed, but note the date",
                 "Optionally tell the customer admin they can revoke the "
@@ -606,7 +712,8 @@ def main(spec: Spec, doc: str) -> int:
     import argparse
     p = argparse.ArgumentParser(description=doc)
     p.add_argument("command", choices=[
-        "discover", "plan", "create-vm", "write-azure-remote", "check-azure",
+        "discover", "plan", "create-vm", "allow-network",
+        "write-azure-remote", "check-azure",
         f"write-{spec.source_name}-remote", "transfer", "status", "verify",
         "teardown"])
     p.add_argument("slug")
@@ -625,8 +732,25 @@ def main(spec: Spec, doc: str) -> int:
                    help=f"prefix inside <slug>-raw "
                         f"(default {spec.default_dest_prefix})")
     p.add_argument("--sas-days", type=int, default=21)
+    p.add_argument("--include", action="append", default=None,
+                   metavar="PATTERN",
+                   help="transfer/verify: rclone --include filter "
+                        "(repeatable); anything not matched is excluded "
+                        "from BOTH the copy and the check")
+    p.add_argument("--oauth-client-json", default=None,
+                   help=f"write-{spec.source_name}-remote only: path to an "
+                        "OAuth client JSON (Google Cloud download format); "
+                        "its client_id/client_secret go into the remote "
+                        "conf so the token from a custom app can refresh. "
+                        "The token must have been minted with the SAME "
+                        "client (rclone authorize \"<target>\" "
+                        "\"<id>\" \"<secret>\").")
     p.add_argument("--transfers", type=int, default=spec.default_transfers)
     p.add_argument("--checkers", type=int, default=spec.default_checkers)
+    p.add_argument("--tpslimit", type=int, default=spec.default_tpslimit,
+                   help="transfer/verify: cap on source-API transactions/sec "
+                        "(rclone --tpslimit, burst = limit); 0 = uncapped "
+                        f"(default {spec.default_tpslimit})")
     p.add_argument("--confirmed", action="store_true",
                    help="teardown only: user confirmed the deletion plan")
     p.add_argument("--force", action="store_true",
@@ -641,7 +765,7 @@ def main(spec: Spec, doc: str) -> int:
 
     root = Path(args.root)
     fn = {"discover": cmd_discover, "plan": cmd_plan,
-          "create-vm": cmd_create_vm,
+          "create-vm": cmd_create_vm, "allow-network": cmd_allow_network,
           "write-azure-remote": cmd_write_azure_remote,
           "check-azure": cmd_check_azure,
           f"write-{spec.source_name}-remote": cmd_write_source_remote,

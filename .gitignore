@@ -4,9 +4,13 @@ companies/.fleet-state.json
 # per-company runtime state lives on disk only, not in git
 companies/*/
 
+# OAuth client JSONs for custom transfer apps (dropbox/google); local only
+companies/.oauth-client-*.json
+
 # generated fleet dashboard (rebuilt by report-all)
 reports/index.html
 __pycache__/
 *.pyc
 .DS_Store
 .preview/
+.idea/

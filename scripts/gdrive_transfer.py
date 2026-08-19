@@ -29,13 +29,19 @@ SPEC = transfer_engine.Spec(
     authorize_target="drive",
     remote_type="drive",
     remote_extra="scope = drive\n",
-    extra_rclone_flags="--tpslimit 10",
     default_transfers=8,
     default_checkers=16,
+    default_tpslimit=10,
     extra_cli_opts=[{
         "flag": "--team-drive", "argname": "team_drive",
         "tag": "gdrive_team_drive", "conf_key": "team_drive",
         "help": "Shared Drive ID (default: the token owner's My Drive)",
+    }, {
+        "flag": "--shared-with-me", "argname": "shared_with_me",
+        "tag": "gdrive_shared_with_me", "conf_key": "shared_with_me",
+        "help": "pass 'true' when the source is a folder shared TO the "
+                "token's account ('Shared with me' — not in its My Drive "
+                "and not a Shared Drive)",
     }],
 )
 

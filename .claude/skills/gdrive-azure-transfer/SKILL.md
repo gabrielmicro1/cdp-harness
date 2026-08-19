@@ -20,13 +20,14 @@ command templates + troubleshooting:
 
 ## HARD CONSTRAINTS — never violate
 
-1. **Network rules are human-only.** NEVER run
-   `az storage account network-rule add` (or any vnet change) unprompted.
-   Surface what's needed and PAUSE; run az yourself only on an explicit
-   user override. **Same-region caveat (learned 2026-08, song-division):**
-   IP rules do NOT match traffic from a VM in the SA's own region — the
-   working config is the `Microsoft.Storage` service endpoint on the VM's
-   subnet plus a vnet-rule on the SA. Say so at the pause.
+1. **Network rules go through `allow-network` only.** The engine grants
+   access itself (Microsoft.Storage service endpoint on the VM's subnet +
+   a vnet-rule on the SA — IP rules never match same-region VM traffic;
+   learned 2026-08, song-division) and teardown removes exactly the rule
+   it added. Never hand-roll `network-rule add`, and NEVER remove a rule
+   the engine didn't add — pre-existing rules are the client's own push
+   path. If a 403 reappears mid-run, company infra may have stripped the
+   rule: re-run `allow-network`.
 2. **Google auth is human-in-the-loop.** Never automate the Google
    sign-in. The Drive owner/admin runs `rclone authorize "drive"` on
    their own machine; you wait for the user to paste the token.
@@ -76,12 +77,11 @@ python3 scripts/gdrive_transfer.py plan <slug> [--path ...] [--team-drive <id>]
    tags for stateless rediscovery.
 3. `write-azure-remote <slug>` — mints the container SAS (rwlc, 21 days),
    installs the `azure` remote.
-4. **PAUSE #1 — network access.** Print the VM's public IP and state BOTH
-   needs: the internal-UI entry AND the same-region service-endpoint +
-   vnet-rule. Wait.
-5. On confirmation: `check-azure <slug>` — classifies 403s
-   (`vm_vnet_rule_present` / `vm_ip_in_ruleset`; propagation ≈ ~10s).
-   Never a SAS problem — do not re-mint.
+4. `allow-network <slug>` — grants the VM storage access (service
+   endpoint + vnet-rule). No pause: the engine runs this itself.
+5. `check-azure <slug>` — classifies 403s (`vm_vnet_rule_present` /
+   `vm_ip_in_ruleset`; propagation ≈ ~10s; missing rule = re-run
+   allow-network). Never a SAS problem — do not re-mint.
 6. **PAUSE #2 — Google token.** Snippet for the Drive owner (secure
    channel; revocable afterward at myaccount.google.com → Security →
    Third-party access):
@@ -105,6 +105,15 @@ python3 scripts/gdrive_transfer.py plan <slug> [--path ...] [--team-drive <id>]
    EOF
    ```
 
+   **Custom OAuth app (faster — our own API quota):** if the user supplies
+   their own Google OAuth client (the client-secret JSON downloaded from
+   Google Cloud), the owner's authorize command becomes
+   `rclone authorize "drive" "<client_id>" "<client_secret>"` (include both
+   values in the snippet), and write-gdrive-remote needs
+   `--oauth-client-json <path>` so the conf carries the matching
+   client_id/client_secret — a token only refreshes against the client
+   that minted it.
+
    Verifies the listing and reports total size + object count. **Sizing
    caveat:** native Google Docs/Sheets/Slides have no binary size — they
    are exported as docx/xlsx/pptx during copy, so `rclone size` undercounts
@@ -118,7 +127,8 @@ python3 scripts/gdrive_transfer.py transfer <slug>
 ```
 
 rclone copy in tmux (8 transfers / 16 checkers / 5 retries /
-`--tpslimit 10` — the Drive API 403s under aggressive parallelism; raising
+`--tpslimit 10` + matching burst (a `--tpslimit` CLI flag overrides;
+0 = uncapped) — the Drive API 403s under aggressive parallelism; raising
 `--transfers` usually slows it down). Confirms alive and hands back — do
 NOT block. Re-running resumes safely. Refuses if already running.
 
@@ -152,9 +162,10 @@ gated). Real binary files missing → re-run transfer, re-verify.
    explicit user override).
 2. Show the deletion plan: VM + NIC + OS disk + public IP + NSG + VNET →
    **GATE: always confirm**, then re-run with `--confirmed`.
-3. Relay the reminder checklist verbatim: remove the IP rule AND the
-   stale vnet-rule from the SA; note the SAS expiry; the Drive owner can
-   revoke rclone at myaccount.google.com → Security.
+3. Relay the reminder checklist verbatim: the vnet-rule is removed
+   automatically (only ours); any UI-added IP rule must go via the UI;
+   note the SAS expiry; the Drive owner can revoke rclone at
+   myaccount.google.com → Security.
 
 ## Judgment notes
 
