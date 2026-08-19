@@ -415,15 +415,31 @@ Sharp edges that are *by design* (don't "fix" without understanding):
   get an exact streaming decompress under a per-run byte budget and become
   `gz-exact`;
   transport failures retry (re-reserving budget), decode failures are
-  terminal and fall back to the floored value. Whatever stays unmeasured
-  after the budget runs out is quantified, never silent, in the run's
-  `gz.uncertain` / `gz.uncertain_bytes` fields.
+  terminal and fall back to the floored value — except a truncated upload
+  (`ValueError` mid-stream), which becomes `gz-truncated` at the exact byte
+  count decompressed before the cut: that is the true logical size of the
+  content that exists, and unlike a garbage trailer it can't overcount
+  (seen on bacancy: a duplicity volume claiming 4.29 GB via trailer that
+  actually holds ~66 MB). `gz-truncated` is treated as terminal like
+  `gz-exact` — re-streaming can't improve it until the ETag changes.
+  Whatever stays unmeasured after the budget runs out is quantified, never
+  silent, in the run's `gz.uncertain` / `gz.uncertain_bytes` fields.
 - **Zips are non-recursive**: a zip inside a zip contributes its compressed
   size via the outer CD; nested contents are not expanded.
 - **`MAX_ZIP_ENTRIES` cap** (5M): a monster CD parses partially
   (`zip:partialN/M` method) rather than stalling.
 - **`zip-no-eocd` / `zip-loc64-*` methods**: unparseable zip structures fall
-  back to compressed size, not errors.
+  back to compressed size, not errors. Before flooring, three recoveries are
+  tried: a saturated entry count (0xFFFF with real 32-bit CD offsets and NO
+  zip64 records — Takeout writes this past 65,535 entries) parses the CD by
+  walking it to the end; a corrupt/absent zip64 locator falls back to
+  scanning the tail for the EOCD64 record's own signature; a missing EOCD
+  retries once with an 8 MB tail (`ZIP_TAIL_RETRY`) in case of trailing
+  junk. What still floors after all three is genuinely truncated or not a
+  zip at all (misnamed AppleDouble/PDF/RAR files are common in Drive
+  exports). `zip-tiny` (< 22 bytes, incl. zero-byte placeholders) is counted
+  at stored size with no range read — a 0-byte blob used to surface as a
+  spurious HTTPError 400.
 
 ---
 

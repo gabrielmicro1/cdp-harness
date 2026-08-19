@@ -53,7 +53,9 @@ def cmd_launch_all(args) -> dict:
     def check(slug):
         try:
             cfg = common.load_config(root, slug)
-            return slug, cfg, phases.skip_check(root, slug, cfg, dry_run=args.dry_run), None
+            return slug, cfg, phases.skip_check(
+                root, slug, cfg, dry_run=args.dry_run,
+                force=getattr(args, "force", False)), None
         except Exception as exc:  # noqa: BLE001 — isolation: one company ≠ the fleet
             return slug, None, None, str(exc)
 
@@ -194,6 +196,10 @@ def main() -> int:
                     help="print az commands instead of running them")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore the per-company blob index (full re-size)")
+    ap.add_argument("--force", action="store_true",
+                    help="bypass the UsedCapacity skip check and size anyway "
+                         "(for re-sizing an unchanged container under new "
+                         "sizer settings, e.g. GZ_STREAM_* knobs)")
     ap.add_argument("--max-wait", type=int, default=480,
                     help="poll-all/run: seconds to keep polling before returning "
                          "(keep under the 10-min Bash timeout; resumable)")

@@ -36,6 +36,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore the per-company blob index (full re-size)")
+    ap.add_argument("--force", action="store_true",
+                    help="bypass the UsedCapacity skip check and size anyway "
+                         "(for re-sizing an unchanged container under new "
+                         "sizer settings, e.g. GZ_STREAM_* knobs)")
     ap.add_argument("--max-wait", type=int, default=480)
     args = ap.parse_args()
     args.slugs = [args.slug]

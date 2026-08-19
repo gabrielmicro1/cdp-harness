@@ -101,10 +101,17 @@ def read_used_capacity(cfg: dict, dry_run: bool = False):
     return None, None
 
 
-def skip_check(root: Path, slug: str, cfg: dict, dry_run: bool = False) -> dict:
+def skip_check(root: Path, slug: str, cfg: dict, dry_run: bool = False,
+               force: bool = False) -> dict:
     """Decide launch vs copy-forward. Unchanged metric AND a previous run with
-    totals → skip. Any doubt (no metric, no prior run) → launch (safe side)."""
+    totals → skip. Any doubt (no metric, no prior run) → launch (safe side).
+    force never skips: for re-sizing an UNCHANGED container under different
+    sizer settings (e.g. gz exact-streaming knobs), where the metric is
+    unchanged by definition but the numbers we want are not."""
     metric, metric_at = read_used_capacity(cfg, dry_run=dry_run)
+    if force:
+        return {"skip": False, "metric": metric, "metric_at": metric_at,
+                "reason": "forced re-size (skip check bypassed)"}
     prev = common.latest_runs(root, slug, 1)
     prev = prev[0] if prev else None
     if metric is None:

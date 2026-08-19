@@ -425,7 +425,10 @@ EOCD_SIZE = 22
 LOC64_SIG = 0x07064b50
 LOC64_STRUCT = "<IIQI"
 LOC64_SIZE = 20
+EOCD64_SIG = 0x06064b50
 EOCD64_STRUCT = "<IQHHIIQQQQ"
+EOCD64_SIZE = 56
+ZIP_TAIL_RETRY = 8_000_000
 CD_SIG = 0x02014b50
 
 
@@ -438,7 +441,10 @@ def _parse_cd(cd, total_entries, matcher=None):
     n = 0
     p = 0
     svc = {}
-    cap = min(total_entries, MAX_ZIP_ENTRIES)
+    # total_entries None = count unknown (saturated 0xFFFF EOCD without zip64
+    # records — Takeout does this past 65,535 entries): walk the whole buffer
+    cap = (MAX_ZIP_ENTRIES if total_entries is None
+           else min(total_entries, MAX_ZIP_ENTRIES))
     sig = struct.pack("<I", CD_SIG)
     while p + 46 <= len(cd) and n < cap:
         if cd[p:p + 4] != sig:
@@ -475,28 +481,66 @@ def _parse_cd(cd, total_entries, matcher=None):
     return total_uncomp, n, svc
 
 
+def _eocd64_scan(tail, idx, clen):
+    """Locate the EOCD64 record by its own signature in the tail (fallback for
+    absent/corrupt zip64 locators — seen on Takeout part files). Scans only
+    bytes before the EOCD at idx; returns (entries, cd_size, cd_off) or None."""
+    sig = struct.pack("<I", EOCD64_SIG)
+    p = tail.rfind(sig, 0, idx)
+    while p >= 0:
+        if p + EOCD64_SIZE <= len(tail):
+            (_s, _sz, _v, _vn, _d, _cds, _etd, entries, cd_size,
+             cd_off) = struct.unpack(EOCD64_STRUCT, tail[p:p + EOCD64_SIZE])
+            if 0 < entries and cd_size and cd_off + cd_size <= clen:
+                return entries, cd_size, cd_off
+        p = tail.rfind(sig, 0, p)
+    return None
+
+
 def zip_uncompressed(name, clen, matcher=None):
     """Return (uncompressed_bytes, note, svc). Range-reads only EOCD + CD."""
-    tail_size = min(clen, 65557)
-    tail = fetch_range(name, clen - tail_size, clen - 1)
-    idx = tail.rfind(struct.pack("<I", EOCD_SIG))
+    if clen < EOCD_SIZE:
+        return clen, "zip-tiny", {}  # empty/placeholder blob — nothing to read
+    tail_sizes = [min(clen, 65557)]
+    if clen > 65557:
+        tail_sizes.append(min(clen, ZIP_TAIL_RETRY))  # oversized-comment/junk tails
+    idx = -1
+    for tail_size in tail_sizes:
+        tail = fetch_range(name, clen - tail_size, clen - 1)
+        idx = tail.rfind(struct.pack("<I", EOCD_SIG))
+        if idx >= 0:
+            break
     if idx < 0:
         return clen, "zip-no-eocd", {}
     (_sig, _disk, _cds, _etd, total_entries, cd_size, cd_off, _cl) = struct.unpack(
         EOCD_STRUCT, tail[idx:idx + EOCD_SIZE])
     if total_entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF:
         loc_start = idx - LOC64_SIZE
-        if loc_start < 0:
-            return clen, "zip-loc64-split", {}
-        (lsig, _ld, eocd64_off, _nd) = struct.unpack(LOC64_STRUCT, tail[loc_start:idx])
-        if lsig != LOC64_SIG:
-            return clen, "zip-loc64-bad", {}
-        e64 = fetch_range(name, eocd64_off, eocd64_off + 55)
-        (_s64, _sz64, _v, _vn, _d64, _cds64, _etd64, total_entries,
-         cd_size, cd_off) = struct.unpack(EOCD64_STRUCT, e64[:56])
+        rec = None
+        if loc_start >= 0:
+            (lsig, _ld, eocd64_off, _nd) = struct.unpack(LOC64_STRUCT, tail[loc_start:idx])
+            if lsig == LOC64_SIG:
+                e64 = fetch_range(name, eocd64_off, eocd64_off + EOCD64_SIZE - 1)
+                (_s64, _sz64, _v, _vn, _d64, _cds64, _etd64, entries64,
+                 cd_size64, cd_off64) = struct.unpack(EOCD64_STRUCT, e64[:EOCD64_SIZE])
+                if _s64 == EOCD64_SIG:
+                    rec = (entries64, cd_size64, cd_off64)
+        if rec is None:
+            rec = _eocd64_scan(tail, idx, clen)
+        if (rec is None and cd_size != 0xFFFFFFFF and cd_off != 0xFFFFFFFF
+                and cd_size and cd_off + cd_size <= clen):
+            # only the entry COUNT is saturated (>65,535 entries, no zip64
+            # records — Takeout's style): the CD location is real, walk it
+            rec = (None, cd_size, cd_off)
+        if rec is None:
+            return clen, ("zip-loc64-split" if loc_start < 0 else "zip-loc64-bad"), {}
+        total_entries, cd_size, cd_off = rec
+    if not cd_size:
+        return 0, "zip:0entries", {}  # empty archive — no CD to fetch
     cd = fetch_range(name, cd_off, cd_off + cd_size - 1)
     total_uncomp, n, svc = _parse_cd(cd, total_entries, matcher)
-    note = f"zip:{n}entries" if n == total_entries else f"zip:partial{n}/{total_entries}"
+    note = (f"zip:{n}entries" if total_entries is None or n == total_entries
+            else f"zip:partial{n}/{total_entries}")
     return total_uncomp, note, svc
 
 
@@ -541,6 +585,16 @@ def stream_blob_chunks(name, chunk=1 << 20):
 _DECOMP_STEP = 64 << 20  # bound per decompress call — caps transient memory
 
 
+class TruncatedGzStream(ValueError):
+    """The blob ends mid-member (a truncated upload). .partial carries the
+    exact byte count decompressed before the cut — the true logical size of
+    the content that actually exists in storage."""
+
+    def __init__(self, partial):
+        super().__init__("truncated gzip stream")
+        self.partial = partial
+
+
 def gz_stream_exact(name):
     """Exact uncompressed size: stream-decompress every gzip member,
     counting output bytes only (bounded memory: <= _DECOMP_STEP per step,
@@ -560,7 +614,7 @@ def gz_stream_exact(name):
                 total += len(d.decompress(d.unconsumed_tail, _DECOMP_STEP))
             chunk = d.unused_data if d.eof else b""
     if not d.eof:
-        raise ValueError("truncated gzip stream")
+        raise TruncatedGzStream(total)
     return total
 
 
@@ -599,8 +653,8 @@ def gz_cached_row_stale(method, clen, uncomp):
     Pre-taxonomy rows say gz-trailer even when floored — uncomp == clen is
     the tell. When streaming is disabled the row is never stale (re-reading
     the trailer every run would gain nothing)."""
-    if GZ_STREAM_BUDGET <= 0 or method == "gz-exact":
-        return False
+    if GZ_STREAM_BUDGET <= 0 or method in ("gz-exact", "gz-truncated"):
+        return False  # gz-truncated is content-exact until the ETag changes
     if clen >= GZ_STREAM_THRESHOLD:
         return True
     floored = method in ("gz-floor", "gz-bad-trailer") or uncomp == clen
@@ -685,6 +739,12 @@ def size_blob(name, clen, etag, kind, matcher, budget=None):
                 try:
                     uncomp, method = (_gz_stream_with_retry(name, clen, budget),
                                        "gz-exact")
+                except TruncatedGzStream as exc:
+                    # blob ends mid-member: the partial count IS the exact
+                    # logical size of what exists (a garbage trailer would
+                    # over- or undercount arbitrarily)
+                    uncomp, method = exc.partial, "gz-truncated"
+                    logmsg(f"truncated gz {name}: exact partial {exc.partial}")
                 except Exception as exc:  # noqa: BLE001 — keep trailer value
                     logmsg(f"stream fallback {name}: {type(exc).__name__}: "
                            f"{str(exc)[:120]}")
