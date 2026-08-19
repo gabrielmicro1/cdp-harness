@@ -107,14 +107,13 @@ FLAG_BADGES = {
 }
 
 
-def bar_chart(rows: list[dict], unexpected: list[str], run: dict | None) -> str:
+def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
     """Grouped horizontal bars, declared vs uncompressed, as inline SVG."""
     entries = []
     for r in rows:
         if r["declared_records"] is not None:
             continue  # record-count services: listed in the table, not the chart
         entries.append((r["service"], r["declared_bytes"] or 0, r["actual_bytes"]))
-    sources = (run or {}).get("sources", {})
     for s in unexpected:
         entries.append((s + " *", 0, sources[s]["uncompressed_bytes"]))
     entries.sort(key=lambda e: -e[2])
@@ -129,7 +128,7 @@ def bar_chart(rows: list[dict], unexpected: list[str], run: dict | None) -> str:
     log_scale = vmin > 0 and vmax / vmin >= 1000  # spans ≥3 orders of magnitude
     floor = vmin / 2 if log_scale else 0
 
-    label_w, chart_w, bar_h, gap, group_gap = 190, 560, 12, 2, 14
+    label_w, chart_w, bar_h, gap, group_gap = 260, 560, 12, 2, 14
     group_h = bar_h * 2 + gap
     height = len(entries) * (group_h + group_gap) + 8
 
@@ -167,7 +166,7 @@ def bar_chart(rows: list[dict], unexpected: list[str], run: dict | None) -> str:
     return f'<div class="chart">{legend}{"".join(parts)}</div>'
 
 
-def service_table(rows: list[dict], unexpected: list[str], run: dict | None) -> str:
+def service_table(rows: list[dict], unexpected: list[str], sources: dict) -> str:
     out = ['<table><tr><th>Service</th><th class="num">Declared</th>'
            '<th class="num">Uncompressed (actual)</th><th class="num">%</th>'
            '<th>Flags</th></tr>']
@@ -181,7 +180,6 @@ def service_table(rows: list[dict], unexpected: list[str], run: dict | None) -> 
                    f'<td class="num">{esc(decl)}</td>'
                    f'<td class="num">{common.human_bytes(r["actual_bytes"])}</td>'
                    f'<td class="num">{pct}</td><td>{flags}</td></tr>')
-    sources = (run or {}).get("sources", {})
     for s in unexpected:
         out.append(f'<tr><td>{esc(s)}</td><td class="num">—</td>'
                    f'<td class="num">'
@@ -190,6 +188,43 @@ def service_table(rows: list[dict], unexpected: list[str], run: dict | None) -> 
                    f'<td>{badge("not in manifest", "warn")}</td></tr>')
     out.append("</table>")
     return "".join(out)
+
+
+L2_BREAKDOWN_MIN = 50_000_000_000  # break down undeclared sources ≥50 GB
+
+
+def unexpected_breakdown(unexpected: list[str], run: dict | None,
+                         sources: dict) -> str:
+    """For each large not-in-manifest source, a folder-level composition table
+    from the run's sources_l2 — answers "what actually IS this prefix?"."""
+    l2 = (run or {}).get("sources_l2") or {}
+    sections = []
+    for s in unexpected:
+        total_unc = sources[s]["uncompressed_bytes"]
+        if total_unc < L2_BREAKDOWN_MIN:
+            continue
+        children = sorted(((k[len(s) + 1:], v) for k, v in l2.items()
+                           if k.startswith(s + "/")), key=lambda kv: -kv[1][2])
+        if not children:
+            continue
+        rows = ['<table><tr><th>Folder</th><th class="num">Files</th>'
+                '<th class="num">Uncompressed</th></tr>']
+        seen_unc = 0
+        for child, (files, _comp, unc) in children:
+            seen_unc += unc
+            rows.append(f'<tr><td>{esc(child)}</td>'
+                        f'<td class="num">{files:,}</td>'
+                        f'<td class="num">{common.human_bytes(unc)}</td></tr>')
+        rest = total_unc - seen_unc
+        if rest > 0:
+            rows.append(f'<tr><td class="meta">(everything else)</td>'
+                        f'<td class="num"></td>'
+                        f'<td class="num">{common.human_bytes(rest)}</td></tr>')
+        rows.append("</table>")
+        sections.append(f'<h2>Inside {esc(s)} '
+                        f'{badge("not in manifest", "warn")}</h2>'
+                        + "".join(rows))
+    return "".join(sections)
 
 
 def build_html(s: dict) -> str:
@@ -259,9 +294,10 @@ def build_html(s: dict) -> str:
 </header>
 <div class="cards">{''.join(kpis)}</div>
 <h2>Declared vs received, per source</h2>
-{bar_chart(s["service_rows"], s["unexpected_sources"], run)}
+{bar_chart(s["service_rows"], s["unexpected_sources"], s["sources"])}
 <h2>Per-service detail</h2>
-{service_table(s["service_rows"], s["unexpected_sources"], run)}
+{service_table(s["service_rows"], s["unexpected_sources"], s["sources"])}
+{unexpected_breakdown(s["unexpected_sources"], run, s["sources"])}
 {notes_html}
 <footer>Generated {common.iso_now()[:10]} by micro1 · sizes are decimal
 (GB = 10⁹ bytes) · comparison column is uncompressed logical size</footer>

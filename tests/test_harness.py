@@ -85,6 +85,36 @@ def main() -> int:
     check("BadZipFile note", "BadZipFile" in notes)
     check("no store-mode note (ratio 2.3)", "store-mode" not in notes)
 
+    print("\n— reconcile: duplicate-data rollup —")
+    dup = reconcile.duplicate_rollup([
+        ("gdrive/a@x.com/take-001.zip", 100, 900),
+        ("gdrive/a@x.com_cleanup/take-001.zip", 100, 900),   # dup of above
+        ("gdrive/b@x.com/take-001.zip", 100, 901),            # unc differs: not dup
+        ("slack/exp.zip", 50, 60),
+        ("slack/deep/dir/exp.zip", 50, 60),                   # dup, same source
+        ("code/exp.zip", 50, 60),                             # other source: not dup
+    ])
+    check("dup rollup bytes", dup["bytes"] == 960, str(dup))
+    check("dup rollup files", dup["files"] == 2, str(dup))
+    check("dup rollup per-source", dup["by_source"]
+          == {"gdrive": 900, "slack": 60}, str(dup))
+    check("no dup note when index absent",
+          reconcile.duplicate_notes(root, "democo") == [])
+    dup_idx = root / "democo" / "blob-index.tsv.gz"
+    with gzip.open(dup_idx, "wt") as fh:
+        fh.write("#matcher\tdeadbeef\n")
+        for pfx in ("u@x.com", "u@x.com_cleanup"):
+            fh.write(f"gdrive/{pfx}/take-001.zip\t0xAB\t"
+                     f"9000000000\t20000000000\tzip:5entries\t\n")
+    dnotes = reconcile.duplicate_notes(root, "democo")
+    check("dup note over threshold", len(dnotes) == 1
+          and "20.00 GB" in dnotes[0] and "gdrive" in dnotes[0],
+          str(dnotes))
+    s2 = reconcile.company_summary(root, "democo")
+    check("dup note reaches summary notes",
+          any("duplicated data" in n for n in s2["notes"]))
+    dup_idx.unlink()
+
     print("\n— gen_report —")
     proc = run_script("gen_report.py", "democo", "--root", root)
     report_path = Path(proc.stdout.strip())
@@ -225,6 +255,148 @@ def main() -> int:
     ehtml = Path(proc.stdout.strip()).read_text()
     check("report renders found-embedded badge",
           "embedded in another source" in ehtml)
+
+    print("\n— reconcile: prefix pin + variant aggregation —")
+    pinco = root / "pinco"
+    (pinco / "sizing-runs").mkdir(parents=True)
+    common.write_json(pinco / "config.json", {
+        "slug": "pinco", "subscription": "m1 corpus", "subscription_id": "x",
+        "resource_group": "rg-pinco", "storage_account": "stpinco",
+        "container": "pinco-raw",
+        "vm": {"name": None, "resource_group": "rg-pinco", "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(pinco / "expected-data-sizes.json", {
+        "slug": "pinco", "manifest_total_bytes": 1_000_000_000_000,
+        "services": {
+            # manifest name ≠ pushed prefix: pinned explicitly
+            "google-workspace": {"bytes": 800_000_000_000,
+                                 "prefix": "workspace-export"},
+            # name match must sum case variants (zoom/ + Zoom/)
+            "zoom": {"bytes": 200_000_000_000}},
+        "source": "test", "confirmed_by_user": True,
+        "created_at": "2026-08-01T00:00:00Z"})
+    common.write_json(pinco / "status.json", {
+        "slug": "pinco", "stage": "pushing",
+        "last_run": {"timestamp": "2026-08-13T09:00:00Z", "outcome": "sized",
+                     "reason": None},
+        "last_change_detected_at": "2026-08-13T09:00:00Z"})
+    common.write_json(pinco / "sizing-runs" / "20260813T100000Z.json", {
+        "slug": "pinco", "timestamp": "2026-08-13T10:00:00Z",
+        "method": "sized", "copied_from": None,
+        "used_capacity_bytes": 700_000_000_000,
+        "used_capacity_at": "2026-08-13T09:00:00Z", "duration_seconds": 60,
+        "totals": {"blob_count": 40, "compressed_bytes": 700_000_000_000,
+                   "uncompressed_bytes": 830_000_000_000,
+                   "zero_byte_blobs": 0},
+        "sources": {
+            "workspace-export": {"blob_count": 10,
+                                 "compressed_bytes": 500_000_000_000,
+                                 "uncompressed_bytes": 600_000_000_000},
+            "zoom": {"blob_count": 10, "compressed_bytes": 90_000_000_000,
+                     "uncompressed_bytes": 90_000_000_000},
+            "Zoom": {"blob_count": 10, "compressed_bytes": 10_000_000_000,
+                     "uncompressed_bytes": 10_000_000_000},
+            "dropbox-export": {"blob_count": 10,
+                               "compressed_bytes": 100_000_000_000,
+                               "uncompressed_bytes": 130_000_000_000}},
+        "sources_l2": {
+            "dropbox-export/Creative": [6, 90_000_000_000, 110_000_000_000],
+            "dropbox-export/Sales": [3, 9_000_000_000, 15_000_000_000]},
+        "methods": {"zip": 40}, "errors": {"total": 0, "by_type": {}},
+        "notes": []})
+    ps = reconcile.company_summary(root, "pinco")
+    prows = {r["service"]: r for r in ps["service_rows"]}
+    check("prefix pin matches workspace-export",
+          prows["google-workspace"]["actual_bytes"] == 600_000_000_000,
+          str(prows["google-workspace"]))
+    check("pinned source not unexpected",
+          "workspace-export" not in ps["unexpected_sources"])
+    check("case variants summed (zoom + Zoom)",
+          prows["zoom"]["actual_bytes"] == 100_000_000_000
+          and prows["zoom"]["blob_count"] == 20, str(prows["zoom"]))
+    check("Zoom variant not unexpected",
+          "Zoom" not in ps["unexpected_sources"])
+    check("dropbox-export still unexpected",
+          ps["unexpected_sources"] == ["dropbox-export"],
+          str(ps["unexpected_sources"]))
+    proc = run_script("gen_report.py", "pinco", "--root", root)
+    phtml = Path(proc.stdout.strip()).read_text()
+    check("report breaks down large unexpected source",
+          "Inside dropbox-export" in phtml and "Creative" in phtml)
+    check("breakdown includes remainder row", "(everything else)" in phtml)
+
+    print("\n— reconcile: source_split (services nested in one export folder) —")
+    splitco = root / "splitco"
+    (splitco / "sizing-runs").mkdir(parents=True)
+    common.write_json(splitco / "config.json", {
+        "slug": "splitco", "subscription": "m1 corpus", "subscription_id": "x",
+        "resource_group": "rg-splitco", "storage_account": "stsplitco",
+        "container": "splitco-raw",
+        "vm": {"name": None, "resource_group": "rg-splitco", "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(splitco / "expected-data-sizes.json", {
+        "slug": "splitco", "manifest_total_bytes": 100_000_000_000,
+        # every service was pushed INSIDE gdrive-export/, not as its own
+        # top-level prefix — split it and reconcile against the children
+        "source_split": ["gdrive-export"],
+        "services": {
+            # bare manifest name matches the child's last path segment
+            "Notion": {"bytes": 2_600_000_000},
+            # child folder named differently: pinned by full path…
+            "Vanta": {"bytes": 27_800_000, "prefix": "gdrive-export/Vanta data"},
+            # …or by the child segment alone
+            "Slack": {"bytes": 3_000_000_000,
+                      "prefix": "SwiftLaw Slack export Mar 16 2022"}},
+        "source": "test", "confirmed_by_user": True,
+        "created_at": "2026-08-01T00:00:00Z"})
+    common.write_json(splitco / "status.json", {
+        "slug": "splitco", "stage": "pushing",
+        "last_run": {"timestamp": "2026-08-13T09:00:00Z", "outcome": "sized",
+                     "reason": None},
+        "last_change_detected_at": "2026-08-13T09:00:00Z"})
+    common.write_json(splitco / "sizing-runs" / "20260813T100000Z.json", {
+        "slug": "splitco", "timestamp": "2026-08-13T10:00:00Z",
+        "method": "sized", "copied_from": None,
+        "used_capacity_bytes": 8_000_000_000,
+        "used_capacity_at": "2026-08-13T09:00:00Z", "duration_seconds": 60,
+        "totals": {"blob_count": 1200, "compressed_bytes": 8_000_000_000,
+                   "uncompressed_bytes": 10_000_000_000, "zero_byte_blobs": 0},
+        "sources": {"gdrive-export": {"blob_count": 1200,
+                                      "compressed_bytes": 8_000_000_000,
+                                      "uncompressed_bytes": 10_000_000_000}},
+        "sources_l2": {
+            "gdrive-export/Notion": [3, 2_000_000_000, 2_600_000_000],
+            "gdrive-export/Vanta data": [77, 20_000_000, 27_800_000],
+            "gdrive-export/SwiftLaw Slack export Mar 16 2022": [
+                1073, 25_000_000, 30_000_000],
+            "gdrive-export/Fireflies": [3, 5_000_000_000, 7_000_000_000]},
+        "methods": {"stored": 1200}, "errors": {"total": 0, "by_type": {}},
+        "notes": []})
+    ss = reconcile.company_summary(root, "splitco")
+    srows = {r["service"]: r for r in ss["service_rows"]}
+    check("split child matched by bare manifest name",
+          srows["Notion"]["actual_bytes"] == 2_600_000_000, str(srows["Notion"]))
+    check("split child matched by full-path pin",
+          srows["Vanta"]["actual_bytes"] == 27_800_000, str(srows["Vanta"]))
+    check("split child matched by child-segment pin",
+          srows["Slack"]["actual_bytes"] == 30_000_000, str(srows["Slack"]))
+    check("split parent is no longer a source",
+          "gdrive-export" not in ss["sources"], str(list(ss["sources"])))
+    check("undeclared child surfaces as unexpected",
+          "gdrive-export/Fireflies" in ss["unexpected_sources"],
+          str(ss["unexpected_sources"]))
+    check("split conserves bytes via (unaccounted)",
+          ss["sources"]["gdrive-export/(unaccounted)"]["uncompressed_bytes"]
+          == 10_000_000_000 - (2_600_000_000 + 27_800_000 + 30_000_000
+                               + 7_000_000_000),
+          str(ss["sources"].get("gdrive-export/(unaccounted)")))
+    check("split leaves headline % on run totals",
+          abs(ss["pct_complete"] - 10.0) < 0.01, str(ss["pct_complete"]))
+    proc = run_script("gen_report.py", "splitco", "--root", root)
+    shtml = Path(proc.stdout.strip()).read_text()
+    check("report renders split children", "gdrive-export/Fireflies" in shtml)
+    check("report keeps declared split services",
+          "Notion" in shtml and "Vanta" in shtml)
 
     print("\n— copied-forward + status transitions —")
     run_path = phases.write_copied_forward_run(root, "democo",
@@ -453,8 +625,10 @@ def main() -> int:
         try:
             sizer.gz_stream_exact("trunc.gz")
             check("truncated stream raises", False)
-        except ValueError:
+        except sizer.TruncatedGzStream as exc:
             check("truncated stream raises", True)
+            check("truncation carries exact partial", exc.partial == 5000,
+                  str(exc.partial))
         blobs["junk.gz"] = b"\x00" * 64
         try:
             sizer.gz_stream_exact("junk.gz")
@@ -463,6 +637,111 @@ def main() -> int:
             check("non-gzip bytes raise", True)
     finally:
         sizer.stream_blob_chunks = real_stream
+
+    print("\n— sizer: zip64 EOCD recovery —")
+
+    def make_plain_zip(entries):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for ename, size in entries.items():
+                z.writestr(ename, b"x" * size)
+        return buf.getvalue()
+
+    def force_zip64(entries):
+        """Build a zip whose EOCD carries 0xFFFF/0xFFFFFFFF sentinels + real
+        zip64 locator/EOCD64 records (zipfile only emits them when forced)."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for ename, size in entries.items():
+                z.writestr(ename, b"x" * size)
+        data = buf.getvalue()
+        eidx = data.rfind(struct.pack("<I", 0x06054b50))
+        (_s, _d, _c1, _c2, n_ent, cd_size, cd_off, _cl) = struct.unpack(
+            "<IHHHHIIH", data[eidx:eidx + 22])
+        eocd64 = struct.pack("<IQHHIIQQQQ", 0x06064b50, 44, 45, 45, 0, 0,
+                             n_ent, n_ent, cd_size, cd_off)
+        loc64 = struct.pack("<IIQI", 0x07064b50, 0, eidx, 1)
+        eocd = struct.pack("<IHHHHIIH", 0x06054b50, 0, 0, 0xFFFF, 0xFFFF,
+                           0xFFFFFFFF, 0xFFFFFFFF, 0)
+        return data[:eidx] + eocd64 + loc64 + eocd
+
+    real_fetch2 = sizer.fetch_range
+    try:
+        served = {}
+        sizer.fetch_range = (lambda name, s, e:
+                             served[name][s:e + 1])
+
+        z64 = force_zip64({"a/x.bin": 1000, "b/y.bin": 500})
+        served["ok64.zip"] = z64
+        tot, note, _ = sizer.zip_uncompressed("ok64.zip", len(z64))
+        check("zip64 via locator", (tot, note) == (1500, "zip:2entries"),
+              f"{tot},{note}")
+
+        # corrupt the locator signature → old code floored as zip-loc64-bad;
+        # the EOCD64-scan fallback must still recover the true size
+        eidx = z64.rfind(struct.pack("<I", 0x06054b50))
+        loc_start = eidx - 20
+        bad = bytearray(z64)
+        bad[loc_start:loc_start + 4] = b"\x00\x00\x00\x00"
+        served["badloc.zip"] = bytes(bad)
+        tot, note, _ = sizer.zip_uncompressed("badloc.zip", len(bad))
+        check("zip64 corrupt locator → EOCD64 scan", (tot, note)
+              == (1500, "zip:2entries"), f"{tot},{note}")
+
+        # locator missing entirely (EOCD64 directly before EOCD)
+        noloc = bytes(bad[:loc_start]) + bytes(bad[eidx:])
+        served["noloc.zip"] = noloc
+        tot, note, _ = sizer.zip_uncompressed("noloc.zip", len(noloc))
+        check("zip64 missing locator → EOCD64 scan", (tot, note)
+              == (1500, "zip:2entries"), f"{tot},{note}")
+
+        # no EOCD64 anywhere → still floors
+        gone = bytes(bad).replace(struct.pack("<I", 0x06064b50), b"\x00" * 4)
+        served["gone.zip"] = gone
+        tot, note, _ = sizer.zip_uncompressed("gone.zip", len(gone))
+        check("zip64 unrecoverable still floors",
+              (tot, note) == (len(gone), "zip-loc64-bad"), f"{tot},{note}")
+
+        # saturated entry count (0xFFFF, no zip64 records — Takeout past
+        # 65,535 entries): CD offsets are real, must be walked to the end
+        sat = bytearray(make_plain_zip({"a/x.bin": 1000, "b/y.bin": 500}))
+        seidx = bytes(sat).rfind(struct.pack("<I", 0x06054b50))
+        sat[seidx + 8:seidx + 12] = struct.pack("<HH", 0xFFFF, 0xFFFF)
+        served["sat.zip"] = bytes(sat)
+        tot, note, _ = sizer.zip_uncompressed("sat.zip", len(sat))
+        check("saturated entry count → CD walk", (tot, note)
+              == (1500, "zip:2entries"), f"{tot},{note}")
+
+        # 22-byte empty archive (bare EOCD, cd_size=0): must not fetch a
+        # zero-length CD range (bytes=0--1 was an HTTPError 400)
+        ez = make_plain_zip({})
+        served["empty22.zip"] = ez
+        real_fetch3 = sizer.fetch_range
+        sizer.fetch_range = (lambda name, s, e: served[name][s:e + 1]
+                             if e >= s else (_ for _ in ()).throw(
+                                 AssertionError("negative range")))
+        tot, note, _ = sizer.zip_uncompressed("empty22.zip", len(ez))
+        check("empty 22-byte zip → 0 entries", (tot, note)
+              == (0, "zip:0entries"), f"{tot},{note}")
+        sizer.fetch_range = real_fetch3
+
+        # empty blob named .zip: no range request must be made (a 0-byte
+        # read is an invalid Range and used to surface as HTTPError 400)
+        sizer.fetch_range = lambda name, s, e: (_ for _ in ()).throw(
+            AssertionError("range read on tiny zip"))
+        check("zero-byte zip short-circuits",
+              sizer.zip_uncompressed("empty.zip", 0) == (0, "zip-tiny", {}))
+        sizer.fetch_range = lambda name, s, e: served[name][s:e + 1]
+
+        # EOCD pushed out of the 65557-byte tail by trailing junk → wide retry
+        plain = make_plain_zip({"c/z.bin": 700})
+        junk = plain + b"\xde\xad" * 40_000  # 80 KB of trailing junk
+        served["junktail.zip"] = junk
+        tot, note, _ = sizer.zip_uncompressed("junktail.zip", len(junk))
+        check("EOCD beyond 64K tail → wide-tail retry",
+              (tot, note) == (700, "zip:1entries"), f"{tot},{note}")
+    finally:
+        sizer.fetch_range = real_fetch2
 
     real_stream_hr = sizer.stream_blob_chunks
     try:
@@ -1219,6 +1498,16 @@ def main() -> int:
                       "--root", root, "--dry-run")
     check("gdrive transfer: throttled defaults",
           "--transfers 8" in proc.stdout)
+    proc = run_script("gdrive_transfer.py", "transfer", "democo",
+                      "--include", "takeout-*.zip", "--root", root,
+                      "--dry-run")
+    check("gdrive transfer: --include filter reaches rclone",
+          "--include 'takeout-*.zip'" in proc.stdout)
+    proc = run_script("gdrive_transfer.py", "verify", "democo",
+                      "--include", "takeout-*.zip", "--root", root,
+                      "--dry-run")
+    check("gdrive verify: same --include filter as transfer",
+          "--include 'takeout-*.zip'" in proc.stdout)
     proc = subprocess.run(
         [sys.executable, str(SCRIPTS / "gdrive_transfer.py"),
          "write-gdrive-remote", "democo", "--root", str(root), "--dry-run"],
@@ -1229,6 +1518,20 @@ def main() -> int:
     proc = run_script("gdrive_transfer.py", "teardown", "democo",
                       "--root", root, "--dry-run", expect_rc=2)
     check("gdrive teardown also gated", '"not-confirmed"' in proc.stdout)
+    oauth_json = tmp / "oauth-client.json"
+    oauth_json.write_text(json.dumps({"installed": {
+        "client_id": "12345-abc.apps.googleusercontent.com",
+        "client_secret": "GOCSPX-OAUTHSECRET"}}))
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "gdrive_transfer.py"),
+         "write-gdrive-remote", "democo", "--root", str(root),
+         "--oauth-client-json", str(oauth_json), "--dry-run"],
+        input='{"access_token":"GDRSECRET"}', capture_output=True, text=True)
+    out = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("gdrive custom oauth client: id reported, secret never echoed",
+          proc.returncode == 0 and "GOCSPX-OAUTHSECRET" not in proc.stdout
+          and out.get("oauth_client_id")
+          == "12345-abc.apps.googleusercontent.com", proc.stdout[-300:])
 
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]

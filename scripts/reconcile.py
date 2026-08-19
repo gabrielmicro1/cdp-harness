@@ -22,12 +22,67 @@ def norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-def _find_source(service: str, sources: dict) -> str | None:
+def _leaf(name: str) -> str:
+    """Last path segment of a source key ("gdrive-export2/Notion" → "Notion").
+    Split sources keep their full path so reports stay unambiguous; matching
+    also considers the leaf so a bare manifest name still finds them."""
+    return name.rsplit("/", 1)[-1]
+
+
+def _find_sources(service: str, decl: dict, sources: dict) -> list[str]:
+    """All actual sources a declaration covers. An explicit "prefix" in the
+    declaration (string or list) pins it to named source(s) — for manifest
+    names that don't match what the client pushed (e.g. google_workspace →
+    workspace-export). Otherwise match by normalized name; every case/
+    punctuation variant counts (zoom/ and Zoom/ are one service). Both forms
+    match a split source by its full path or by its leaf, so
+    "gdrive-export2/Vanta data" can be pinned either way."""
+    want = decl.get("prefix")
+    if want:
+        wanted = {norm(w) for w in ([want] if isinstance(want, str) else want)}
+        return [s for s in sources
+                if norm(s) in wanted or norm(_leaf(s)) in wanted]
     n = norm(service)
-    for src in sources:
-        if norm(src) == n:
-            return src
-    return None
+    return [s for s in sources if norm(s) == n or norm(_leaf(s)) == n]
+
+
+def effective_sources(expected: dict | None, run: dict | None) -> dict:
+    """The sources the reconciler compares against — the run's top-level
+    prefixes, except that any prefix listed in the declaration's
+    "source_split" is replaced by its second-level children.
+
+    Why: some clients push every service INSIDE one export folder (swiftlaw's
+    gdrive-export2/, 2026-08), so the top level is a single meaningless
+    prefix and the real per-service split lives one level deeper. Children
+    keep their full "parent/child" key.
+
+    Bytes are conserved. sources_l2 is a capped rollup, so whatever the
+    children don't account for stays in a "parent/(unaccounted)" bucket
+    rather than silently vanishing from the per-source view."""
+    sources = dict((run or {}).get("sources", {}))
+    split = (expected or {}).get("source_split") or []
+    l2 = (run or {}).get("sources_l2") or {}
+    for parent in split:
+        if parent not in sources:
+            continue
+        kids = {k: v for k, v in l2.items() if k.startswith(parent + "/")}
+        if not kids:
+            continue                      # nothing deeper recorded; leave as-is
+        seen = [0, 0, 0]
+        for key, (files, comp, unc) in kids.items():
+            sources[key] = {"blob_count": files, "compressed_bytes": comp,
+                            "uncompressed_bytes": unc}
+            seen[0] += files
+            seen[1] += comp
+            seen[2] += unc
+        total = sources.pop(parent)
+        rest = [max(total.get(f, 0) - seen[i], 0) for i, f in enumerate(
+            ("blob_count", "compressed_bytes", "uncompressed_bytes"))]
+        if any(rest):
+            sources[f"{parent}/(unaccounted)"] = {
+                "blob_count": rest[0], "compressed_bytes": rest[1],
+                "uncompressed_bytes": rest[2]}
+    return sources
 
 
 def _find_detected(service: str, detected: dict) -> dict | None:
@@ -38,7 +93,8 @@ def _find_detected(service: str, detected: dict) -> dict | None:
     return None
 
 
-def service_rows(expected: dict | None, run: dict | None) -> tuple[list[dict], list[str]]:
+def service_rows(expected: dict | None, run: dict | None,
+                 sources: dict | None = None) -> tuple[list[dict], list[str]]:
     """Per-service reconciliation rows + unexpected actual sources.
 
     Row: {service, declared_bytes, declared_records, actual_bytes,
@@ -46,22 +102,24 @@ def service_rows(expected: dict | None, run: dict | None) -> tuple[list[dict], l
     Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded
     """
     services = (expected or {}).get("services", {})
-    sources = dict((run or {}).get("sources", {}))
+    if sources is None:
+        sources = effective_sources(expected, run)
+    sources = dict(sources)
     detected = (run or {}).get("detected_services", {})
     rows = []
     matched = set()
     for svc, decl in services.items():
-        src = _find_source(svc, sources)
-        actual = sources.get(src, {}) if src else {}
-        if src:
-            matched.add(src)
+        srcs = _find_sources(svc, decl, sources)
+        matched.update(srcs)
         row = {
             "service": svc,
             "declared_bytes": decl.get("bytes"),
             "declared_records": decl.get("records"),
-            "actual_bytes": actual.get("uncompressed_bytes", 0),
-            "actual_compressed": actual.get("compressed_bytes", 0),
-            "blob_count": actual.get("blob_count", 0),
+            "actual_bytes": sum(sources[s].get("uncompressed_bytes", 0)
+                                for s in srcs),
+            "actual_compressed": sum(sources[s].get("compressed_bytes", 0)
+                                     for s in srcs),
+            "blob_count": sum(sources[s].get("blob_count", 0) for s in srcs),
             "pct": None,
             "flags": [],
         }
@@ -141,9 +199,11 @@ UNDECLARED_NOTE_FLOOR = 1_000_000_000  # surface undeclared finds ≥1 GB only
 
 
 def detection_notes(rows: list[dict], expected: dict | None,
-                    run: dict | None) -> list[str]:
+                    run: dict | None, sources: dict | None = None) -> list[str]:
     """Notes from the sizer's embedded-service detection: declared services
     found inside other sources, and material undeclared discoveries."""
+    if sources is None:
+        sources = effective_sources(expected, run)
     notes = []
     for r in rows:
         if "found-embedded" in r["flags"]:
@@ -154,7 +214,7 @@ def detection_notes(rows: list[dict], expected: dict | None,
                 f"was detected inside {hosts} — likely exported within "
                 f"another service's archive.")
     declared = {norm(s) for s in (expected or {}).get("services", {})}
-    tops = {norm(s) for s in (run or {}).get("sources", {})}
+    tops = {norm(s) for s in sources} | {norm(_leaf(s)) for s in sources}
     for svc, d in (run or {}).get("detected_services", {}).items():
         if norm(svc) in declared or norm(svc) in tops:
             continue
@@ -165,6 +225,66 @@ def detection_notes(rows: list[dict], expected: dict | None,
                 f"Detected ~{d['bytes'] / 1e9:.1f} GB of {svc} data under "
                 f"{hosts}; {svc} is not declared in the manifest.")
     return notes
+
+
+def duplicate_rollup(rows) -> dict:
+    """Duplicated bytes from blob-index rows [(name, comp, unc), ...]:
+    identical archives (same top-level source, same basename, same compressed
+    AND uncompressed size) stored 2+ times — re-uploaded exports, `_cleanup`
+    copies, the same attachment in several mailboxes. Copies beyond the first
+    count as duplicated. The index carries only zip/gz rows (stored blobs are
+    never cached), so this is a LOWER BOUND on real duplication.
+    Returns {"bytes": total_dup_unc, "files": n, "by_source": {top: bytes}}."""
+    seen: dict = {}
+    for name, comp, unc in rows:
+        top = name.split("/", 1)[0] if "/" in name else "(root)"
+        key = (top, name.rsplit("/", 1)[-1], comp, unc)
+        seen[key] = seen.get(key, 0) + 1
+    dup_bytes, dup_files, by_source = 0, 0, {}
+    for (top, _base, _comp, unc), count in seen.items():
+        if count > 1:
+            extra = (count - 1) * unc
+            dup_bytes += extra
+            dup_files += count - 1
+            by_source[top] = by_source.get(top, 0) + extra
+    return {"bytes": dup_bytes, "files": dup_files, "by_source": by_source}
+
+
+DUP_NOTE_MIN_BYTES = 10_000_000_000  # only note duplication ≥10 GB
+
+
+def duplicate_notes(root: Path, slug: str) -> list[str]:
+    """Read the company's blob index and note significant duplication.
+    No index (never sized, or deleted) → no note, never an error."""
+    idx = common.company_dir(root, slug) / "blob-index.tsv.gz"
+    if not idx.exists():
+        return []
+    import gzip
+    rows = []
+    with gzip.open(idx, "rt", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 4:
+                try:
+                    rows.append((f[0], int(f[2]), int(f[3])))
+                except ValueError:
+                    continue
+    dup = duplicate_rollup(rows)
+    if dup["bytes"] < DUP_NOTE_MIN_BYTES:
+        return []
+    srcs = sorted(dup["by_source"].items(), key=lambda kv: -kv[1])
+    where = ", ".join(f"{s} ({common.human_bytes(b)})" for s, b in srcs[:3]
+                      if b >= DUP_NOTE_MIN_BYTES) or srcs[0][0]
+    return [
+        f"At least {common.human_bytes(dup['bytes'])} of the uncompressed "
+        f"total is duplicated data: {dup['files']:,} archive "
+        f"file{'s' if dup['files'] != 1 else ''} "
+        f"stored two or more times (identical name and sizes) — mostly in {where}. "
+        "Re-uploaded exports and *_cleanup copies are typical causes; the "
+        "deduplicated corpus is correspondingly smaller. Lower bound: only "
+        "zip/gz files are checked."]
 
 
 def _rate_and_eta(latest: dict, prev: dict | None, remaining: float):
@@ -228,7 +348,8 @@ def company_summary(root: Path, slug: str) -> dict:
                  if latest and manifest_total else None)
     rate, eta = _rate_and_eta(latest, prev, remaining) if latest else (None, None)
 
-    rows, unexpected = service_rows(expected, latest)
+    sources = effective_sources(expected, latest)
+    rows, unexpected = service_rows(expected, latest, sources)
 
     now = common.utc_now()
     last_change = status.get("last_change_detected_at")
@@ -255,6 +376,11 @@ def company_summary(root: Path, slug: str) -> dict:
         "days_since_change": days_since_change,
         "service_rows": rows,
         "unexpected_sources": unexpected,
-        "notes": lore_notes(latest) + detection_notes(rows, expected, latest),
+        # post-split view; consumers render per-source numbers from THIS, not
+        # from latest_run["sources"], or split children go missing
+        "sources": sources,
+        "notes": lore_notes(latest) + detection_notes(rows, expected, latest,
+                                                      sources)
+                 + duplicate_notes(root, slug),
         "expected_confirmed": bool((expected or {}).get("confirmed_by_user")),
     }

@@ -159,8 +159,27 @@ Cached so daily runs skip discovery entirely.
     "gdrive":  {"bytes": 1200000000000}, // byte-declared service
     "slack":   {"records": 1500000},     // record-count declaration: EXCLUDED from byte
                                          // reconciliation, but listed + flagged in reports
-    "zendesk": {"bytes": 0}              // declared 0 B: flagged if data actually appears
+    "zendesk": {"bytes": 0},             // declared 0 B: flagged if data actually appears
+    "workspace": {"bytes": 1, "prefix": "workspace-export"}
+                                         // optional "prefix" (string or list) pins a
+                                         // declaration to actual top-level prefix(es) when
+                                         // the manifest name doesn't match what the client
+                                         // pushed (e.g. a merged Workspace export). Without
+                                         // it, matching is by normalized name and sums ALL
+                                         // case/punctuation variants (zoom/ + Zoom/).
   },
+  "source_split": ["gdrive-export2"],    // optional: top-level prefixes whose SECOND level
+                                         // holds the real services (swiftlaw pushed every
+                                         // service inside one gdrive-export2/ folder).
+                                         // reconcile.effective_sources() replaces each
+                                         // listed prefix with its sources_l2 children, keyed
+                                         // "parent/child"; declarations then match by leaf
+                                         // ("Notion" finds "gdrive-export2/Notion") or by an
+                                         // explicit "prefix" (full path or leaf). Bytes the
+                                         // children don't cover land in "parent/(unaccounted)"
+                                         // — sources_l2 is a top-40 rollup, so a wide export
+                                         // can be truncated and must not vanish silently.
+                                         // Headline % is unaffected: it uses run totals.
   "source": "manifest screenshot, 2026-08-13",
   "confirmed_by_user": true,             // MUST be true before any report trusts it —
                                          // a mis-OCR'd number poisons every downstream report
@@ -193,8 +212,8 @@ Cached so daily runs skip discovery entirely.
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
                                          // gz>0 triggers the gz-accuracy notes; the per-blob gz
                                          // method taxonomy (gz-trailer/gz-floor/gz-bad-trailer/
-                                         // gz-tiny/gz-exact) lives in the blob-index/TSV, rolled
-                                         // up in "gz" below
+                                         // gz-tiny/gz-exact/gz-truncated) lives in the
+                                         // blob-index/TSV, rolled up in "gz" below
   "errors": {"total": 3, "by_type": {"BadZipFile": 3}},
   "cache": {"hits": 800, "misses": 6},   // null in copied-forward and pre-cache runs
   "gz": {"streamed": 2, "streamed_bytes": 900000000000,   // exact-streamed gz blobs
