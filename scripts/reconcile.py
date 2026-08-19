@@ -287,6 +287,56 @@ def duplicate_notes(root: Path, slug: str) -> list[str]:
         "zip/gz files are checked."]
 
 
+def duplicate_sources(expected: dict | None, run: dict | None) -> dict:
+    """Top-level prefixes that are redundant copies of data already counted
+    under another prefix, declared in expected-data-sizes.json's
+    "duplicate_prefixes" and verified against the container (not guessed).
+
+    Why: some clients push the same export twice under different top-level
+    names (saxon, 2026-08: 76 root folders are byte-exact copies of children
+    inside sharepoint/). Left alone they inflate the headline total and show
+    up as dozens of bogus "not in manifest" sources.
+
+    An entry is a bare prefix string (the WHOLE prefix is redundant) or
+    {"prefix": str, "redundant_bytes": int} when only part of it is (a
+    partial/aborted export that still holds some unique data).
+    Returns {prefix: redundant_uncompressed_bytes} for prefixes in the run."""
+    decl = (expected or {}).get("duplicate_prefixes") or []
+    srcs = (run or {}).get("sources", {})
+    out = {}
+    for e in decl:
+        name = e if isinstance(e, str) else e.get("prefix")
+        if name not in srcs:
+            continue
+        full = srcs[name].get("uncompressed_bytes", 0)
+        out[name] = full if isinstance(e, str) else min(
+            e.get("redundant_bytes", full), full)
+    return out
+
+
+def duplicate_prefix_note(dups: dict, run: dict | None) -> list[str]:
+    """Explain the deduplication so the subtraction is never silent."""
+    if not dups:
+        return []
+    srcs = (run or {}).get("sources", {})
+    whole = [k for k, v in dups.items()
+             if v >= srcs.get(k, {}).get("uncompressed_bytes", 0)]
+    part = [k for k in dups if k not in whole]
+    bits = []
+    if whole:
+        bits.append(f"{len(whole)} top-level folder"
+                    f"{'s' if len(whole) != 1 else ''} "
+                    f"({', '.join(sorted(whole)[:3])}"
+                    f"{', …' if len(whole) > 3 else ''}) are byte-exact copies "
+                    "of data already counted under another prefix")
+    for k in sorted(part):
+        bits.append(f"{common.human_bytes(dups[k])} of {k} duplicates another "
+                    "prefix (the rest is unique and still counted)")
+    return [f"{common.human_bytes(sum(dups.values()))} excluded as duplicate "
+            f"data: {'; '.join(bits)}. Headline total and %-complete are "
+            "deduplicated; per-source rows omit the redundant copies."]
+
+
 def _rate_and_eta(latest: dict, prev: dict | None, remaining: float):
     """bytes/day from the two most recent runs → projected completion date."""
     if not prev:
@@ -341,7 +391,9 @@ def company_summary(root: Path, slug: str) -> dict:
     prev = runs[1] if len(runs) > 1 else None
 
     manifest_total = (expected or {}).get("manifest_total_bytes")
-    unc_total = latest["totals"]["uncompressed_bytes"] if latest else None
+    unc_raw = latest["totals"]["uncompressed_bytes"] if latest else None
+    dup_total = sum(duplicate_sources(expected, latest).values())
+    unc_total = (unc_raw - dup_total) if unc_raw is not None else None
     pct = (unc_total / manifest_total * 100
            if latest and manifest_total else None)
     remaining = (max(manifest_total - unc_total, 0)
@@ -349,6 +401,10 @@ def company_summary(root: Path, slug: str) -> dict:
     rate, eta = _rate_and_eta(latest, prev, remaining) if latest else (None, None)
 
     sources = effective_sources(expected, latest)
+    dups = duplicate_sources(expected, latest)
+    for _p, _b in dups.items():
+        if _p in sources and _b >= sources[_p].get("uncompressed_bytes", 0):
+            sources.pop(_p)          # wholly redundant: not a real source
     rows, unexpected = service_rows(expected, latest, sources)
 
     now = common.utc_now()
@@ -367,6 +423,8 @@ def company_summary(root: Path, slug: str) -> dict:
         "prev_run": prev,
         "manifest_total_bytes": manifest_total,
         "uncompressed_total": unc_total,
+        "uncompressed_total_raw": unc_raw,
+        "duplicate_bytes": dup_total,
         "pct_complete": pct,
         "remaining_bytes": remaining,
         "rate_bytes_per_day": rate,
@@ -379,8 +437,10 @@ def company_summary(root: Path, slug: str) -> dict:
         # post-split view; consumers render per-source numbers from THIS, not
         # from latest_run["sources"], or split children go missing
         "sources": sources,
-        "notes": lore_notes(latest) + detection_notes(rows, expected, latest,
-                                                      sources)
+        "notes": duplicate_prefix_note(duplicate_sources(expected, latest),
+                                       latest)
+                 + lore_notes(latest) + detection_notes(rows, expected, latest,
+                                                        sources)
                  + duplicate_notes(root, slug),
         "expected_confirmed": bool((expected or {}).get("confirmed_by_user")),
     }

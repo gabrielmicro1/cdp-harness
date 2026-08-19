@@ -253,7 +253,11 @@ def build_html(s: dict) -> str:
                 f'{common.human_bytes(s["uncompressed_total"])}</div>'
                 f'<div class="sub">compressed in storage: '
                 f'{common.human_bytes(run["totals"]["compressed_bytes"]) if run else "—"}'
-                f'</div></div>')
+                + (f'<br>{common.human_bytes(s["duplicate_bytes"])} duplicate '
+                   f'data excluded (raw '
+                   f'{common.human_bytes(s["uncompressed_total_raw"])})'
+                   if s.get("duplicate_bytes") else "")
+                + f'</div></div>')
     kpis.append(f'<div class="card"><div class="label">Declared total (manifest)'
                 f'</div><div class="value">'
                 f'{common.human_bytes(s["manifest_total_bytes"])}</div></div>')

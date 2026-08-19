@@ -43,8 +43,10 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox) *populate* `<slug>-raw` from a cloud source (rwlc
-   SAS, 21-day default) — they are the ingest path, not an audit path. They
+   skills (gcs, dropbox, gdrive, qwilr) *populate* `<slug>-raw` from a cloud
+   source (rwlc SAS — 21-day default on the VM paths, 1-day on the local
+   qwilr pull, whose writes are additionally create-only via
+   `If-None-Match: *`) — they are the ingest path, not an audit path. They
    only add blobs under their dest prefix and never modify or delete
    existing data; everything else in the harness stays strictly read-only.
 
@@ -89,6 +91,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   dropbox-azure-transfer/references/commands.md
   gdrive-azure-transfer/SKILL.md           # Google Drive → <slug>-raw (same engine)
   gdrive-azure-transfer/references/commands.md
+  qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
+  qwilr-azure-transfer/references/commands.md
 scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
@@ -101,6 +105,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   gcs_transfer.py            # thin GCS CLI over transfer_engine (Spec only)
   dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
   gdrive_transfer.py         # thin Google Drive CLI over transfer_engine (Spec only)
+  qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
@@ -180,6 +185,22 @@ Cached so daily runs skip discovery entirely.
                                          // — sources_l2 is a top-40 rollup, so a wide export
                                          // can be truncated and must not vanish silently.
                                          // Headline % is unaffected: it uses run totals.
+  "duplicate_prefixes": ["MarketingTeam", {"prefix": "onedrive",
+                        "redundant_bytes": 134100000000}],
+                                         // optional: top-level prefixes that are
+                                         // redundant COPIES of data already counted under
+                                         // another prefix (saxon pushed 76 root folders that
+                                         // are byte-exact copies of sharepoint/ children).
+                                         // A bare string = the whole prefix is redundant and
+                                         // is dropped from the per-source view; an object with
+                                         // "redundant_bytes" = only that many bytes duplicate
+                                         // (a partial/aborted export still holding unique
+                                         // data — that prefix STAYS in the per-source view).
+                                         // reconcile.duplicate_sources() subtracts these from
+                                         // the headline total and %-complete, and always
+                                         // emits a note so the subtraction is never silent.
+                                         // ONLY list prefixes VERIFIED against the container
+                                         // (delimiter listing), never ones a client asserted.
   "source": "manifest screenshot, 2026-08-13",
   "confirmed_by_user": true,             // MUST be true before any report trusts it —
                                          // a mis-OCR'd number poisons every downstream report
@@ -384,10 +405,15 @@ a tmux session into `<slug>-raw/workspace-export/` (Dropbox:
 `dropbox-export/`, Drive: `gdrive-export/`). Rules that differ from the
 sizing path — do not cross-contaminate:
 
-- **Network rules are HUMAN-ONLY for this path.** The transfer VM's IP is
-  added via the internal network-rules UI by the user; the harness never runs
-  `network-rule add` here (rules added outside the UI get stripped).
-  `phases.ip_rule_ensure` belongs to the sizing path only.
+- **Network rules are engine-run via `allow-network`** (policy change,
+  2026-08: the harness grants access itself — the Microsoft.Storage service
+  endpoint on the VM's subnet + a vnet-rule on the SA; IP rules never match
+  same-region VM traffic). Teardown removes exactly the rule we added;
+  pre-existing rules (the client's own push path) are never touched. Caveat:
+  company infrastructure may strip rules not added through the internal UI —
+  if a 403 reappears mid-transfer, re-run `allow-network`.
+  `phases.ip_rule_ensure` belongs to the laptop-origin paths only
+  (sizing, and the local qwilr pull below).
 - **SAS is `racwl`, 21-day default** (write path — the read-only `rl` policy
   above is for sizing). Never revoked; lapses on its own.
 - **Secrets** (SAS URL, Google OAuth token) live only in the VM's
@@ -404,6 +430,21 @@ sizing path — do not cross-contaminate:
   The transfer VM needs the `Microsoft.Storage` service endpoint on its
   subnet + a vnet-rule on the SA. The laptop-based sizing path is unaffected
   (external IP, IP rules work).
+
+**The one VM-less ingest: qwilr.** A Qwilr corpus is small JSON pulled from
+Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
+read-only scope exists; client revokes it after the engagement), so
+`scripts/qwilr_transfer.py` (standalone — NOT a transfer_engine Spec) runs
+the pull locally and PUTs straight to blob REST into
+`<slug>-raw/qwilr-export/`. Because it runs from the laptop (external IP),
+storage access uses `phases.ip_rule_ensure`/`ip_rule_remove_if_ours` — the
+same mechanism as sizing; `allow-network` stays VM-only. racwl container
+SAS but 1-day expiry (held in-process; no VM to outlive), writes are
+create-only (`If-None-Match: *`), resume = re-run (one dest-prefix listing
+skips landed blobs), no state file, token via stdin only. The API has no
+PDF/HTML export and no bulk audit-trail/analytics export; embedded CDN
+assets are manifested (`_meta/assets-manifest-*.json`), not downloaded.
+Driven by the `qwilr-azure-transfer` skill.
 
 ## Learned the hard way (from real croplabel / webspiders / latchel runs)
 

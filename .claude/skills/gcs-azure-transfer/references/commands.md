@@ -13,6 +13,7 @@ S=python3\ scripts/gcs_transfer.py    # all take <slug>; JSON on stdout
 $S discover <slug>                    # phase + hints; run FIRST, always
 $S plan <slug> --bucket <b>           # resolve dest + region; no changes
 $S create-vm <slug> --bucket <b>      # VM + bootstrap (rclone, tmux)
+$S allow-network <slug>               # service endpoint + vnet-rule
 $S write-azure-remote <slug>          # mint SAS, install [azure] remote
 $S check-azure <slug>                 # rclone lsd sanity check, classified
 $S write-gcs-remote <slug> < token    # token on STDIN; verifies + sizes
@@ -48,7 +49,7 @@ az storage container generate-sas --account-name <sa> -n <slug>-raw \
 # from the spec, plus harmless add; delete deliberately absent)
 
 # Same-region access (REQUIRED — IP rules never match same-region VM
-# traffic; human/UI-first, az only on explicit user override)
+# traffic). Engine-run by `allow-network`; teardown removes only our rule:
 az network vnet subnet update -g <rg> --vnet-name xfer-<slug>VNET \
   -n xfer-<slug>Subnet --service-endpoints Microsoft.Storage
 az storage account network-rule add -g <rg> --account-name <sa> \

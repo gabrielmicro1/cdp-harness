@@ -20,12 +20,14 @@ confirmation gates. Full command templates and the troubleshooting table:
 
 ## HARD CONSTRAINTS — never violate
 
-1. **Network rules are human-only.** NEVER run
-   `az storage account network-rule add` (or any vnet change) for this path.
-   Company infrastructure strips rules not added through the internal UI.
-   Surface the VM's IP and PAUSE for the user. (The sizing path's
-   `ip_rule_ensure` is a different, pre-existing mechanism — do not borrow it
-   here.)
+1. **Network rules go through `allow-network` only.** The engine grants
+   access itself (Microsoft.Storage service endpoint on the VM's subnet +
+   a vnet-rule on the SA — IP rules never match same-region VM traffic)
+   and teardown removes exactly the rule it added. Never hand-roll
+   `network-rule add`, and NEVER remove a rule the engine didn't add.
+   Company infrastructure may strip rules not added through the internal
+   UI — if a 403 reappears mid-run, re-run `allow-network`. (The sizing
+   path's `ip_rule_ensure` is a different mechanism — do not borrow it.)
 2. **Google auth is human-in-the-loop.** Never automate Google sign-in. The
    customer admin runs `rclone authorize` on their own machine; you wait for
    the user to paste the token.
@@ -78,20 +80,14 @@ python3 scripts/gcs_transfer.py plan <slug> --bucket <gcs-bucket>
    rclone + tmux. Takes a few minutes.
 3. `write-azure-remote <slug>` — mints the container SAS locally (rwlc,
    21 days) and installs the `azure` remote on the VM.
-4. **PAUSE #1 — network rule.** Print the VM's public IP prominently:
-   "Add this IP to storage account `<name>` via the internal network-rules
-   UI, then tell me when done." Wait. **Same-region caveat (learned
-   2026-08, song-division):** Azure IP rules do NOT match traffic from a
-   VM in the storage account's own region — the working config is the
-   `Microsoft.Storage` service endpoint on the VM's subnet plus a
-   vnet-rule on the SA. Surface that need to the user; run the az
-   commands yourself only on an explicit user override (see
-   references/commands.md).
-5. On confirmation: `check-azure <slug>`. On a 403 it reads the ruleset
-   (read-only) and tells you which case you're in: `vm_ip_in_ruleset: true`
-   = propagation — wait ~10s and retry; `false` = the internal-UI entry
-   never landed (wrong account or typo) — back to the user, don't wait.
-   Either way it's never a SAS problem — do not re-mint.
+4. `allow-network <slug>` — grants the VM storage access
+   (Microsoft.Storage service endpoint on the subnet + a vnet-rule; IP
+   rules never match same-region VM traffic — learned 2026-08,
+   song-division). No pause: the engine runs this itself.
+5. `check-azure <slug>`. On a 403 it reads the ruleset (read-only):
+   vnet-rule present = propagation — wait ~10s and retry; missing =
+   re-run allow-network. Either way it's never a SAS problem — do not
+   re-mint.
 6. **PAUSE #2 — Google token.** Give the user this snippet for their
    customer admin (secure channel; the token grants read access to the
    export bucket and can be revoked afterward from the admin's Google
