@@ -43,9 +43,9 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, qwilr) *populate* `<slug>-raw` from a cloud
-   source (rwlc SAS — 21-day default on the VM paths, 1-day on the local
-   qwilr pull, whose writes are additionally create-only via
+   skills (gcs, dropbox, gdrive, qwilr, vimeo) *populate* `<slug>-raw` from a
+   cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on the
+   local qwilr/vimeo pulls, whose writes are additionally create-only via
    `If-None-Match: *`) — they are the ingest path, not an audit path. They
    only add blobs under their dest prefix and never modify or delete
    existing data; everything else in the harness stays strictly read-only.
@@ -93,6 +93,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   gdrive-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
+  vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
+  vimeo-azure-transfer/references/commands.md
 scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
@@ -106,6 +108,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
   gdrive_transfer.py         # thin Google Drive CLI over transfer_engine (Spec only)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
+  vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
@@ -413,7 +416,7 @@ sizing path — do not cross-contaminate:
   company infrastructure may strip rules not added through the internal UI —
   if a 403 reappears mid-transfer, re-run `allow-network`.
   `phases.ip_rule_ensure` belongs to the laptop-origin paths only
-  (sizing, and the local qwilr pull below).
+  (sizing, and the local qwilr/vimeo pulls below).
 - **SAS is `racwl`, 21-day default** (write path — the read-only `rl` policy
   above is for sizing). Never revoked; lapses on its own.
 - **Secrets** (SAS URL, Google OAuth token) live only in the VM's
@@ -431,7 +434,7 @@ sizing path — do not cross-contaminate:
   subnet + a vnet-rule on the SA. The laptop-based sizing path is unaffected
   (external IP, IP rules work).
 
-**The one VM-less ingest: qwilr.** A Qwilr corpus is small JSON pulled from
+**The VM-less ingests: qwilr and vimeo.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
 read-only scope exists; client revokes it after the engagement), so
 `scripts/qwilr_transfer.py` (standalone — NOT a transfer_engine Spec) runs
@@ -445,6 +448,26 @@ skips landed blobs), no state file, token via stdin only. The API has no
 PDF/HTML export and no bulk audit-trail/analytics export; embedded CDN
 assets are manifested (`_meta/assets-manifest-*.json`), not downloaded.
 Driven by the `qwilr-azure-transfer` skill.
+
+**Vimeo** has no rclone backend either, but its corpus is hundreds of GB of
+video — too big to proxy through the laptop. `scripts/vimeo_transfer.py`
+(standalone, same shape as qwilr) therefore never streams video bytes: it
+resolves each Vimeo download link's redirect to a signed CDN URL and drives
+Azure **Put Blob From URL / Put Block From URL** server-side copy, so the
+storage fabric pulls from Vimeo's CDN directly (laptop egress = API JSON +
+control calls + tiny caption files). Same laptop IP-rule firewall
+(`phases.ip_rule_ensure`), create-only commits (`If-None-Match: *` rides
+the Put Block List), no state file, resume = re-run (media skip is keyed by
+the `videos/<id>/` directory — video titles are mutable). Token: a Vimeo
+personal access token (`public private video_files` scopes) via stdin only;
+`video_files` is PLAN-gated (Standard/Pro+) so the `probe` subcommand is
+the day-one gate, and it also detects the accounts that only expose file
+arrays under API version 3.2. racwl container SAS at 2 days (server-side
+copies are multi-hour); files ≤1 GiB are single-shot with Azure validating
+Vimeo's declared md5, larger ones stage 256 MiB blocks and re-resolve the
+CDN URL whenever it expires mid-copy (normal, budgeted). Thumbnails are
+manifested, not downloaded; no analytics/comments/version-history export
+exists. Driven by the `vimeo-azure-transfer` skill.
 
 ## Learned the hard way (from real croplabel / webspiders / latchel runs)
 

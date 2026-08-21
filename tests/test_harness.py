@@ -1772,6 +1772,444 @@ def main() -> int:
          phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
          phases.mint_sas) = saved
 
+
+    print("\n— vimeo_transfer --dry-run (server-side-copy ingest) —")
+    proc = run_script("vimeo_transfer.py", "plan", "democo", "--root", root)
+    vplan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("vimeo plan: server-side copy, dest from config, 2-day SAS, no VM",
+          vplan["dest"] == "democo-raw/vimeo-export"
+          and vplan["storage_account"] == "stdemoco"
+          and vplan["sas_days"] == 2 and "no VM" in vplan["mode"]
+          and "server-side" in vplan["mode"]
+          and vplan["declared_vimeo_bytes"] is None)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vimeo_transfer.py"), "probe",
+         "democo", "--root", str(root), "--dry-run"],
+        input="VIMEOSECRET", capture_output=True, text=True)
+    check("vimeo probe dry-run: rc 0, no Azure, token never echoed",
+          proc.returncode == 0 and "VIMEOSECRET" not in proc.stdout
+          and "api.vimeo.com/me" in proc.stdout
+          and "generate-sas" not in proc.stdout
+          and "network-rule" not in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vimeo_transfer.py"), "pull",
+         "democo", "--root", str(root), "--dry-run"],
+        input="VIMEOSECRET", capture_output=True, text=True)
+    out = proc.stdout
+    check("vimeo pull dry-run: rc 0, token never echoed, SAS redacted",
+          proc.returncode == 0 and "VIMEOSECRET" not in out
+          and "redacted" in out, out[-300:])
+    check("vimeo pull: racwl container SAS on the right container",
+          "generate-sas" in out and "racwl" in out and "-n democo-raw" in out)
+    check("vimeo pull: laptop IP rule path, not the VM vnet path",
+          "network-rule add" in out and "--ip-address" in out
+          and "allow-network" not in out and "vm create" not in out)
+    check("vimeo pull: hits the Vimeo API, create-only writes",
+          "api.vimeo.com/me/videos" in out
+          and "x-ms-blob-type: BlockBlob" in out and "If-None-Match" in out)
+    check("vimeo pull: server-side copy shapes (blocks + commit)",
+          "x-ms-copy-source" in out and "x-ms-source-range" in out
+          and "comp=block" in out and "comp=blocklist" in out)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vimeo_transfer.py"), "verify",
+         "democo", "--root", str(root), "--dry-run"],
+        input="VIMEOSECRET", capture_output=True, text=True)
+    check("vimeo verify dry-run: read path mints rl, not racwl",
+          proc.returncode == 0 and "--permissions rl" in proc.stdout
+          and "racwl" not in proc.stdout
+          and "VIMEOSECRET" not in proc.stdout, proc.stdout[-300:])
+
+    print("\n— vimeo_transfer in-process (stubbed transport) —")
+    import vimeo_transfer  # noqa: E402
+    MIB = vimeo_transfer.MIB
+
+    vsaved = (vimeo_transfer.vimeo_get, vimeo_transfer.resolve_cdn_url,
+              vimeo_transfer.resolve_fresh, vimeo_transfer.azure_list_blobs,
+              vimeo_transfer.azure_put_bytes, vimeo_transfer.azure_put_json,
+              vimeo_transfer.put_blob_from_url,
+              vimeo_transfer.put_block_from_url,
+              vimeo_transfer.put_block_list,
+              vimeo_transfer.copy_video_to_blob,
+              vimeo_transfer.mint_write_sas, vimeo_transfer.read_token,
+              vimeo_transfer._download_small, vimeo_transfer._http,
+              vimeo_transfer._sleep, common.run_az,
+              phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+              phases.mint_sas)
+    try:
+        # paging.next walked to exhaustion
+        vget_calls = []
+
+        def fake_get_paged(token, path, params=None, accept=None):
+            vget_calls.append(path)
+            if path.startswith("/me/videos?page=2"):
+                return {"total": 3, "data": [{"uri": "/videos/p3"}]}
+            return {"total": 3,
+                    "data": [{"uri": "/videos/p1"}, {"uri": "/videos/p2"}],
+                    "paging": {"next": "/me/videos?page=2&per_page=100"}}
+
+        vimeo_transfer.vimeo_get = fake_get_paged
+        got = vimeo_transfer.list_videos("tok")
+        check("vimeo pagination walks paging.next to exhaustion",
+              [vimeo_transfer._video_id(v) for v in got] == ["p1", "p2", "p3"]
+              and vget_calls[1].startswith("/me/videos?page=2"))
+
+        # choose_file precedence
+        dl_src = {"quality": "source", "link": "Ls", "size": 5, "md5": "a" * 32}
+        dl_hd = {"quality": "hd", "link": "Lh", "size": 9, "type": "video/mp4"}
+        prog_src = {"type": "source", "link": "Lp", "size": 7}
+        f_sd = {"quality": "sd", "link": "Lf", "size": 3, "type": "video/mp4"}
+        check("choose_file: source download beats bigger hd",
+              vimeo_transfer.choose_file(
+                  {"download": [dl_hd, dl_src]})["link"] == "Ls")
+        check("choose_file: no source -> largest download",
+              vimeo_transfer.choose_file(
+                  {"download": [dl_hd], "play": {"progressive": [prog_src]}}
+              )["link"] == "Lh")
+        check("choose_file: progressive source beats files; hls excluded",
+              vimeo_transfer.choose_file(
+                  {"files": [f_sd, {"quality": "hls", "link": "Lhls",
+                                    "size": 999}],
+                   "play": {"progressive": [prog_src]}})["link"] == "Lp"
+              and vimeo_transfer.choose_file(
+                  {"files": [f_sd, {"quality": "hls", "link": "Lhls",
+                                    "size": 999}]})["link"] == "Lf")
+        check("choose_file: nothing -> None",
+              vimeo_transfer.choose_file({"name": "x"}) is None
+              and vimeo_transfer.choose_file(None) is None)
+
+        # block plan math + id shape
+        bplan = vimeo_transfer.block_plan(600 * MIB, 256 * MIB)
+        check("block_plan: 600 MiB @ 256 MiB -> 3 blocks, exact ends",
+              len(bplan) == 3 and bplan[0][1:] == (0, 256 * MIB - 1)
+              and bplan[2][1:] == (512 * MIB, 600 * MIB - 1)
+              and len({len(b[0]) for b in bplan}) == 1
+              and len({b[0] for b in bplan}) == 3)
+        check("md5 hex->b64 and rejects junk",
+              vimeo_transfer.md5_hex_to_b64("00" * 16)
+              == "AAAAAAAAAAAAAAAAAAAAAA=="
+              and vimeo_transfer.md5_hex_to_b64("nothex") is None
+              and vimeo_transfer.md5_hex_to_b64(None) is None)
+
+        # copy routing: small -> single shot; large -> blocks + commit
+        cargs = types.SimpleNamespace(dry_run=False, single_shot_max_mb=1024,
+                                      block_size_mb=256)
+        ccalls = {"single": [], "blocks": [], "commits": [], "fresh": 0}
+        vimeo_transfer.resolve_cdn_url = lambda link: "https://cdn/x"
+        vimeo_transfer.put_blob_from_url = (
+            lambda cfg, sas, name, src, ct, md5, dry:
+            ccalls["single"].append(name) or 1)
+        vimeo_transfer.put_block_from_url = (
+            lambda cfg, sas, name, bid, src, s0, e0, dry:
+            ccalls["blocks"].append((bid, s0, e0)))
+        vimeo_transfer.put_block_list = (
+            lambda cfg, sas, name, ids, ct, md5, dry:
+            ccalls["commits"].append(list(ids)) or 1)
+        chosen_small = {"size": 10 * MIB, "md5": "00" * 16, "link": "L",
+                        "type": "video/mp4", "kind": "download",
+                        "quality": "source", "ext": ".mp4"}
+        n = vimeo_transfer.copy_video_to_blob({}, "sas", "tok", "v9",
+                                              "x/videos/v9/f.mp4",
+                                              chosen_small, cargs)
+        cargs_blocky = types.SimpleNamespace(dry_run=False,
+                                             single_shot_max_mb=100,
+                                             block_size_mb=256)
+        chosen_big = dict(chosen_small, size=600 * MIB)
+        n2 = vimeo_transfer.copy_video_to_blob({}, "sas", "tok", "v9",
+                                               "x/videos/v9/f.mp4",
+                                               chosen_big, cargs_blocky)
+        check("copy routing: small single-shot, above threshold 3 blocks+commit",
+              n == 10 * MIB and ccalls["single"] == ["x/videos/v9/f.mp4"]
+              and n2 == 600 * MIB and len(ccalls["blocks"]) == 3
+              and len(ccalls["commits"][0]) == 3)
+
+        # expired CDN URL: re-resolve, retry the SAME block id
+        ccalls["blocks"].clear()
+        boom = {"armed": True}
+
+        def flaky_block(cfg, sas, name, bid, src, s0, e0, dry):
+            if boom["armed"]:
+                boom["armed"] = False
+                raise vimeo_transfer.CopyError(
+                    "expired", azure_code="CannotVerifyCopySource")
+            ccalls["blocks"].append((bid, src))
+
+        vimeo_transfer.put_block_from_url = flaky_block
+        vimeo_transfer.resolve_fresh = (
+            lambda token, vid, chosen:
+            (ccalls.__setitem__("fresh", ccalls["fresh"] + 1)
+             or "https://cdn/fresh"))
+        vimeo_transfer.copy_video_to_blob({}, "sas", "tok", "v9",
+                                          "x/videos/v9/f.mp4",
+                                          dict(chosen_big, size=300 * MIB),
+                                          cargs_blocky)
+        check("expired CDN URL: re-resolved once, same block id retried",
+              ccalls["fresh"] == 1 and ccalls["blocks"][0][0]
+              == vimeo_transfer._block_id(0)
+              and ccalls["blocks"][0][1] == "https://cdn/fresh")
+
+        # full pull flow: resume-skip, no-file, per-video error, meta blobs
+        def fake_get_pull(token, path, params=None, accept=None):
+            vget_calls.append(path)
+            if path == "/me":
+                return {"uri": "/users/1", "name": "Demo"}
+            if path == "/me/videos":
+                return {"total": 4, "data": [
+                    {"uri": "/videos/v1",
+                     "download": [dict(dl_src, size=100)]},
+                    {"uri": "/videos/v2", "name": "Two",
+                     "download": [dict(dl_src, size=200)],
+                     "pictures": {"sizes": [{"link": "https://i/t.jpg"}]},
+                     "metadata": {"connections": {"texttracks":
+                                                  {"total": 1}}}},
+                    {"uri": "/videos/v3",
+                     "download": [dict(dl_src, size=300)]},
+                    {"uri": "/videos/v4", "name": "NoFile"},
+                ]}
+            if path == "/videos/v2/texttracks":
+                return {"data": [{"uri": "/videos/v2/texttracks/9",
+                                  "language": "en", "name": "caps",
+                                  "link": "https://x/cap.vtt"}]}
+            if path == "/me/projects":
+                return {"total": 1,
+                        "data": [{"uri": "/projects/77", "name": "F"}]}
+            if path == "/projects/77/videos":
+                return {"total": 1, "data": [{"uri": "/videos/v2"}]}
+            if path == "/me/albums":
+                return {"total": 0, "data": []}
+            return {"placeholder": path}
+
+        vputs = []
+
+        def fake_put_json(cfg, sas, name, obj, dry):
+            vputs.append(name)
+            return 10
+
+        def fake_put_bytes(cfg, sas, name, body, ct, dry):
+            vputs.append(name)
+            return len(body)
+
+        copied_vids = []
+
+        def fake_copy(cfg, sas, token, vid, name, chosen, a):
+            copied_vids.append(vid)
+            if vid == "v3":
+                raise vimeo_transfer.CopyError("copy x: HTTP 500 boom")
+            return chosen["size"]
+
+        common.run_az = lambda *a, **k: types.SimpleNamespace(stdout="")
+        phases.ip_rule_ensure = lambda cfg, dry_run=False: (True, "1.2.3.4")
+        vremoved = []
+        phases.ip_rule_remove_if_ours = (
+            lambda cfg, ip, we, dry_run=False: vremoved.append((ip, we)))
+        vimeo_transfer.vimeo_get = fake_get_pull
+        vimeo_transfer.mint_write_sas = (
+            lambda cfg, days, dry: ("sig=fake", "2026-08-22T00:00:00Z"))
+        vimeo_transfer.azure_list_blobs = (
+            lambda cfg, sas, prefix, dry: {
+                "vimeo-export/videos/v1/old-name.mp4": {"size": 100,
+                                                        "md5": None},
+                "vimeo-export/videos/v1/metadata.json": {"size": 10,
+                                                         "md5": None}})
+        vimeo_transfer.azure_put_json = fake_put_json
+        vimeo_transfer.azure_put_bytes = fake_put_bytes
+        vimeo_transfer.copy_video_to_blob = fake_copy
+        vimeo_transfer.read_token = lambda dry: "tok"
+        vimeo_transfer._download_small = lambda url: b"WEBVTT"
+
+        vargs = types.SimpleNamespace(slug="democo",
+                                      dest_prefix="vimeo-export",
+                                      sas_days=2, video_limit=None,
+                                      block_size_mb=256,
+                                      single_shot_max_mb=1024,
+                                      api_version="3.4", dry_run=False)
+        vres = vimeo_transfer.cmd_pull(root, vargs)
+        check("vimeo pull: landed video skipped (rename-proof), never re-copied",
+              vres["skipped_existing"] == 1 and "v1" not in copied_vids)
+        check("vimeo pull: per-video error counted, run completes ok",
+              vres["ok"] is True and vres["video_errors"]["count"] == 1
+              and vres["video_errors"]["ids"] == ["v3"]
+              and vres["copied"] == 1
+              and vres["bytes_copied_serverside"] == 200)
+        check("vimeo pull: no-file video listed, not an error",
+              vres["no_file"] == {"count": 1, "ids": ["v4"]})
+        check("vimeo pull: texttrack + meta blobs written",
+              "vimeo-export/videos/v2/texttracks/en-caps.vtt" in vputs
+              and any(n.startswith("vimeo-export/_meta/videos-index-")
+                      for n in vputs)
+              and any(n.startswith("vimeo-export/_meta/folders-")
+                      for n in vputs)
+              and any(n.startswith("vimeo-export/_meta/thumbnails-manifest-")
+                      for n in vputs))
+        check("vimeo pull: resume hint present with errors, IP rule removed",
+              "resume_hint" in vres and vremoved == [("1.2.3.4", True)])
+
+        # 401 aborts before any write
+        vputs.clear()
+
+        def fake_get_401(token, path, params=None, accept=None):
+            raise common.HarnessError("Vimeo API 401 on /me -- token bad")
+
+        vimeo_transfer.vimeo_get = fake_get_401
+        try:
+            vimeo_transfer.cmd_pull(root, vargs)
+            check("vimeo pull: 401 aborts", False, "no exception raised")
+        except common.HarnessError:
+            check("vimeo pull: 401 aborts immediately, nothing PUT",
+                  vputs == [])
+
+        # circuit breaker: first 5 copies all fail -> systemic abort
+        def fake_get_many(token, path, params=None, accept=None):
+            if path == "/me":
+                return {"uri": "/users/1"}
+            if path == "/me/videos":
+                return {"total": 6, "data": [
+                    {"uri": f"/videos/b{i}",
+                     "download": [dict(dl_src, size=10)]}
+                    for i in range(6)]}
+            return {"data": []}
+
+        def fake_copy_fail(cfg, sas, token, vid, name, chosen, a):
+            raise vimeo_transfer.CopyError("copy: HTTP 403 nope")
+
+        vimeo_transfer.vimeo_get = fake_get_many
+        vimeo_transfer.azure_list_blobs = lambda cfg, sas, prefix, dry: {}
+        vimeo_transfer.copy_video_to_blob = fake_copy_fail
+        try:
+            vimeo_transfer.cmd_pull(root, vargs)
+            check("vimeo circuit breaker trips", False, "no exception")
+        except common.HarnessError as e:
+            check("vimeo circuit breaker: 5 straight failures abort",
+                  "systemic" in str(e))
+
+        # verify math: missing / size vs any candidate / extra / texttracks
+        def fake_get_verify(token, path, params=None, accept=None):
+            return {"total": 4, "data": [
+                {"uri": "/videos/v1",
+                 "download": [{"quality": "source", "link": "L", "size": 100,
+                               "md5": "aa" * 16}],
+                 "metadata": {"connections": {"texttracks": {"total": 2}}}},
+                {"uri": "/videos/v2",
+                 "download": [{"quality": "source", "link": "L",
+                               "size": 200}]},
+                {"uri": "/videos/v5", "name": "NoFile"},
+                {"uri": "/videos/v6",
+                 "download": [{"quality": "source", "link": "L",
+                               "size": 50}]},
+            ]}
+
+        vimeo_transfer.vimeo_get = fake_get_verify
+        vimeo_transfer.azure_list_blobs = (
+            lambda cfg, sas, prefix, dry: {
+                "vimeo-export/videos/v1/f.mp4":
+                    {"size": 100,
+                     "md5": vimeo_transfer.md5_hex_to_b64("aa" * 16)},
+                "vimeo-export/videos/v1/metadata.json":
+                    {"size": 10, "md5": None},
+                "vimeo-export/videos/v1/texttracks/en-caps.vtt":
+                    {"size": 5, "md5": None},
+                "vimeo-export/videos/v6/f.mp4": {"size": 60, "md5": None},
+                "vimeo-export/videos/gone/f.mp4": {"size": 1, "md5": None},
+                "vimeo-export/_meta/videos-index-20260820T000000Z.json":
+                    {"size": 10, "md5": None}})
+        phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
+        vv = vimeo_transfer.cmd_verify(root, vargs)
+        check("vimeo verify: missing/mismatch/extra sets + rc-2 semantics",
+              vv["ok"] is False and vv["missing"] == ["v2"]
+              and [m["id"] for m in vv["size_mismatch"]] == ["v6"]
+              and vv["extra"] == ["gone"]
+              and vv["no_file_api_side"]["ids"] == ["v5"]
+              and vv["texttracks"] == {"expected": 2, "present": 1}
+              and vv["md5"]["checked"] == 1 and vv["md5"]["matched"] == 1
+              and vv["meta_blobs"] == 1 and "hint" in vv)
+
+        # 429 backoff honors Retry-After; 401 never retries (real vimeo_get)
+        vimeo_transfer.vimeo_get = vsaved[0]
+        vsleeps = []
+        vimeo_transfer._sleep = lambda s: vsleeps.append(s)
+
+        class _VResp:
+            def __init__(self, body): self.body = body
+            def read(self): return self.body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        vhttp = {"n": 0}
+
+        def fake_http_429(req, timeout=90):
+            vhttp["n"] += 1
+            if vhttp["n"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "slow down", {"Retry-After": "4"},
+                    io.BytesIO(b""))
+            return _VResp(b'{"data": []}')
+
+        vimeo_transfer._http = fake_http_429
+        data = vimeo_transfer.vimeo_get("tok", "/me/videos")
+        check("vimeo 429 backoff honors Retry-After exactly",
+              data == {"data": []} and vsleeps == [4])
+
+        vhttp["n"] = 0
+
+        def fake_http_401(req, timeout=90):
+            vhttp["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 401, "no", {},
+                                         io.BytesIO(b""))
+
+        vimeo_transfer._http = fake_http_401
+        try:
+            vimeo_transfer.vimeo_get("tok", "/me/videos")
+            check("vimeo 401 raises HarnessError", False, "no exception")
+        except common.HarnessError:
+            check("vimeo 401 aborts on first attempt, no retries",
+                  vhttp["n"] == 1)
+
+        # live request shapes: block staging + create-only commit
+        vreqs = []
+
+        def fake_http_ok(req, timeout=90):
+            vreqs.append(req)
+            return _VResp(b"")
+
+        vimeo_transfer._http = fake_http_ok
+        vimeo_transfer.put_block_from_url = vsaved[7]
+        vimeo_transfer.put_block_list = vsaved[8]
+        cfg_demo = {"storage_account": "stdemoco", "container": "democo-raw"}
+        vimeo_transfer.put_block_from_url(
+            cfg_demo, "sig=s", "vimeo-export/videos/v/f.mp4",
+            vimeo_transfer._block_id(0), "https://cdn/x", 0, 99, False)
+        vimeo_transfer.put_block_list(
+            cfg_demo, "sig=s", "vimeo-export/videos/v/f.mp4",
+            [vimeo_transfer._block_id(0)], "video/mp4",
+            vimeo_transfer.md5_hex_to_b64("00" * 16), False)
+        h0 = {k.lower(): v for k, v in vreqs[0].headers.items()}
+        h1 = {k.lower(): v for k, v in vreqs[1].headers.items()}
+        check("put_block_from_url: server-side range copy, versioned",
+              vreqs[0].get_method() == "PUT"
+              and "comp=block&blockid=" in vreqs[0].full_url
+              and h0.get("x-ms-copy-source") == "https://cdn/x"
+              and h0.get("x-ms-source-range") == "bytes=0-99"
+              and h0.get("x-ms-version") == vimeo_transfer.X_MS_VERSION)
+        check("put_block_list: create-only commit with provenance md5",
+              vreqs[1].get_method() == "PUT"
+              and "comp=blocklist" in vreqs[1].full_url
+              and h1.get("if-none-match") == "*"
+              and h1.get("x-ms-blob-content-md5")
+              == "AAAAAAAAAAAAAAAAAAAAAA=="
+              and b"<Latest>" in vreqs[1].data)
+    finally:
+        (vimeo_transfer.vimeo_get, vimeo_transfer.resolve_cdn_url,
+         vimeo_transfer.resolve_fresh, vimeo_transfer.azure_list_blobs,
+         vimeo_transfer.azure_put_bytes, vimeo_transfer.azure_put_json,
+         vimeo_transfer.put_blob_from_url,
+         vimeo_transfer.put_block_from_url,
+         vimeo_transfer.put_block_list,
+         vimeo_transfer.copy_video_to_blob,
+         vimeo_transfer.mint_write_sas, vimeo_transfer.read_token,
+         vimeo_transfer._download_small, vimeo_transfer._http,
+         vimeo_transfer._sleep, common.run_az,
+         phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+         phases.mint_sas) = vsaved
+
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]
     print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")
