@@ -300,9 +300,15 @@ def duplicate_sources(expected: dict | None, run: dict | None) -> dict:
     An entry is a bare prefix string (the WHOLE prefix is redundant) or
     {"prefix": str, "redundant_bytes": int} when only part of it is (a
     partial/aborted export that still holds some unique data).
-    Returns {prefix: redundant_uncompressed_bytes} for prefixes in the run."""
+    Returns {prefix: redundant_uncompressed_bytes} for prefixes in the run.
+
+    Matching runs against the POST-SPLIT per-source view (effective_sources),
+    so a source_split company declares duplicates at their "parent/child"
+    keys (swiftlaw, 2026-08: everything lives under gdrive-export2/, and the
+    redundant copies are its second-level children). Companies without
+    source_split are unaffected — effective keys ARE the top-level keys."""
     decl = (expected or {}).get("duplicate_prefixes") or []
-    srcs = (run or {}).get("sources", {})
+    srcs = effective_sources(expected, run)
     out = {}
     for e in decl:
         name = e if isinstance(e, str) else e.get("prefix")
@@ -314,11 +320,12 @@ def duplicate_sources(expected: dict | None, run: dict | None) -> dict:
     return out
 
 
-def duplicate_prefix_note(dups: dict, run: dict | None) -> list[str]:
+def duplicate_prefix_note(dups: dict, run: dict | None,
+                          expected: dict | None = None) -> list[str]:
     """Explain the deduplication so the subtraction is never silent."""
     if not dups:
         return []
-    srcs = (run or {}).get("sources", {})
+    srcs = effective_sources(expected, run)
     whole = [k for k, v in dups.items()
              if v >= srcs.get(k, {}).get("uncompressed_bytes", 0)]
     part = [k for k in dups if k not in whole]
@@ -335,6 +342,41 @@ def duplicate_prefix_note(dups: dict, run: dict | None) -> list[str]:
     return [f"{common.human_bytes(sum(dups.values()))} excluded as duplicate "
             f"data: {'; '.join(bits)}. Headline total and %-complete are "
             "deduplicated; per-source rows omit the redundant copies."]
+
+
+def excluded_sources(expected: dict | None, run: dict | None) -> dict:
+    """Top-level prefixes that are NON-CORPUS operational data — writes that
+    land in the container but are not part of the client's corpus at all
+    (bacancy, 2026-08: a portal-configured blob-inventory policy writes daily
+    "which files landed" reports under 2026/). Declared in
+    expected-data-sizes.json's "excluded_prefixes"; each entry is a bare
+    prefix string or {"prefix": str, "reason": str}. The WHOLE prefix is
+    dropped from the headline total, %-complete, and per-source rows.
+    Distinct from duplicate_prefixes (redundant copies of real corpus data).
+    Returns {prefix: (uncompressed_bytes, reason)} for prefixes in the run."""
+    decl = (expected or {}).get("excluded_prefixes") or []
+    srcs = (run or {}).get("sources", {})
+    out = {}
+    for e in decl:
+        name = e if isinstance(e, str) else e.get("prefix")
+        if name not in srcs:
+            continue
+        reason = ("non-corpus operational data" if isinstance(e, str)
+                  else e.get("reason") or "non-corpus operational data")
+        out[name] = (srcs[name].get("uncompressed_bytes", 0), reason)
+    return out
+
+
+def excluded_prefix_note(exc: dict) -> list[str]:
+    """Explain the exclusion so the subtraction is never silent."""
+    if not exc:
+        return []
+    total = sum(b for b, _ in exc.values())
+    bits = [f"{k} ({common.human_bytes(b)}): {r}"
+            for k, (b, r) in sorted(exc.items())]
+    return [f"{common.human_bytes(total)} excluded as non-corpus data — "
+            f"{'; '.join(bits)}. Not counted in the headline total, "
+            "%-complete, or per-source rows."]
 
 
 def _rate_and_eta(latest: dict, prev: dict | None, remaining: float):
@@ -393,7 +435,9 @@ def company_summary(root: Path, slug: str) -> dict:
     manifest_total = (expected or {}).get("manifest_total_bytes")
     unc_raw = latest["totals"]["uncompressed_bytes"] if latest else None
     dup_total = sum(duplicate_sources(expected, latest).values())
-    unc_total = (unc_raw - dup_total) if unc_raw is not None else None
+    excluded = excluded_sources(expected, latest)
+    exc_total = sum(b for b, _ in excluded.values())
+    unc_total = (unc_raw - dup_total - exc_total) if unc_raw is not None else None
     pct = (unc_total / manifest_total * 100
            if latest and manifest_total else None)
     remaining = (max(manifest_total - unc_total, 0)
@@ -405,6 +449,8 @@ def company_summary(root: Path, slug: str) -> dict:
     for _p, _b in dups.items():
         if _p in sources and _b >= sources[_p].get("uncompressed_bytes", 0):
             sources.pop(_p)          # wholly redundant: not a real source
+    for _p in excluded:
+        sources.pop(_p, None)        # non-corpus: not a source at all
     rows, unexpected = service_rows(expected, latest, sources)
 
     now = common.utc_now()
@@ -425,6 +471,7 @@ def company_summary(root: Path, slug: str) -> dict:
         "uncompressed_total": unc_total,
         "uncompressed_total_raw": unc_raw,
         "duplicate_bytes": dup_total,
+        "excluded_bytes": exc_total,
         "pct_complete": pct,
         "remaining_bytes": remaining,
         "rate_bytes_per_day": rate,
@@ -438,7 +485,8 @@ def company_summary(root: Path, slug: str) -> dict:
         # from latest_run["sources"], or split children go missing
         "sources": sources,
         "notes": duplicate_prefix_note(duplicate_sources(expected, latest),
-                                       latest)
+                                       latest, expected)
+                 + excluded_prefix_note(excluded)
                  + lore_notes(latest) + detection_notes(rows, expected, latest,
                                                         sources)
                  + duplicate_notes(root, slug),

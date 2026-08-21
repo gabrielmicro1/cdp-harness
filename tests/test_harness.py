@@ -86,6 +86,28 @@ def main() -> int:
     check("BadZipFile note", "BadZipFile" in notes)
     check("no store-mode note (ratio 2.3)", "store-mode" not in notes)
 
+    print("\n— reconcile: excluded prefixes (non-corpus data) —")
+    _exc_run = {"sources": {"2026": {"uncompressed_bytes": 500},
+                            "gdrive": {"uncompressed_bytes": 9500}}}
+    _exc = reconcile.excluded_sources(
+        {"excluded_prefixes": [{"prefix": "2026", "reason": "inventory"}]},
+        _exc_run)
+    check("excluded_sources: picks bytes + reason",
+          _exc == {"2026": (500, "inventory")})
+    check("excluded_sources: bare string form",
+          reconcile.excluded_sources({"excluded_prefixes": ["2026"]}, _exc_run)
+          == {"2026": (500, "non-corpus operational data")})
+    check("excluded_sources: absent prefix ignored",
+          reconcile.excluded_sources({"excluded_prefixes": ["nope"]}, _exc_run)
+          == {})
+    _exc_note = reconcile.excluded_prefix_note(_exc)
+    check("excluded_prefix_note: mentions prefix and reason",
+          len(_exc_note) == 1 and "2026" in _exc_note[0]
+          and "inventory" in _exc_note[0]
+          and "non-corpus" in _exc_note[0])
+    check("excluded_prefix_note: empty when nothing excluded",
+          reconcile.excluded_prefix_note({}) == [])
+
     print("\n— reconcile: duplicate-data rollup —")
     dup = reconcile.duplicate_rollup([
         ("gdrive/a@x.com/take-001.zip", 100, 900),
@@ -115,6 +137,36 @@ def main() -> int:
     check("dup note reaches summary notes",
           any("duplicated data" in n for n in s2["notes"]))
     dup_idx.unlink()
+
+    print("\n— reconcile: duplicate prefixes (flat + source_split) —")
+    _flat_run = {"sources": {"a": {"uncompressed_bytes": 100},
+                             "b": {"uncompressed_bytes": 50}}}
+    _flat_exp = {"duplicate_prefixes": ["b", {"prefix": "a",
+                                              "redundant_bytes": 30}]}
+    check("flat duplicate matching unchanged",
+          reconcile.duplicate_sources(_flat_exp, _flat_run)
+          == {"b": 50, "a": 30})
+    _split_run = {
+        "sources": {"parent": {"blob_count": 10,
+                               "compressed_bytes": 150_000_000,
+                               "uncompressed_bytes": 160_000_000}},
+        "sources_l2": {"parent/dup": [2, 40_000_000, 40_000_000],
+                       "parent/big": [8, 110_000_000, 120_000_000]}}
+    _split_exp = {
+        "source_split": ["parent"],
+        "duplicate_prefixes": ["parent/dup",
+                               {"prefix": "parent/big",
+                                "redundant_bytes": 70_000_000},
+                               "parent/absent"]}
+    check("split duplicates match second-level keys",
+          reconcile.duplicate_sources(_split_exp, _split_run)
+          == {"parent/dup": 40_000_000, "parent/big": 70_000_000})
+    _dnote = reconcile.duplicate_prefix_note(
+        reconcile.duplicate_sources(_split_exp, _split_run),
+        _split_run, _split_exp)
+    check("split duplicate note classifies whole vs partial",
+          len(_dnote) == 1 and "parent/dup" in _dnote[0]
+          and "70.00 MB of parent/big" in _dnote[0], str(_dnote))
 
     print("\n— gen_report —")
     proc = run_script("gen_report.py", "democo", "--root", root)

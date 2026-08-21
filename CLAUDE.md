@@ -207,6 +207,23 @@ Cached so daily runs skip discovery entirely.
                                          // emits a note so the subtraction is never silent.
                                          // ONLY list prefixes VERIFIED against the container
                                          // (delimiter listing), never ones a client asserted.
+                                         // Matching runs on the POST-SPLIT per-source view:
+                                         // with source_split, declare duplicates at their
+                                         // "parent/child" keys (swiftlaw's redundant copies
+                                         // live under gdrive-export2/'s second level).
+  "excluded_prefixes": [{"prefix": "2026",
+                        "reason": "blob inventory policy output"}],
+                                         // optional: top-level prefixes that are NON-CORPUS
+                                         // operational data (e.g. a portal-configured blob
+                                         // inventory policy writing daily reports into the
+                                         // container — bacancy, 2026-08). Bare string or
+                                         // {"prefix", "reason"}. The whole prefix is dropped
+                                         // from the headline total, %-complete, and
+                                         // per-source rows; reconcile.excluded_sources()
+                                         // always emits a note so it's never silent. Distinct
+                                         // from duplicate_prefixes: that is for redundant
+                                         // copies of REAL corpus data; this is for writes
+                                         // that were never part of the corpus at all.
   "source": "manifest screenshot, 2026-08-13",
   "confirmed_by_user": true,             // MUST be true before any report trusts it —
                                          // a mis-OCR'd number poisons every downstream report
