@@ -2210,6 +2210,476 @@ def main() -> int:
          phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
          phases.mint_sas) = vsaved
 
+    print("\n— zoom_transfer --dry-run (month-windowed server-side-copy "
+          "ingest) —")
+    proc = run_script("zoom_transfer.py", "plan", "democo", "--root", root)
+    zplan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("zoom plan: server-side copy, dest from config, 2-day SAS, no VM",
+          zplan["dest"] == "democo-raw/zoom-export"
+          and zplan["storage_account"] == "stdemoco"
+          and zplan["sas_days"] == 2 and "no VM" in zplan["mode"]
+          and "server-side" in zplan["mode"]
+          and zplan["declared_zoom_bytes"] is None
+          and zplan["date_range"].startswith("2015-01-01"))
+    zsecrets = "ZOOMACCID\nZOOMCLIENTID\nZOOMCLIENTSECRET"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoom_transfer.py"), "probe",
+         "democo", "--root", str(root), "--dry-run"],
+        input=zsecrets, capture_output=True, text=True)
+    check("zoom probe dry-run: rc 0, no Azure, secrets never echoed",
+          proc.returncode == 0
+          and all(s not in proc.stdout for s in zsecrets.split())
+          and "zoom.us/oauth/token" in proc.stdout
+          and "accounts/me/recordings" in proc.stdout
+          and "generate-sas" not in proc.stdout
+          and "network-rule" not in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoom_transfer.py"), "pull",
+         "democo", "--root", str(root), "--dry-run"],
+        input=zsecrets, capture_output=True, text=True)
+    out = proc.stdout
+    check("zoom pull dry-run: rc 0, secrets never echoed, SAS redacted",
+          proc.returncode == 0
+          and all(s not in out for s in zsecrets.split())
+          and "redacted" in out, out[-300:])
+    check("zoom pull: racwl container SAS on the right container",
+          "generate-sas" in out and "racwl" in out and "-n democo-raw" in out)
+    check("zoom pull: laptop IP rule path, not the VM vnet path",
+          "network-rule add" in out and "--ip-address" in out
+          and "allow-network" not in out and "vm create" not in out)
+    check("zoom pull: month-windowed materialized listing, create-only writes",
+          "accounts/me/recordings" in out and "page_size=300" in out
+          and "materialized" in out
+          and "x-ms-blob-type: BlockBlob" in out and "If-None-Match" in out)
+    check("zoom pull: server-side copy shapes (blocks + commit)",
+          "x-ms-copy-source" in out and "x-ms-source-range" in out
+          and "comp=block" in out and "comp=blocklist" in out)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoom_transfer.py"), "verify",
+         "democo", "--root", str(root), "--dry-run"],
+        input=zsecrets, capture_output=True, text=True)
+    check("zoom verify dry-run: read path mints rl, not racwl",
+          proc.returncode == 0 and "--permissions rl" in proc.stdout
+          and "racwl" not in proc.stdout
+          and all(s not in proc.stdout for s in zsecrets.split()),
+          proc.stdout[-300:])
+
+    print("\n— zoom_transfer in-process (stubbed transport) —")
+    import zoom_transfer  # noqa: E402
+
+    zsaved = (zoom_transfer.zoom_get, zoom_transfer.resolve_download_url,
+              zoom_transfer.resolve_fresh, zoom_transfer.azure_list_blobs,
+              zoom_transfer.azure_put_bytes, zoom_transfer.azure_put_json,
+              zoom_transfer.put_blob_from_url,
+              zoom_transfer.put_block_from_url,
+              zoom_transfer.put_block_list,
+              zoom_transfer.copy_file_to_blob,
+              zoom_transfer.mint_write_sas, zoom_transfer.read_credentials,
+              zoom_transfer._http, zoom_transfer._sleep,
+              zoom_transfer.TokenBox.mint, common.run_az,
+              phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+              phases.mint_sas)
+    try:
+        # month windows: clamped ends, one entry per month
+        check("zoom month_windows: clamped first/last, one per month",
+              zoom_transfer.month_windows("2026-01-15", "2026-03-10")
+              == [("2026-01-15", "2026-01-31"),
+                  ("2026-02-01", "2026-02-28"),
+                  ("2026-03-01", "2026-03-10")]
+              and zoom_transfer.month_windows("2026-05-05", "2026-05-05")
+              == [("2026-05-05", "2026-05-05")])
+
+        # uuid handling: double-encoded API paths, filename-safe blob dirs
+        check("zoom double_encode: '/' and '+' encoded twice",
+              zoom_transfer.double_encode("a/b+c==")
+              == "a%252Fb%252Bc%253D%253D")
+        check("zoom safe_uuid: filename-safe, deterministic",
+              zoom_transfer.safe_uuid({"uuid": "a/b+c=="}) == "a_b-c=="
+              and zoom_transfer.safe_uuid({"id": 12345}) == "12345"
+              and zoom_transfer.safe_uuid({}) == "unknown")
+
+        # placeholder gate (empty file_type = in-progress row)
+        check("zoom should_pull_file: placeholder rows skipped",
+              zoom_transfer.should_pull_file(
+                  {"download_url": "u", "file_type": "MP4"})
+              and not zoom_transfer.should_pull_file(
+                  {"download_url": "u", "file_type": ""})
+              and not zoom_transfer.should_pull_file({"file_type": "MP4"}))
+
+        # blob_name: deterministic shape, ext map + fallback
+        zmtg = {"uuid": "u/u+1=="}
+        check("zoom blob_name: deterministic, id truncated, ext mapped",
+              zoom_transfer.blob_name(
+                  "zoom-export", zmtg,
+                  {"recording_start": "2026-03-01T10:00:00Z",
+                   "file_type": "MP4", "id": "abcdef0123456789"})
+              == ("zoom-export/meetings/u_u-1==/"
+                  "20260301T100000Z_MP4_abcdef012345.mp4")
+              and zoom_transfer.blob_name(
+                  "zoom-export", zmtg,
+                  {"recording_start": "2026-03-01T10:00:00Z",
+                   "file_type": "WEIRD", "file_extension": "XYZ",
+                   "id": "1"}).endswith("_WEIRD_1.xyz")
+              and zoom_transfer.blob_name(
+                  "zoom-export", zmtg,
+                  {"recording_start": "2026-03-01T10:00:00Z",
+                   "file_type": "TRANSCRIPT", "id": "2"}).endswith(".vtt"))
+
+        class _ZResp:
+            def __init__(self, body): self.body = body
+            def read(self): return self.body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        # TokenBox: mints once, re-mints inside the refresh margin
+        zmints = {"n": 0}
+
+        def fake_http_token(req, timeout=90):
+            zmints["n"] += 1
+            return _ZResp(b'{"access_token": "tok%d", "expires_in": 3600}'
+                          % zmints["n"])
+
+        zoom_transfer._http = fake_http_token
+        zbox = zoom_transfer.TokenBox("A", "B", "C")
+        t1 = zbox.get()
+        t2 = zbox.get()
+        zbox._exp = time.time() + 100  # inside the 300s refresh margin
+        t3 = zbox.get()
+        check("zoom TokenBox: mints once, re-mints inside expiry margin",
+              t1 == "tok1" and t2 == "tok1" and t3 == "tok2"
+              and zmints["n"] == 2)
+
+        # 429 honors Retry-After exactly
+        zsleeps = []
+        zoom_transfer._sleep = lambda s: zsleeps.append(s)
+        zhttp = {"n": 0}
+
+        def fake_http_429(req, timeout=90):
+            if "oauth" in req.full_url:
+                return _ZResp(b'{"access_token": "t", "expires_in": 3600}')
+            zhttp["n"] += 1
+            if zhttp["n"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "slow down", {"Retry-After": "7"},
+                    io.BytesIO(b""))
+            return _ZResp(b'{"meetings": []}')
+
+        zoom_transfer._http = fake_http_429
+        data = zoom_transfer.zoom_get(zoom_transfer.TokenBox("A", "B", "C"),
+                                      "/accounts/me/recordings")
+        check("zoom 429 backoff honors Retry-After exactly",
+              data == {"meetings": []} and zsleeps == [7])
+
+        # 401 mid-run: one silent re-mint, then abort
+        zhttp["n"] = 0
+        ztokens = {"minted": 0}
+
+        def fake_http_401(req, timeout=90):
+            if "oauth" in req.full_url:
+                ztokens["minted"] += 1
+                return _ZResp(b'{"access_token": "t", "expires_in": 3600}')
+            zhttp["n"] += 1
+            raise urllib.error.HTTPError(req.full_url, 401, "no", {},
+                                         io.BytesIO(b""))
+
+        zoom_transfer._http = fake_http_401
+        try:
+            zoom_transfer.zoom_get(zoom_transfer.TokenBox("A", "B", "C"),
+                                   "/users/me")
+            check("zoom 401 re-mints once then aborts", False, "no exception")
+        except common.HarnessError:
+            check("zoom 401 re-mints once then aborts",
+                  zhttp["n"] == 2 and ztokens["minted"] == 2)
+
+        # listing 400 (unactivated app): raised immediately, never retried
+        zhttp["n"] = 0
+
+        def fake_http_400(req, timeout=90):
+            if "oauth" in req.full_url:
+                return _ZResp(b'{"access_token": "t", "expires_in": 3600}')
+            zhttp["n"] += 1
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "bad", {},
+                io.BytesIO(b'{"code":4711,"message":"scope"}'))
+
+        zoom_transfer._http = fake_http_400
+        try:
+            zoom_transfer.list_month(zoom_transfer.TokenBox("A", "B", "C"),
+                                     "2026-01-01", "2026-01-31")
+            check("zoom listing 400: raised immediately, never retried",
+                  False, "no exception")
+        except zoom_transfer.ZoomHTTPError as e:
+            check("zoom listing 400: raised immediately, never retried",
+                  e.status == 400 and zhttp["n"] == 1 and "4711" in str(e))
+
+        # full pull flow: month materialized before any copy, month failure
+        # isolation, exact-name resume, placeholder skip, per-file error
+        zf1 = {"download_url": "https://z/d1", "file_type": "MP4",
+               "id": "f1", "file_size": 100,
+               "recording_start": "2026-01-05T10:00:00Z"}
+        zf2 = {"download_url": "https://z/d2", "file_type": "M4A",
+               "id": "f2", "file_size": 50,
+               "recording_start": "2026-01-20T10:00:00Z"}
+        zf3 = {"download_url": "https://z/d3", "file_type": "MP4",
+               "id": "f3", "file_size": 70,
+               "recording_start": "2026-03-02T10:00:00Z"}
+        zf4 = {"download_url": "https://z/d4", "file_type": "CHAT",
+               "id": "f4", "file_size": 5,
+               "recording_start": "2026-03-02T10:00:00Z"}
+        zph = {"download_url": "https://z/ph", "file_type": "", "id": "ph"}
+        zm1 = {"uuid": "m1", "recording_files": [zf1, zph]}
+        zm2 = {"uuid": "m2", "recording_files": [zf2]}
+        zm3 = {"uuid": "m3", "recording_files": [zf3, zf4]}
+        zcalls = []
+
+        def fake_zoom_get(box, path, params=None):
+            if path == "/accounts/me/recordings":
+                if (params or {}).get("page_size") == 1:
+                    zcalls.append("gate")
+                    return {"total_records": 0, "meetings": []}
+                frm = params["from"]
+                if frm.startswith("2026-01"):
+                    if params.get("next_page_token"):
+                        zcalls.append("list-2026-01-p2")
+                        return {"meetings": [zm2]}
+                    zcalls.append("list-2026-01-p1")
+                    return {"meetings": [zm1], "next_page_token": "npt"}
+                if frm.startswith("2026-02"):
+                    zcalls.append("list-2026-02")
+                    raise zoom_transfer.ZoomHTTPError(500, "boom month")
+                if frm.startswith("2026-03"):
+                    zcalls.append("list-2026-03")
+                    return {"meetings": [zm3]}
+                return {"meetings": []}
+            if path == "/users/me":
+                return {"email": "a@b.c"}
+            return {}
+
+        zputs = []
+
+        def fake_zput_json(cfg, sas, name, obj, dry):
+            zputs.append(name)
+            return 10
+
+        def fake_zcopy(cfg, sas, box, uuid, name, f, a):
+            zcalls.append(f"copy-{f['id']}")
+            if f["id"] == "f4":
+                raise zoom_transfer.CopyError("copy x: HTTP 500 boom")
+            return int(f.get("file_size") or 0)
+
+        common.run_az = lambda *a, **k: types.SimpleNamespace(stdout="")
+        phases.ip_rule_ensure = lambda cfg, dry_run=False: (True, "1.2.3.4")
+        zremoved = []
+        phases.ip_rule_remove_if_ours = (
+            lambda cfg, ip, we, dry_run=False: zremoved.append((ip, we)))
+        zoom_transfer.TokenBox.mint = lambda self: "t"
+        zoom_transfer.read_credentials = lambda dry: ("A", "B", "C")
+        zoom_transfer.zoom_get = fake_zoom_get
+        zoom_transfer.mint_write_sas = (
+            lambda cfg, days, dry: ("sig=fake", "2026-08-22T00:00:00Z"))
+        zname2 = zoom_transfer.blob_name("zoom-export", zm2, zf2)
+        zoom_transfer.azure_list_blobs = (
+            lambda cfg, sas, prefix, dry: {zname2: {"size": 50}})
+        zoom_transfer.azure_put_json = fake_zput_json
+        zoom_transfer.copy_file_to_blob = fake_zcopy
+
+        zargs = types.SimpleNamespace(
+            slug="democo", dest_prefix="zoom-export", sas_days=2,
+            from_date="2026-01-01", to_date="2026-03-31",
+            meeting_limit=None, block_size_mb=256, single_shot_max_mb=1024,
+            dry_run=False)
+        zres = zoom_transfer.cmd_pull(root, zargs)
+        check("zoom pull: month fully materialized before any copy",
+              zcalls.index("list-2026-01-p2") < zcalls.index("copy-f1"))
+        check("zoom pull: month failure isolated, run continues ok",
+              zres["ok"] is True and list(zres["month_errors"]) == ["2026-02"]
+              and zres["months_listed"] == 2)
+        check("zoom pull: landed file skipped by exact name, never re-copied",
+              zres["skipped_existing"] == 1 and "copy-f2" not in zcalls)
+        check("zoom pull: placeholder counted, not an error",
+              zres["placeholders_skipped"] == 1
+              and zres["file_errors"]["count"] == 1)
+        check("zoom pull: per-file error counted, run completes ok",
+              zres["copied"] == 2 and zres["bytes_copied_serverside"] == 170
+              and zres["file_errors"]["names"]
+              == [zoom_transfer.blob_name("zoom-export", zm3, zf4)])
+        check("zoom pull: metadata + index + account meta blobs written",
+              any(n.endswith("m1/metadata.json") for n in zputs)
+              and any("_meta/recordings-index-" in n for n in zputs)
+              and any("_meta/account-" in n for n in zputs))
+        check("zoom pull: resume hint present, IP rule removed",
+              "resume_hint" in zres and zremoved == [("1.2.3.4", True)])
+
+        # circuit breaker: first 5 file copies all fail -> systemic abort
+        def fake_zoom_get_many(box, path, params=None):
+            if path == "/accounts/me/recordings":
+                if (params or {}).get("page_size") == 1:
+                    return {"meetings": []}
+                return {"meetings": [{
+                    "uuid": "mm",
+                    "recording_files": [
+                        {"download_url": f"https://z/x{i}",
+                         "file_type": "MP4", "id": f"x{i}", "file_size": 10,
+                         "recording_start": "2026-01-01T00:00:00Z"}
+                        for i in range(6)]}]}
+            return {}
+
+        def fake_zcopy_fail(cfg, sas, box, uuid, name, f, a):
+            raise zoom_transfer.CopyError("copy: HTTP 403 nope")
+
+        zargs_jan = types.SimpleNamespace(
+            slug="democo", dest_prefix="zoom-export", sas_days=2,
+            from_date="2026-01-01", to_date="2026-01-31",
+            meeting_limit=None, block_size_mb=256, single_shot_max_mb=1024,
+            dry_run=False)
+        zoom_transfer.zoom_get = fake_zoom_get_many
+        zoom_transfer.azure_list_blobs = lambda cfg, sas, prefix, dry: {}
+        zoom_transfer.copy_file_to_blob = fake_zcopy_fail
+        try:
+            zoom_transfer.cmd_pull(root, zargs_jan)
+            check("zoom circuit breaker trips", False, "no exception")
+        except common.HarnessError as e:
+            check("zoom circuit breaker: 5 straight failures abort",
+                  "systemic" in str(e))
+
+        # listing 400 at the gate: activation hint, nothing PUT
+        zputs.clear()
+
+        def fake_zoom_get_400(box, path, params=None):
+            if path == "/accounts/me/recordings":
+                raise zoom_transfer.ZoomHTTPError(400, "HTTP 400: 4711")
+            return {}
+
+        zoom_transfer.zoom_get = fake_zoom_get_400
+        try:
+            zoom_transfer.cmd_pull(root, zargs_jan)
+            check("zoom pull 400 aborts", False, "no exception")
+        except common.HarnessError as e:
+            check("zoom pull: listing 400 aborts with activation hint, "
+                  "nothing PUT",
+                  "ACTIVATED" in str(e) and zputs == [])
+
+        # expired source URL: re-resolve with fresh token, retry SAME block
+        zoom_transfer.copy_file_to_blob = zsaved[9]
+        zblocks = []
+        zfresh = {"n": 0}
+        zboom = {"armed": True}
+
+        def flaky_zblock(cfg, sas, name, bid, src, s0, e0, dry):
+            if zboom["armed"]:
+                zboom["armed"] = False
+                raise zoom_transfer.CopyError(
+                    "expired", azure_code="CannotVerifyCopySource")
+            zblocks.append((bid, src))
+
+        zoom_transfer.put_block_from_url = flaky_zblock
+        zoom_transfer.put_block_list = (
+            lambda cfg, sas, name, ids, ct, dry: 1)
+        zoom_transfer.resolve_download_url = lambda box, link: "https://z/u1"
+        zoom_transfer.resolve_fresh = (
+            lambda box, uuid, f: (zfresh.__setitem__("n", zfresh["n"] + 1)
+                                  or "https://z/fresh"))
+        ZMIB = zoom_transfer.MIB
+        zc_args = types.SimpleNamespace(dry_run=False, single_shot_max_mb=100,
+                                        block_size_mb=256)
+        n = zoom_transfer.copy_file_to_blob(
+            {}, "sas", None, "u", "zoom-export/meetings/u/f.mp4",
+            {"download_url": "https://z/d", "file_type": "MP4",
+             "file_size": 300 * ZMIB}, zc_args)
+        check("zoom expired URL: re-resolved once, same block id retried",
+              zfresh["n"] == 1 and n == 300 * ZMIB
+              and zblocks[0][0] == zoom_transfer._block_id(0)
+              and zblocks[0][1] == "https://z/fresh")
+
+        # verify math: missing / byte-exact mismatch / extra (retention) /
+        # placeholder api-side / rc-2 semantics
+        zvm = {"uuid": "va", "recording_files": [
+            {"download_url": "u", "file_type": "MP4", "id": "fa",
+             "file_size": 100, "recording_start": "2026-01-02T00:00:00Z"},
+            {"download_url": "u", "file_type": "M4A", "id": "fb",
+             "file_size": 40, "recording_start": "2026-01-02T00:00:00Z"},
+            {"download_url": "u", "file_type": "CHAT", "id": "fc",
+             "file_size": 9, "recording_start": "2026-01-02T00:00:00Z"},
+            {"download_url": "u", "file_type": "", "id": "ph2"},
+        ]}
+        zna, znb, znc = (zoom_transfer.blob_name("zoom-export", zvm, f)
+                         for f in zvm["recording_files"][:3])
+
+        def fake_zoom_get_verify(box, path, params=None):
+            if path == "/accounts/me/recordings":
+                if (params or {}).get("page_size") == 1:
+                    return {"meetings": []}
+                return {"meetings": [zvm]}
+            return {}
+
+        zgone = "zoom-export/meetings/gone/20250101T000000Z_MP4_old.mp4"
+        zoom_transfer.zoom_get = fake_zoom_get_verify
+        zoom_transfer.azure_list_blobs = (
+            lambda cfg, sas, prefix, dry: {
+                zna: {"size": 100},
+                znc: {"size": 5},
+                "zoom-export/meetings/va/metadata.json": {"size": 3},
+                zgone: {"size": 1},
+                "zoom-export/_meta/recordings-index-20260820T000000Z.json":
+                    {"size": 2}})
+        phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
+        zv = zoom_transfer.cmd_verify(root, zargs_jan)
+        check("zoom verify: missing/byte-exact/extra/placeholder + rc-2",
+              zv["ok"] is False and zv["missing"] == [znb]
+              and [m["name"] for m in zv["size_mismatch"]] == [znc]
+              and zv["extra"] == [zgone]
+              and zv["placeholders_api_side"] == 1
+              and zv["files_expected"] == 3
+              and zv["files_in_container"] == 3
+              and zv["meta_blobs"] == 1 and "hint" in zv)
+
+        # live request shapes: versioned range copy; create-only commit
+        # WITHOUT md5 (zoom declares none)
+        zreqs = []
+
+        def fake_http_ok_z(req, timeout=90):
+            zreqs.append(req)
+            return _ZResp(b"")
+
+        zoom_transfer._http = fake_http_ok_z
+        zoom_transfer.put_block_from_url = zsaved[7]
+        zoom_transfer.put_block_list = zsaved[8]
+        zcfg_demo = {"storage_account": "stdemoco",
+                     "container": "democo-raw"}
+        zoom_transfer.put_block_from_url(
+            zcfg_demo, "sig=s", "zoom-export/meetings/m/f.mp4",
+            zoom_transfer._block_id(0), "https://z/x", 0, 99, False)
+        zoom_transfer.put_block_list(
+            zcfg_demo, "sig=s", "zoom-export/meetings/m/f.mp4",
+            [zoom_transfer._block_id(0)], "video/mp4", False)
+        hz0 = {k.lower(): v for k, v in zreqs[0].headers.items()}
+        hz1 = {k.lower(): v for k, v in zreqs[1].headers.items()}
+        check("zoom put_block_from_url: server-side range copy, versioned",
+              zreqs[0].get_method() == "PUT"
+              and "comp=block&blockid=" in zreqs[0].full_url
+              and hz0.get("x-ms-copy-source") == "https://z/x"
+              and hz0.get("x-ms-source-range") == "bytes=0-99"
+              and hz0.get("x-ms-version") == zoom_transfer.X_MS_VERSION)
+        check("zoom put_block_list: create-only commit, no md5 headers",
+              zreqs[1].get_method() == "PUT"
+              and "comp=blocklist" in zreqs[1].full_url
+              and hz1.get("if-none-match") == "*"
+              and "x-ms-blob-content-md5" not in hz1
+              and b"<Latest>" in zreqs[1].data)
+    finally:
+        (zoom_transfer.zoom_get, zoom_transfer.resolve_download_url,
+         zoom_transfer.resolve_fresh, zoom_transfer.azure_list_blobs,
+         zoom_transfer.azure_put_bytes, zoom_transfer.azure_put_json,
+         zoom_transfer.put_blob_from_url,
+         zoom_transfer.put_block_from_url,
+         zoom_transfer.put_block_list,
+         zoom_transfer.copy_file_to_blob,
+         zoom_transfer.mint_write_sas, zoom_transfer.read_credentials,
+         zoom_transfer._http, zoom_transfer._sleep,
+         zoom_transfer.TokenBox.mint, common.run_az,
+         phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
+         phases.mint_sas) = zsaved
+
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]
     print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")

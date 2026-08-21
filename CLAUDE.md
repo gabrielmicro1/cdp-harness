@@ -43,10 +43,10 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, qwilr, vimeo) *populate* `<slug>-raw` from a
-   cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on the
-   local qwilr/vimeo pulls, whose writes are additionally create-only via
-   `If-None-Match: *`) — they are the ingest path, not an audit path. They
+   skills (gcs, dropbox, gdrive, qwilr, vimeo, zoom) *populate* `<slug>-raw`
+   from a cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on
+   the local qwilr/vimeo/zoom pulls, whose writes are additionally create-only
+   via `If-None-Match: *`) — they are the ingest path, not an audit path. They
    only add blobs under their dest prefix and never modify or delete
    existing data; everything else in the harness stays strictly read-only.
 
@@ -95,6 +95,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
   vimeo-azure-transfer/references/commands.md
+  zoom-azure-transfer/SKILL.md             # Zoom S2S API → <slug>-raw (local, Azure server-side copy)
+  zoom-azure-transfer/references/commands.md
 scripts/                     # the deterministic layer (python3, stdlib only)
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # shared sizing phases: skip/launch/poll/harvest/cleanup
@@ -109,6 +111,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   gdrive_transfer.py         # thin Google Drive CLI over transfer_engine (Spec only)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
+  zoom_transfer.py           # Zoom recordings → blob via Put-Block-From-URL server-side copy; local, standalone
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
@@ -416,7 +419,7 @@ sizing path — do not cross-contaminate:
   company infrastructure may strip rules not added through the internal UI —
   if a 403 reappears mid-transfer, re-run `allow-network`.
   `phases.ip_rule_ensure` belongs to the laptop-origin paths only
-  (sizing, and the local qwilr/vimeo pulls below).
+  (sizing, and the local qwilr/vimeo/zoom pulls below).
 - **SAS is `racwl`, 21-day default** (write path — the read-only `rl` policy
   above is for sizing). Never revoked; lapses on its own.
 - **Secrets** (SAS URL, Google OAuth token) live only in the VM's
@@ -434,7 +437,7 @@ sizing path — do not cross-contaminate:
   subnet + a vnet-rule on the SA. The laptop-based sizing path is unaffected
   (external IP, IP rules work).
 
-**The VM-less ingests: qwilr and vimeo.** A Qwilr corpus is small JSON pulled from
+**The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
 read-only scope exists; client revokes it after the engagement), so
 `scripts/qwilr_transfer.py` (standalone — NOT a transfer_engine Spec) runs
@@ -468,6 +471,31 @@ Vimeo's declared md5, larger ones stage 256 MiB blocks and re-resolve the
 CDN URL whenever it expires mid-copy (normal, budgeted). Thumbnails are
 manifested, not downloaded; no analytics/comments/version-history export
 exists. Driven by the `vimeo-azure-transfer` skill.
+
+**Zoom** rides vimeo's transport (`scripts/zoom_transfer.py`, standalone,
+same server-side Put Blob/Block From URL copy, same laptop IP-rule
+firewall, create-only commits, no state file, racwl 2-day SAS) with
+Zoom-specific ground truth: auth is a Server-to-Server OAuth app
+(scope `recording:read:admin` — it DOES work with S2S despite a stale KB
+note) whose THREE secrets (Account ID, Client ID, Client Secret) arrive
+on stdin as 3 lines; the app must be **activated** by the account owner —
+an unactivated app authenticates and then 400s on the listing, which is
+the `probe` gate and a client conversation, never a retry. The listing
+(`/accounts/me/recordings`, literal `me` — a real accountId needs the
+master scope, 400 code 4711) is capped to ~1-month windows, walked from
+`--from-date` (default 2015-01-01) and **fully materialized per month
+before any copy** (a `next_page_token` expires during multi-minute
+copies — crashed a real run). Placeholder rows (empty `file_type` =
+still processing) are skipped; the 1 h token auto-refreshes (`TokenBox`)
+and feeds mid-copy CDN re-resolves on the vimeo re-resolve budget; blob
+names are deterministic (`meetings/<uuid>/<start>_<TYPE>_<fileid>.<ext>`)
+so resume is keyed on the exact name; Zoom declares no md5, so verify is
+byte-exact on size. Retention auto-delete gives the engagement a clock
+(probe surfaces it); Team Chat, Zoom Phone, Whiteboards and trash are out
+of scope. S2S apps are account-bound — an org with several Zoom accounts
+(song-division) gets one app + one full cycle per account, sub-prefixed
+`--dest-prefix zoom-export/<label>` so verify stays per-account. Driven
+by the `zoom-azure-transfer` skill.
 
 ## Learned the hard way (from real croplabel / webspiders / latchel runs)
 
