@@ -1834,7 +1834,8 @@ def main() -> int:
               vimeo_transfer._download_small, vimeo_transfer._http,
               vimeo_transfer._sleep, common.run_az,
               phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
-              phases.mint_sas)
+              phases.mint_sas, vimeo_transfer.resolve_cdn,
+              vimeo_transfer._http_nr)
     try:
         # paging.next walked to exhaustion
         vget_calls = []
@@ -1894,7 +1895,7 @@ def main() -> int:
         cargs = types.SimpleNamespace(dry_run=False, single_shot_max_mb=1024,
                                       block_size_mb=256)
         ccalls = {"single": [], "blocks": [], "commits": [], "fresh": 0}
-        vimeo_transfer.resolve_cdn_url = lambda link: "https://cdn/x"
+        vimeo_transfer.resolve_cdn = lambda link: ("https://cdn/x", None)
         vimeo_transfer.put_blob_from_url = (
             lambda cfg, sas, name, src, ct, md5, dry:
             ccalls["single"].append(name) or 1)
@@ -1937,7 +1938,7 @@ def main() -> int:
         vimeo_transfer.resolve_fresh = (
             lambda token, vid, chosen:
             (ccalls.__setitem__("fresh", ccalls["fresh"] + 1)
-             or "https://cdn/fresh"))
+             or ("https://cdn/fresh", None)))
         vimeo_transfer.copy_video_to_blob({}, "sas", "tok", "v9",
                                           "x/videos/v9/f.mp4",
                                           dict(chosen_big, size=300 * MIB),
@@ -2196,6 +2197,34 @@ def main() -> int:
               and h1.get("x-ms-blob-content-md5")
               == "AAAAAAAAAAAAAAAAAAAAAA=="
               and b"<Latest>" in vreqs[1].data)
+
+        vimeo_transfer.put_blob_from_url = vsaved[6]
+        vreqs.clear()
+        vimeo_transfer.put_blob_from_url(
+            cfg_demo, "sig=s", "vimeo-export/videos/v/f.mp4",
+            "https://cdn/x", "video/mp4", None, False)
+        h2 = {k.lower(): v for k, v in vreqs[0].headers.items()}
+        check("put_blob_from_url: source disposition overridden (CDN sends "
+              "invalid filenames), create-only",
+              h2.get("x-ms-copy-source") == "https://cdn/x"
+              and h2.get("x-ms-blob-content-disposition") == "attachment"
+              and h2.get("if-none-match") == "*")
+
+        # wire size parsed from the 0-byte probe (listing sizes can be stale)
+        vimeo_transfer.resolve_cdn = vsaved[19]
+
+        def fake_nr(req, timeout=60):
+            class _R:
+                status = 206
+                headers = {"Content-Range": "bytes 0-0/4125238613"}
+                def close(self):
+                    pass
+            return _R()
+
+        vimeo_transfer._http_nr = fake_nr
+        u_w = vimeo_transfer.resolve_cdn("https://x/dl")
+        check("resolve_cdn: wire size parsed from Content-Range",
+              u_w == ("https://x/dl", 4125238613))
     finally:
         (vimeo_transfer.vimeo_get, vimeo_transfer.resolve_cdn_url,
          vimeo_transfer.resolve_fresh, vimeo_transfer.azure_list_blobs,
@@ -2208,7 +2237,8 @@ def main() -> int:
          vimeo_transfer._download_small, vimeo_transfer._http,
          vimeo_transfer._sleep, common.run_az,
          phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
-         phases.mint_sas) = vsaved
+         phases.mint_sas, vimeo_transfer.resolve_cdn,
+         vimeo_transfer._http_nr) = vsaved
 
     print("\n— zoom_transfer --dry-run (month-windowed server-side-copy "
           "ingest) —")

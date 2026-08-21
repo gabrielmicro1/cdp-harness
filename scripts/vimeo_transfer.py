@@ -281,11 +281,15 @@ def safe_filename(video: dict, chosen: dict) -> str:
     return (base[:150] or "video") + chosen["ext"]
 
 
-def resolve_cdn_url(link: str) -> str:
-    """Follow the download link's redirect chain manually and return the
-    final signed CDN URL. Azure copy-from-URL never follows redirects, so
-    resolution happens here. The result expires within HOURS -- never cache
-    it; on any source-side failure call again (resolve_fresh)."""
+def resolve_cdn(link: str) -> tuple[str, int | None]:
+    """Follow the download link's redirect chain manually and return
+    (final signed CDN URL, byte size seen on the wire). Azure copy-from-URL
+    never follows redirects, so resolution happens here; the size comes
+    from the 0-byte probe's Content-Range total because the listing's
+    declared size can be STALE (seen live: a 4.1 GB video whose actual file
+    differed, overrunning the last block's range) -- the wire is the truth
+    the copy must match. The URL expires within HOURS -- never cache it; on
+    any source-side failure call again (resolve_fresh)."""
     url = link
     for _hop in range(6):
         req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
@@ -306,18 +310,32 @@ def resolve_cdn_url(link: str) -> str:
                         "(expired link? re-fetch the video's file entries)")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise VimeoHTTPError(0, f"resolving download link: {e}")
+        total: int | None = None
+        content_range = resp.headers.get("Content-Range") or ""
+        if "/" in content_range:
+            tail = content_range.rsplit("/", 1)[-1].strip()
+            if tail.isdigit():
+                total = int(tail)
+        elif getattr(resp, "status", None) == 200 \
+                and resp.headers.get("Content-Length"):
+            total = int(resp.headers["Content-Length"])
         resp.close()
-        return url
+        return url, total
     raise VimeoHTTPError(0, "redirect loop resolving download link")
 
 
-def resolve_fresh(token: str, video_id: str, chosen: dict) -> str:
+def resolve_cdn_url(link: str) -> str:
+    return resolve_cdn(link)[0]
+
+
+def resolve_fresh(token: str, video_id: str,
+                  chosen: dict) -> tuple[str, int | None]:
     """Two-stage re-resolve for an expired CDN URL: re-follow the stored API
     link; if that link itself has expired (~24h), re-fetch the video's file
     entries and resolve the equivalent one. Updates chosen['link'] so later
-    retries start from the fresh link."""
+    retries start from the fresh link. Returns (url, wire size)."""
     try:
-        return resolve_cdn_url(chosen["link"])
+        return resolve_cdn(chosen["link"])
     except VimeoHTTPError:
         video = vimeo_get(token, f"/videos/{video_id}",
                           {"fields": "uri,download,files,play"})
@@ -326,7 +344,7 @@ def resolve_fresh(token: str, video_id: str, chosen: dict) -> str:
             raise CopyError(f"re-resolve: video {video_id} no longer offers "
                             "file links")
         chosen["link"] = fresh["link"]
-        return resolve_cdn_url(fresh["link"])
+        return resolve_cdn(fresh["link"])
 
 
 def probe_range(url: str) -> bool:
@@ -557,6 +575,11 @@ def put_blob_from_url(cfg: dict, sas: str, name: str, src_url: str,
         "x-ms-blob-type": "BlockBlob",
         "x-ms-copy-source": src_url,
         "x-ms-blob-content-type": content_type,
+        # Without an explicit override Azure copies the source's HTTP
+        # headers onto the blob, and Vimeo's CDN sends a Content-Disposition
+        # filename Azure can reject as an invalid property (mojibake +
+        # "|" -- seen live on every special-character title).
+        "x-ms-blob-content-disposition": "attachment",
         "If-None-Match": "*",
     }
     if md5_b64:
@@ -711,7 +734,16 @@ def copy_video_to_blob(cfg: dict, sas: str, token: str, video_id: str,
     size = int(chosen.get("size") or 0)
     md5_b64 = md5_hex_to_b64(chosen.get("md5"))
     ct = chosen.get("type") or "video/mp4"
-    src = "<cdn-url>" if args.dry_run else resolve_cdn_url(chosen["link"])
+    if args.dry_run:
+        src = "<cdn-url>"
+    else:
+        src, wire = resolve_cdn(chosen["link"])
+        if wire and wire != size:
+            print(f"progress   {video_id}: wire size {wire} != listing "
+                  f"size {size}; trusting the wire (stale listing md5 "
+                  "dropped)", file=sys.stderr, flush=True)
+            size = wire
+            md5_b64 = None  # describes the listed encode, not this one
     single_max = args.single_shot_max_mb * MIB
     reresolves = 0
 
@@ -723,7 +755,12 @@ def copy_video_to_blob(cfg: dict, sas: str, token: str, video_id: str,
         print(f"progress   {video_id}: CDN URL expired, re-resolving "
               f"({reresolves}/{RERESOLVE_BUDGET})", file=sys.stderr,
               flush=True)
-        return resolve_fresh(token, video_id, chosen)
+        fresh_src, fresh_wire = resolve_fresh(token, video_id, chosen)
+        if fresh_wire and size and fresh_wire != size:
+            raise CopyError(
+                f"source changed size mid-copy ({size} -> {fresh_wire}); "
+                "re-run pull -- it re-plans against the new size")
+        return fresh_src
 
     if size <= single_max:  # includes size-unknown (0): single-shot caps 5000 MB
         while True:
@@ -1206,6 +1243,7 @@ def cmd_verify(root: Path, args) -> dict:
     by_vid = _index_by_video(blobs, prefix)
     missing: list[str] = []
     size_mismatch: list[dict] = []
+    wire_size_ok = 0
     no_file_api: list[str] = []
     metadata_missing = 0
     md5_matches = md5_checked = 0
@@ -1233,8 +1271,20 @@ def cmd_verify(root: Path, args) -> dict:
         blob = blobs[f"{prefix}/videos/{vid}/{media[0]}"]
         candidates = _candidate_sizes(video)
         if candidates and blob["size"] not in candidates:
-            size_mismatch.append({"id": vid, "actual": blob["size"],
-                                  "expected_one_of": sorted(candidates)[:5]})
+            # listing sizes can be stale -- before flagging, ask the wire
+            confirmed = True
+            if not args.dry_run:
+                try:
+                    _u, wire = resolve_cdn(chosen["link"])
+                    if wire == blob["size"]:
+                        confirmed = False
+                        wire_size_ok += 1
+                except VimeoHTTPError:
+                    pass
+            if confirmed:
+                size_mismatch.append({"id": vid, "actual": blob["size"],
+                                      "expected_one_of":
+                                          sorted(candidates)[:5]})
         want_md5 = md5_hex_to_b64(chosen.get("md5"))
         if want_md5 and blob.get("md5"):
             md5_checked += 1
@@ -1253,6 +1303,7 @@ def cmd_verify(root: Path, args) -> dict:
         "missing_count": len(missing),
         "missing": missing[:50],
         "size_mismatch": size_mismatch[:50],
+        "wire_size_ok": wire_size_ok,  # listing size stale, wire matches blob
         "no_file_api_side": {"count": len(no_file_api),
                              "ids": no_file_api[:50]},
         "metadata_missing": metadata_missing,
