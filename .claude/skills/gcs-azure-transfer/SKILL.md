@@ -164,6 +164,14 @@ source on its next run.
 
 ## Judgment notes
 
+- **A differences-heavy verify is NOT proof of an interrupted transfer.**
+  If you did not set up this engagement yourself, it may be SCOPED to an
+  include list (specific users only — bacancy, 2026-08-21): check
+  `companies/<slug>/transfer-include-list.txt` and the engagement memory
+  BEFORE interpreting verify output or re-running transfer. The engine
+  refuses unfiltered transfer/verify while a scope file exists on the VM
+  (`scoped-engagement`); `--unfiltered` requires an explicit user decision,
+  never your own. Never start a transfer the user didn't ask for.
 - Discovery says `vm-no-public-ip` → someone deallocated the VM; the static
   IP association may be gone and the allowlist entry stale. Surface loudly.
 - `vm-unreachable` right after create-vm = cloud-init still booting; wait

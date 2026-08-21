@@ -315,7 +315,23 @@ def cmd_create_vm(spec: Spec, root: Path, args) -> dict:
 
 
 def _subnet_id(spec: Spec, rg: str, slug: str, dry_run: bool) -> str | None:
+    """The VM's ACTUAL subnet id, resolved via its NIC.
+
+    az vm create silently reuses a pre-existing vnet in the RG when one
+    exists in the same region (bacancy 2026-08: leftover legacy sizer
+    vnets), so the <name>VNET/<name>Subnet naming convention is only a
+    fallback for dry-run, never an assumption.
+    """
     name = spec.vm_name(slug)
+    nics = common.az_json(["vm", "show", "-g", rg, "-n", name, "--query",
+                           "networkProfile.networkInterfaces[].id"],
+                          dry_run=dry_run) or []
+    if nics:
+        sid = common.az_json(["network", "nic", "show", "--ids", nics[0],
+                              "--query", "ipConfigurations[0].subnet.id"],
+                             dry_run=dry_run)
+        if sid:
+            return sid
     return common.az_json(["network", "vnet", "subnet", "show", "-g", rg,
                            "--vnet-name", f"{name}VNET",
                            "-n", f"{name}Subnet", "--query", "id"],
@@ -336,11 +352,27 @@ def cmd_allow_network(spec: Spec, root: Path, args) -> dict:
     set_subscription(cfg, args.dry_run)
     rg = args.rg or cfg["resource_group"]
     name = spec.vm_name(args.slug)
-    common.run_az(["network", "vnet", "subnet", "update", "-g", rg,
-                   "--vnet-name", f"{name}VNET", "-n", f"{name}Subnet",
-                   "--service-endpoints", "Microsoft.Storage"],
-                  dry_run=args.dry_run, timeout=300)
     subnet_id = _subnet_id(spec, rg, args.slug, args.dry_run)
+    if subnet_id:
+        vnet_name = subnet_id.split("/")[-3]
+        subnet_name = subnet_id.split("/")[-1]
+        endpoints = common.az_json(["network", "vnet", "subnet", "show",
+                                    "--ids", subnet_id, "--query",
+                                    "serviceEndpoints[].service"],
+                                   dry_run=args.dry_run) or []
+        if "Microsoft.Storage" not in endpoints:
+            # --service-endpoints REPLACES the list — a shared subnet's
+            # existing endpoints must ride along or they'd be dropped
+            common.run_az(["network", "vnet", "subnet", "update", "--ids",
+                           subnet_id, "--service-endpoints"]
+                          + endpoints + ["Microsoft.Storage"],
+                          dry_run=args.dry_run, timeout=300)
+    else:
+        vnet_name, subnet_name = f"{name}VNET", f"{name}Subnet"
+        common.run_az(["network", "vnet", "subnet", "update", "-g", rg,
+                       "--vnet-name", vnet_name, "-n", subnet_name,
+                       "--service-endpoints", "Microsoft.Storage"],
+                      dry_run=args.dry_run, timeout=300)
     existing = common.az_json(
         ["storage", "account", "show", "-g", cfg["resource_group"],
          "-n", cfg["storage_account"], "--query",
@@ -354,7 +386,14 @@ def cmd_allow_network(spec: Spec, root: Path, args) -> dict:
                        "--account-name", cfg["storage_account"],
                        "--subnet", subnet_id or f"{name}VNET/{name}Subnet"],
                       dry_run=args.dry_run, timeout=300)
-    return {"ok": True, "vnet": f"{name}VNET", "subnet": f"{name}Subnet",
+        # Tag the VM so teardown can prove this rule is OURS to remove —
+        # on a shared subnet the vnet name alone can't establish ownership
+        # Value must not parse as JSON ("true" becomes a boolean, which the
+        # ARM tags API rejects — tags are strings; learned on bacancy).
+        common.run_az(["vm", "update", "-g", rg, "-n", name, "--set",
+                       "tags.vnet_rule_added=engine"],
+                      dry_run=args.dry_run, timeout=300)
+    return {"ok": True, "vnet": vnet_name, "subnet": subnet_name,
             "storage_account": cfg["storage_account"],
             "vnet_rule": "already-present" if already else "added",
             "note": "propagation ~10-30s — run check-azure next. If a 403 "
@@ -405,7 +444,10 @@ def cmd_check_azure(spec: Spec, root: Path, args) -> dict:
                                 "--query",
                                 "networkRuleSet.virtualNetworkRules[].virtualNetworkResourceId"],
                                dry_run=args.dry_run) or []
-        has_vnet_rule = any(vm["name"] + "VNET" in v for v in vnets)
+        sid = _subnet_id(spec, args.rg or cfg["resource_group"], args.slug,
+                         args.dry_run)
+        has_vnet_rule = bool(sid) and any(
+            v.lower() == sid.lower() for v in vnets)
         listed = vm["public_ip"] in rules
         if has_vnet_rule:
             hint = ("VM subnet vnet-rule is present but storage still 403s "
@@ -504,6 +546,28 @@ def _include_flags(args) -> str:
                    for pat in (getattr(args, "include", None) or []))
 
 
+INCLUDE_LIST_PATH = "/home/azureuser/xfer-include.txt"
+
+
+def _push_include_from(ip: str, args, dry_run: bool) -> str:
+    """Upload a local include-list file to the VM; return the rclone flag.
+
+    Hundreds of --include flags don't survive ssh+tmux quoting — a
+    pattern file does (one rclone filter per line, blanks dropped).
+    Transfer AND verify must both route through this so they filter alike.
+    """
+    path = getattr(args, "include_from", None)
+    if not path:
+        return ""
+    pats = [ln.strip() for ln in
+            Path(path).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if not pats:
+        raise common.HarnessError(f"--include-from {path} has no patterns")
+    run_ssh(ip, f"cat > {INCLUDE_LIST_PATH}",
+            stdin_data="\n".join(pats) + "\n", dry_run=dry_run)
+    return f" --include-from {INCLUDE_LIST_PATH}"
+
+
 def _tps_flags(args) -> str:
     """rclone --tpslimit flags (copy AND check hit the same source API)."""
     tps = getattr(args, "tpslimit", None)
@@ -519,6 +583,32 @@ def _tmux_alive(ip: str, dry_run: bool) -> bool:
     return "alive" in (proc.stdout or "")
 
 
+def _scope_guard(vm: dict, args) -> dict | None:
+    """Refuse an unfiltered transfer/verify on a scoped engagement.
+
+    A scoped run leaves its include list at INCLUDE_LIST_PATH on the VM.
+    An unfiltered rerun would then treat "scoped and complete" as
+    "interrupted" and re-copy the whole source (bacancy rogue run,
+    2026-08-21: 2.96 TiB of unapproved users landed before it was killed).
+    Only an explicit --unfiltered overrides.
+    """
+    if (getattr(args, "include", None) or getattr(args, "include_from", None)
+            or getattr(args, "unfiltered", False)):
+        return None
+    proc = run_ssh(vm["public_ip"],
+                   f"test -f {INCLUDE_LIST_PATH} && echo scoped || echo open",
+                   dry_run=args.dry_run, check=False)
+    if "scoped" in (proc.stdout or ""):
+        return {"ok": False, "cause": "scoped-engagement",
+                "hint": f"{INCLUDE_LIST_PATH} exists on the VM — this "
+                        "engagement is scoped to an include list. Re-run "
+                        "with --include-from (the list is preserved at "
+                        "companies/<slug>/transfer-include-list.txt), or "
+                        "pass --unfiltered to deliberately copy the whole "
+                        "source."}
+    return None
+
+
 def cmd_transfer(spec: Spec, root: Path, args) -> dict:
     cfg = load_cfg(root, args.slug)
     vm = require_vm(spec, cfg, args.slug, args.dry_run)
@@ -526,9 +616,14 @@ def cmd_transfer(spec: Spec, root: Path, args) -> dict:
     if _tmux_alive(vm["public_ip"], args.dry_run):
         return {"ok": False, "cause": "already-running",
                 "hint": "tmux session 'transfer' is alive — use status."}
+    guard = _scope_guard(vm, args)
+    if guard:
+        return guard
     extra = (" " + spec.extra_rclone_flags) if spec.extra_rclone_flags else ""
+    inc = _include_flags(args) + _push_include_from(
+        vm["public_ip"], args, args.dry_run)
     rclone_cmd = (f"rclone copy '{spec.source_ref(loc)}' "
-                  f"azure:{cfg['container']}/{prefix}{_include_flags(args)} "
+                  f"azure:{cfg['container']}/{prefix}{inc} "
                   f"--transfers {args.transfers} --checkers {args.checkers}"
                   f"{_tps_flags(args)} "
                   f"--retries 5 --log-file={LOG_PATH} --log-level INFO "
@@ -585,13 +680,50 @@ def cmd_status(spec: Spec, root: Path, args) -> dict:
             "log_tail": "\n".join(out.strip().splitlines()[-8:])}
 
 
+def cmd_list_source(spec: Spec, root: Path, args) -> dict:
+    """Top-level directories of the source (read-only rclone lsf).
+
+    The ground truth for building include filters: filter patterns are
+    case-sensitive, so they must be built from the source's ACTUAL
+    directory names, never from a human-supplied list.
+    """
+    cfg = load_cfg(root, args.slug)
+    vm = require_vm(spec, cfg, args.slug, args.dry_run)
+    loc, _ = loc_and_prefix(spec, vm, args)
+    proc = run_ssh(vm["public_ip"],
+                   f"rclone lsf --dirs-only '{spec.source_ref(loc)}'",
+                   dry_run=args.dry_run, check=False, timeout=900)
+    dirs = sorted(d.rstrip("/") for d in (proc.stdout or "").splitlines()
+                  if d.strip())
+    out = {"ok": proc.returncode == 0 if not args.dry_run else None,
+           "count": len(dirs), "dirs": dirs}
+    inc = _push_include_from(vm["public_ip"], args, args.dry_run)
+    if inc:  # what the filter selects, before any copy: exact bytes/objects
+        proc2 = run_ssh(vm["public_ip"],
+                        f"rclone size --json '{spec.source_ref(loc)}'{inc}",
+                        dry_run=args.dry_run, check=False, timeout=1800)
+        try:
+            out["filtered"] = json.loads(proc2.stdout or "")
+            out["filtered"]["human"] = common.human_bytes(
+                out["filtered"].get("bytes", 0))
+        except (json.JSONDecodeError, TypeError):
+            out["filtered"] = {"error": (proc2.stdout or "")[-300:]}
+    return out
+
+
 def cmd_verify(spec: Spec, root: Path, args) -> dict:
     cfg = load_cfg(root, args.slug)
     vm = require_vm(spec, cfg, args.slug, args.dry_run)
     loc, prefix = loc_and_prefix(spec, vm, args)
+    guard = _scope_guard(vm, args)
+    if guard:
+        return guard
+    inc = _include_flags(args) + _push_include_from(
+        vm["public_ip"], args, args.dry_run)
     proc = run_ssh(vm["public_ip"],
+                   "set -o pipefail; "
                    f"rclone check '{spec.source_ref(loc)}' "
-                   f"azure:{cfg['container']}/{prefix}{_include_flags(args)}"
+                   f"azure:{cfg['container']}/{prefix}{inc}"
                    f"{_tps_flags(args)} "
                    "--one-way 2>&1 | tail -40",
                    dry_run=args.dry_run, check=False, timeout=3600)
@@ -628,18 +760,30 @@ def cmd_teardown(spec: Spec, root: Path, args) -> dict:
                 "hint": "Teardown deletes billable resources. The skill must "
                         "show the plan and get explicit user confirmation, "
                         "then re-run with --confirmed."}
-    # Remove OUR vnet-rule from the SA first, while the subnet still
-    # resolves (only the rule for this VM's VNET — pre-existing rules are
-    # the client's own push path and are never touched).
+    # Remove OUR vnet-rule from the SA first, while the VM's NIC (the
+    # subnet resolver) still exists. Ownership proof: the vnet_rule_added
+    # tag set by allow-network, or a dedicated <name>VNET subnet. A rule
+    # on a shared subnet without the tag is left in place — it may be
+    # someone else's access path.
     deleted = []
+    skipped = []
     subnet_id = _subnet_id(spec, rg, args.slug, args.dry_run)
-    proc = common.run_az(["storage", "account", "network-rule", "remove",
-                          "-g", cfg["resource_group"],
-                          "--account-name", cfg["storage_account"],
-                          "--subnet", subnet_id or f"{name}VNET/{name}Subnet"],
-                         dry_run=args.dry_run, check=False, timeout=300)
-    if proc.returncode == 0:
-        deleted.append(f"sa-vnet-rule:{name}VNET")
+    tags = (vm or {}).get("tags") or {}
+    dedicated = bool(subnet_id) and subnet_id.lower().endswith(
+        f"virtualnetworks/{name.lower()}vnet/subnets/{name.lower()}subnet")
+    rule_ours = (bool(tags.get("vnet_rule_added")) or dedicated
+                 or args.dry_run)
+    if rule_ours:
+        proc = common.run_az(
+            ["storage", "account", "network-rule", "remove",
+             "-g", cfg["resource_group"],
+             "--account-name", cfg["storage_account"],
+             "--subnet", subnet_id or f"{name}VNET/{name}Subnet"],
+            dry_run=args.dry_run, check=False, timeout=300)
+        if proc.returncode == 0:
+            deleted.append(f"sa-vnet-rule:{subnet_id or name + 'VNET'}")
+    else:
+        skipped.append("sa-vnet-rule (not tagged as ours — left in place)")
     # NIC + OS disk are delete-option-tied to the VM; PIP, NSG and VNET are
     # not. VNET last — its subnet is only free once the NIC died with the VM.
     common.run_az(["vm", "delete", "-g", rg, "-n", name, "--yes"],
@@ -651,9 +795,10 @@ def cmd_teardown(spec: Spec, root: Path, args) -> dict:
                              dry_run=args.dry_run, check=False, timeout=300)
         if proc.returncode == 0:
             deleted.append(f"{kind}:{res}")
-    return {"ok": True, "deleted": deleted, "released_ip": ip,
+    return {"ok": True, "deleted": deleted, "skipped": skipped,
+            "released_ip": ip,
             "reminders": [
-                f"The {name}VNET vnet-rule was removed automatically; if an "
+                "The vnet-rule we added was removed automatically; if an "
                 f"IP rule for {ip} was ever added via the internal UI, "
                 f"remove it there (storage account {cfg['storage_account']})",
                 "The rwlc container SAS lapses on its own at its expiry — "
@@ -714,8 +859,8 @@ def main(spec: Spec, doc: str) -> int:
     p.add_argument("command", choices=[
         "discover", "plan", "create-vm", "allow-network",
         "write-azure-remote", "check-azure",
-        f"write-{spec.source_name}-remote", "transfer", "status", "verify",
-        "teardown"])
+        f"write-{spec.source_name}-remote", "list-source", "transfer",
+        "status", "verify", "teardown"])
     p.add_argument("slug")
     p.add_argument("--root", default=str(common.DEFAULT_COMPANIES_ROOT))
     loc_flag = "--" + spec.loc_argname.replace("_", "-")
@@ -737,6 +882,12 @@ def main(spec: Spec, doc: str) -> int:
                    help="transfer/verify: rclone --include filter "
                         "(repeatable); anything not matched is excluded "
                         "from BOTH the copy and the check")
+    p.add_argument("--include-from", dest="include_from", default=None,
+                   metavar="FILE",
+                   help="transfer/verify: local file of rclone include "
+                        "patterns, one per line (uploaded to the VM); for "
+                        "hundreds of patterns where repeated --include "
+                        "won't survive ssh quoting")
     p.add_argument("--oauth-client-json", default=None,
                    help=f"write-{spec.source_name}-remote only: path to an "
                         "OAuth client JSON (Google Cloud download format); "
@@ -751,6 +902,10 @@ def main(spec: Spec, doc: str) -> int:
                    help="transfer/verify: cap on source-API transactions/sec "
                         "(rclone --tpslimit, burst = limit); 0 = uncapped "
                         f"(default {spec.default_tpslimit})")
+    p.add_argument("--unfiltered", action="store_true",
+                   help="transfer/verify: explicitly run WITHOUT an include "
+                        "filter on an engagement whose VM carries a scope "
+                        "file (otherwise refused — see scoped-engagement)")
     p.add_argument("--confirmed", action="store_true",
                    help="teardown only: user confirmed the deletion plan")
     p.add_argument("--force", action="store_true",
@@ -769,6 +924,7 @@ def main(spec: Spec, doc: str) -> int:
           "write-azure-remote": cmd_write_azure_remote,
           "check-azure": cmd_check_azure,
           f"write-{spec.source_name}-remote": cmd_write_source_remote,
+          "list-source": cmd_list_source,
           "transfer": cmd_transfer, "status": cmd_status,
           "verify": cmd_verify, "teardown": cmd_teardown}[args.command]
     try:
