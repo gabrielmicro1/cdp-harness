@@ -104,6 +104,7 @@ FLAG_BADGES = {
     "zero-declared-has-data": ("declared 0 B, has data", "warn"),
     "overshoot": ("over 100%", "warn"),
     "found-embedded": ("embedded in another source", "info"),
+    "deduplicated": ("duplicate share excluded", "info"),
 }
 
 

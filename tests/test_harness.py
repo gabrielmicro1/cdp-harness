@@ -167,6 +167,22 @@ def main() -> int:
     check("split duplicate note classifies whole vs partial",
           len(_dnote) == 1 and "parent/dup" in _dnote[0]
           and "70.00 MB of parent/big" in _dnote[0], str(_dnote))
+    _deduped = reconcile.apply_duplicates(
+        reconcile.effective_sources(_split_exp, _split_run),
+        reconcile.duplicate_sources(_split_exp, _split_run))
+    check("apply_duplicates: whole dup dropped, partial keeps unique bytes",
+          "parent/dup" not in _deduped
+          and _deduped["parent/big"]["uncompressed_bytes"] == 50_000_000
+          and _deduped["parent/big"]["deduplicated_bytes"] == 70_000_000,
+          str(_deduped))
+    _rows, _ = reconcile.service_rows(
+        {**_split_exp, "services": {"big": {"bytes": 50_000_000}}},
+        _split_run, _deduped)
+    _big = _rows[0]
+    check("deduplicated row: actual excludes redundant share, flagged",
+          _big["actual_bytes"] == 50_000_000 and _big["pct"] == 100.0
+          and "deduplicated" in _big["flags"]
+          and _big["deduplicated_bytes"] == 70_000_000, str(_big))
 
     print("\n— gen_report —")
     proc = run_script("gen_report.py", "democo", "--root", root)

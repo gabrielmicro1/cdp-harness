@@ -99,7 +99,7 @@ def service_rows(expected: dict | None, run: dict | None,
 
     Row: {service, declared_bytes, declared_records, actual_bytes,
           actual_compressed, blob_count, pct, flags[]}
-    Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded
+    Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded | deduplicated
     """
     services = (expected or {}).get("services", {})
     if sources is None:
@@ -123,6 +123,12 @@ def service_rows(expected: dict | None, run: dict | None,
             "pct": None,
             "flags": [],
         }
+        dedup = sum(sources[s].get("deduplicated_bytes", 0) for s in srcs)
+        if dedup:
+            # actual_bytes already excludes the redundant share (see
+            # apply_duplicates) — the flag makes the subtraction visible
+            row["flags"].append("deduplicated")
+            row["deduplicated_bytes"] = dedup
         if row["declared_records"] is not None:
             # record-count declarations are EXCLUDED from byte reconciliation
             row["flags"].append("record-count")
@@ -320,6 +326,27 @@ def duplicate_sources(expected: dict | None, run: dict | None) -> dict:
     return out
 
 
+def apply_duplicates(sources: dict, dups: dict) -> dict:
+    """Fold duplicate_sources() into the per-source view: wholly-redundant
+    prefixes disappear; partially-redundant ones keep only their unique bytes
+    (uncompressed_bytes minus the redundant share) and carry the subtraction
+    in "deduplicated_bytes" so rows can be flagged. The declared-vs-received
+    comparison then runs on deduplicated numbers everywhere, matching the
+    deduplicated headline."""
+    out = dict(sources)
+    for p, b in dups.items():
+        src = out.get(p)
+        if src is None:
+            continue
+        unc = src.get("uncompressed_bytes", 0)
+        if b >= unc:
+            out.pop(p)               # wholly redundant: not a real source
+        else:
+            out[p] = {**src, "uncompressed_bytes": unc - b,
+                      "deduplicated_bytes": b}
+    return out
+
+
 def duplicate_prefix_note(dups: dict, run: dict | None,
                           expected: dict | None = None) -> list[str]:
     """Explain the deduplication so the subtraction is never silent."""
@@ -444,11 +471,8 @@ def company_summary(root: Path, slug: str) -> dict:
                  if latest and manifest_total else None)
     rate, eta = _rate_and_eta(latest, prev, remaining) if latest else (None, None)
 
-    sources = effective_sources(expected, latest)
-    dups = duplicate_sources(expected, latest)
-    for _p, _b in dups.items():
-        if _p in sources and _b >= sources[_p].get("uncompressed_bytes", 0):
-            sources.pop(_p)          # wholly redundant: not a real source
+    sources = apply_duplicates(effective_sources(expected, latest),
+                               duplicate_sources(expected, latest))
     for _p in excluded:
         sources.pop(_p, None)        # non-corpus: not a source at all
     rows, unexpected = service_rows(expected, latest, sources)
