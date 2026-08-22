@@ -123,6 +123,13 @@ worker() {
             printf '%s\n' "$out" | sed 's/sig=[^&"]*/sig=REDACTED/g' \
                 > "$BASE/logs/job-${jprefix//\//_}.err"
         fi
+        # partial failures: keep the engine's per-code error tallies
+        # ("error <x-ms-error-code>: N") — the failure CLASS is the whole
+        # client conversation (archive-tier vs throttle vs auth)
+        if [ "${fail:-0}" != "0" ] && [ "${fail:-0}" != "?" ]; then
+            printf '%s\n' "$out" | grep '^error ' \
+                > "$BASE/logs/job-${jprefix//\//_}.errors" 2>/dev/null
+        fi
         local end row dest
         end=$(date +%s)
         row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
