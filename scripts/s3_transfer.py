@@ -156,11 +156,23 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
                f"region = {region}\n")
     eng.write_conf_section(vm["public_ip"], "s3", section,
                            dry_run=args.dry_run)
-    ls = _s3_ssh(vm["public_ip"], f"rclone lsd s3:{bucket} 2>&1 | head -20",
-                 dry_run=args.dry_run, check=False, timeout=180)
-    if ls.returncode != 0 and not args.dry_run:
-        return {"ok": False, "stage": "rclone lsd s3",
-                "output_tail": (ls.stdout + ls.stderr).strip()[-400:],
+    # smoke test with a RECURSIVE lsf, never lsd/--max-depth 1: rclone's
+    # non-recursive listing buffers the entire directory before printing
+    # (300M entries on a flat bucket = hang), and lsd on a flat bucket
+    # emits nothing at all; only -R streams per page, so head fills after
+    # the first page. Success = at least one key listed (this bucket is
+    # never legitimately empty at setup time).
+    ls = _s3_ssh(vm["public_ip"],
+                 f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                 "2>/dev/null | head -5",
+                 dry_run=args.dry_run, check=False, timeout=90)
+    if not (ls.stdout or "").strip() and not args.dry_run:
+        err = _s3_ssh(vm["public_ip"],
+                      f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                      "2>&1 >/dev/null | head -5",
+                      check=False, timeout=90)
+        return {"ok": False, "stage": "rclone lsf s3",
+                "output_tail": (err.stdout or "").strip()[-400:],
                 "hint": "listing failed — wrong/inactive key, a policy "
                         "missing s3:ListBucket, or a requester-pays bucket. "
                         "Run probe for the requester-pays check."}
@@ -180,14 +192,22 @@ def cmd_probe(root: Path, args) -> dict:
     ip = vm["public_ip"]
     region = _bucket_region(ip, bucket, args.dry_run)
     notes: list[str] = []
-    ls = _s3_ssh(ip, f"rclone lsd s3:{bucket} 2>&1 | head -5",
-                 dry_run=args.dry_run, check=False, timeout=120)
-    listing_ok = ls.returncode == 0
+    # recursive lsf, never lsd/--max-depth 1: only -R streams per page;
+    # non-recursive listings buffer the whole directory (300M entries on a
+    # flat bucket) before printing, so head never fills and the ssh
+    # timeout turns into a crash
+    ls = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                     "2>/dev/null | head -5",
+                 dry_run=args.dry_run, check=False, timeout=90)
+    listing_ok = bool((ls.stdout or "").strip()) or (
+        args.dry_run and ls.returncode == 0)
     requester_pays = False
     if not listing_ok and not args.dry_run:
-        rp = _s3_ssh(ip, f"rclone lsd s3:{bucket} --s3-requester-pays "
-                         "2>&1 | head -5", check=False, timeout=120)
-        if rp.returncode == 0:
+        rp = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
+                         f"s3:{bucket} --s3-requester-pays 2>/dev/null "
+                         "| head -5",
+                     check=False, timeout=90)
+        if (rp.stdout or "").strip():
             requester_pays, listing_ok = True, True
             notes.append(
                 "REQUESTER-PAYS bucket: rclone can list it with "
@@ -196,19 +216,24 @@ def cmd_probe(root: Path, args) -> dict:
                 "timeline, or ask the client to flip the payer setting "
                 "for the engagement.")
     if not listing_ok and not args.dry_run:
+        err = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
+                          f"s3:{bucket} 2>&1 >/dev/null | head -5",
+                      check=False, timeout=90)
         return {"ok": False, "bucket": bucket, "region": region,
                 "stage": "listing",
-                "output_tail": (ls.stdout + ls.stderr).strip()[-400:],
+                "output_tail": (err.stdout or "").strip()[-400:],
                 "hint": "the key cannot list the bucket — a client "
                         "conversation (key/policy), not a retry."}
-    # root shape sample FIRST: a flat bucket (files at root, no dirs) makes
-    # any --dirs-only listing page the whole bucket without ever emitting a
-    # line, so the dirs survey below must be gated on this cheap check
-    rs = _s3_ssh(ip, f"rclone lsf s3:{bucket} --max-depth 1 2>/dev/null "
-                     "| head -1000", dry_run=args.dry_run, check=False,
-                 timeout=120)
+    # key shape sample FIRST (recursive: only -R streams — see the smoke
+    # test comment above): keys containing "/" prove folder structure; a
+    # flat bucket's sample is all bare root keys. The --dirs-only survey
+    # below must be gated on this, or it pages the whole bucket without
+    # ever emitting a line.
+    rs = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                     "2>/dev/null | head -1000",
+                 dry_run=args.dry_run, check=False, timeout=90)
     sample = [ln for ln in (rs.stdout or "").splitlines() if ln.strip()]
-    root_dirs = sum(1 for ln in sample if ln.endswith("/"))
+    root_dirs = sum(1 for ln in sample if "/" in ln)
     root_files = len(sample) - root_dirs
     flat_suspected = root_files > 0 and root_dirs == 0
     if flat_suspected:
@@ -347,12 +372,14 @@ def cmd_plan_jobs(root: Path, args) -> dict:
                 return res
     flat = args.flat
     if flat is None:
-        # cheap shape sample: one-ish LIST page, SIGPIPE-terminated
-        rs = _s3_ssh(ip, f"rclone lsf s3:{bucket} --max-depth 1 "
-                         "2>/dev/null | head -1000",
-                     dry_run=args.dry_run, check=False, timeout=120)
+        # cheap shape sample: recursive (-R streams per page; non-recursive
+        # buffers the whole dir), SIGPIPE-terminated after ~one page. Keys
+        # containing "/" prove folder structure.
+        rs = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
+                         f"s3:{bucket} 2>/dev/null | head -1000",
+                     dry_run=args.dry_run, check=False, timeout=90)
         sample = [ln for ln in (rs.stdout or "").splitlines() if ln.strip()]
-        dirs_n = sum(1 for ln in sample if ln.endswith("/"))
+        dirs_n = sum(1 for ln in sample if "/" in ln)
         flat = len(sample) > 0 and dirs_n == 0
     if flat:
         # launch state: start the detached range-sharded listing

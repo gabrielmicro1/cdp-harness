@@ -1793,10 +1793,12 @@ def main() -> int:
           and '"S (root)"' in proc.stdout)
     proc = run_script("s3_transfer.py", "probe", "democo",
                       "--bucket", "demo-images", "--root", root, "--dry-run")
-    check("s3 probe: cheap root-shape sample runs before the dirs survey",
-          "--max-depth 1" in proc.stdout and "head -1000" in proc.stdout
-          and proc.stdout.index("--max-depth 1")
+    check("s3 probe: streaming key-shape sample runs before the dirs survey",
+          "--files-only -R" in proc.stdout and "head -1000" in proc.stdout
+          and proc.stdout.index("head -1000")
           < proc.stdout.index("--dirs-only")
+          and "--max-depth 1" not in proc.stdout  # buffers whole dir: banned
+          and "rclone lsd" not in proc.stdout     # same trap on flat buckets
           and '"flat_suspected"' in proc.stdout)
     proc = run_script("s3_transfer.py", "transfer", "democo",
                       "--root", root, "--dry-run")
