@@ -232,6 +232,18 @@ def _list_shard(bucket, region, idx, start_after, end, out_dir):
             f"unsafe-{idx:03d}.txt (NOT copied)")
 
 
+def _list_shard_group(bucket, region, jobs, out_dir, threads):
+    """Worker-process entry: drain a group of shards with a small thread
+    pool. Processes, not just threads, because boto3's per-page XML parse
+    is CPU-real and the GIL caps one process at ~13k keys/s no matter how
+    many threads it runs (measured live, checkmate 2026-08-22)."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(_list_shard, bucket, region, i, a, b, out_dir)
+                for i, a, b in jobs]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+
+
 def cmd_list() -> int:
     bucket = os.environ["S3_BUCKET"]
     region = os.environ.get("AWS_REGION", "")
@@ -241,13 +253,20 @@ def cmd_list() -> int:
         return 0
     shards = int(os.environ.get("FLAT_SHARDS", DEFAULT_SHARDS))
     workers = int(os.environ.get("FLAT_LIST_WORKERS", DEFAULT_LIST_WORKERS))
+    procs = int(os.environ.get("FLAT_LIST_PROCS", os.cpu_count() or 8))
     out_dir = os.path.join(BASE, "shards")
     os.makedirs(out_dir, exist_ok=True)
     ranges = range_bounds(shards)
-    log(f"list start: {len(ranges)} range shards, {workers} workers")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_list_shard, bucket, region, i, a, b, out_dir)
-                for i, (a, b) in enumerate(ranges)]
+    threads = max(1, workers // max(1, procs))
+    groups: list[list] = [[] for _ in range(procs)]
+    for i, (a, b) in enumerate(ranges):
+        groups[i % procs].append((i, a, b))
+    groups = [g for g in groups if g]
+    log(f"list start: {len(ranges)} range shards, {len(groups)} procs x "
+        f"{threads} threads")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=procs) as ex:
+        futs = [ex.submit(_list_shard_group, bucket, region, g, out_dir,
+                          threads) for g in groups]
         for fut in concurrent.futures.as_completed(futs):
             fut.result()  # first shard failure aborts the run loudly
     keys = 0
