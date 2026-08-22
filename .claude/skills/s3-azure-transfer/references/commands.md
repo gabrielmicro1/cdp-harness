@@ -160,3 +160,22 @@ df -h ~/xfer-jobs                  # plan-file disk headroom
 - On the VM only, the composed dest URL (SAS included) is visible in the
   azcopy process argv (`ps`) for the duration of a job — same trust
   domain as rclone.conf, and azcopy redacts `sig=` in its own logs.
+
+## Flat-mode mop-up (after verify finds MISSING-DEST)
+
+Flat verify writes EVERY missing key (uncapped, "key\tsize") to
+`~/xfer-jobs/missing.txt` on the VM. Instead of requeueing whole failed
+chunks (each a ~250k skip-scan), copy exactly the shortfall:
+
+```bash
+ssh azureuser@<ip> 'split -l 250000 -d -a 5 ~/xfer-jobs/missing.txt \
+    ~/xfer-jobs/chunks/chunk-9 && cd ~/xfer-jobs/chunks && \
+    for c in chunk-9*; do printf "L\t%s\n" "$c"; done \
+    | tee -a ~/xfer-jobs/jobs.txt >> ~/xfer-jobs/queue.txt'
+python3 scripts/s3_transfer.py transfer <slug>   # drains the mop-up chunks
+python3 scripts/s3_transfer.py verify <slug>     # must come back clean
+```
+
+chunk-9* names cannot collide with the planner's chunk-0xxxx series.
+SIZE-DIFF keys are deliberately NOT in missing.txt — the create-only
+engine cannot overwrite a bad blob; that is a human remediation decision.

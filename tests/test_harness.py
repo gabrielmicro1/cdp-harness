@@ -1759,7 +1759,10 @@ def main() -> int:
     man = [("a", 1), ("b", 2), ("c", 3), ("d", 4)]
     azl = [("a", 1), ("c", 9), ("d", 4), ("e", 5)]
     buf = io.StringIO()
-    st = s3_flat.merge_join(iter(man), iter(azl), buf)
+    miss = io.StringIO()
+    st = s3_flat.merge_join(iter(man), iter(azl), buf, missing_out=miss)
+    check("flat verify: missing.txt gets only MISSING-DEST (mop-up input)",
+          miss.getvalue() == "b\t2\n")
     rows = [r.split("\t") for r in buf.getvalue().splitlines()
             if not r.startswith("#")]
     check("flat verify merge-join: labels, totals, ok/bad counts",

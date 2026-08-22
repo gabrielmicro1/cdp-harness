@@ -127,12 +127,17 @@ def split_listing(lines, per_chunk: int):
         yield f"quarantine-{qi:05d}", "".join(k + "\n" for k in quar)
 
 
-def merge_join(manifest_rows, azure_rows, out, now=time.time):
+def merge_join(manifest_rows, azure_rows, out, now=time.time,
+               missing_out=None):
     """Stream compare two lexically sorted (key, size) iterators; write
     mismatch rows (runner 8-field shape, capped at MISMATCH_CAP) plus
     #progress sentinels to `out`. Returns totals for the #done line.
-    Raises SortError if either stream violates strict ascending order --
-    the one assumption the whole verify rests on."""
+    missing_out (uncapped, one "key\tsize" per line) collects EVERY
+    MISSING-DEST key so a mop-up pass can copy exactly the shortfall
+    instead of re-scanning whole failed chunks (SIZE-DIFF is excluded:
+    the create-only engine cannot overwrite, deliberately). Raises
+    SortError if either stream violates strict ascending order -- the
+    one assumption the whole verify rests on."""
     stats = {"ok": 0, "bad": 0, "s3_count": 0, "s3_bytes": 0,
              "az_count": 0, "az_bytes": 0}
     written = 0
@@ -168,6 +173,8 @@ def merge_join(manifest_rows, azure_rows, out, now=time.time):
             stats["s3_count"] += 1
             stats["s3_bytes"] += m[1]
             emit(m[0], 1, m[1], 0, "", "MISSING-DEST")
+            if missing_out is not None:
+                missing_out.write(f"{m[0]}\t{m[1]}\n")
             m = next(man, None)
         elif m is None or a[0] < m[0]:
             stats["az_count"] += 1
@@ -183,6 +190,9 @@ def merge_join(manifest_rows, azure_rows, out, now=time.time):
                 stats["ok"] += 1
             else:
                 emit(m[0], 1, m[1], 1, a[1], "SIZE-DIFF")
+                # NOT added to missing_out: the create-only engine cannot
+                # overwrite a bad blob — SIZE-DIFF is a deliberate
+                # remediation decision, never a silent re-copy
             m = next(man, None)
             a = next(az, None)
     return stats
@@ -589,17 +599,19 @@ def iter_azure_listing():
 
 def cmd_verify() -> int:
     out_path = os.path.join(BASE, "verify.tsv")
-    with open(out_path, "w") as out:
+    miss_path = os.path.join(BASE, "missing.txt")
+    with open(out_path, "w") as out, open(miss_path + ".tmp", "w") as miss:
         try:
             stats = merge_join(iter_manifest(os.path.join(BASE,
                                                           "listing.txt")),
-                               iter_azure_listing(), out)
+                               iter_azure_listing(), out, missing_out=miss)
         except SortError as exc:
             out.write(f"#error\tunsorted\t{exc}\n")
             log(f"verify ABORTED: {exc}")
             return 1
         kv = "\t".join(f"{k}={v}" for k, v in stats.items())
         out.write(f"#done\t{int(time.time())}\t{kv}\n")
+    os.replace(miss_path + ".tmp", miss_path)
     log(f"verify done: {stats}")
     return 0
 
