@@ -195,11 +195,14 @@ class SortError(Exception):
 # ── S3 range-sharded listing (VM only; boto3 imported lazily) ───────────────
 
 def _list_shard(bucket, region, idx, start_after, end, out_dir):
-    import boto3  # apt python3-boto3; VM-only dependency
+    import boto3.session  # apt python3-boto3; VM-only dependency
     from botocore.config import Config
-    cli = boto3.client("s3", region_name=region or None,
-                       config=Config(retries={"max_attempts": 10,
-                                              "mode": "adaptive"}))
+    # a PRIVATE Session per shard: boto3's module-level client() shares one
+    # default Session, whose create_client races across threads
+    # (KeyError: 'credential_provider' — hit live, checkmate 2026-08-22)
+    cli = boto3.session.Session().client(
+        "s3", region_name=region or None,
+        config=Config(retries={"max_attempts": 10, "mode": "adaptive"}))
     final = os.path.join(out_dir, f"shard-{idx:03d}.tsv")
     if os.path.exists(final):
         return  # resume after a crash: this shard already completed

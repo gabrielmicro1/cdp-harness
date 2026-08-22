@@ -142,7 +142,9 @@ list_bucket() {  # flat-bucket full listing -> listing.txt + listing.done
             && python3 -c "import json,sys;print(json.dumps({'keys': sum(1 for _ in open(sys.argv[1])), 'unsafe': 0}))" \
                 "$BASE/listing.txt" > "$BASE/listing.done"
     else
-        python3 "$BASE/s3_flat.py" list
+        # stdout/stderr to a file, not the tmux pane — a pane dies with its
+        # window and takes the crash traceback with it (learned live)
+        python3 "$BASE/s3_flat.py" list >> "$BASE/plan-run.log" 2>&1
     fi
     local rc=$?
     echo "$(date -u +%FT%TZ) list-bucket exit rc=$rc" >> "$BASE/plan.log"
