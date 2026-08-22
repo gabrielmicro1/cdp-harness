@@ -371,10 +371,11 @@ def cmd_plan_jobs(root: Path, args) -> dict:
                                             + (sp.stderr or ""))[-400:]}
                 res.update({"flat": True, "bucket": bucket,
                             "queue": f"{vm['name']}:{XFER_DIR}/queue.txt",
-                            "note": "L jobs are azcopy server-side "
-                                    "list-of-files copies; Q jobs (if any) "
-                                    "stream unsafe-named keys via rclone. "
-                                    "Pilot one job before scaling."})
+                            "note": "L jobs are server-side Put-Blob-From-"
+                                    "URL copies (s3_flat.py, API-enforced "
+                                    "create-only); Q jobs (if any) stream "
+                                    "unsafe-named keys via rclone. Pilot "
+                                    "one job before scaling."})
                 return res
     flat = args.flat
     if flat is None:

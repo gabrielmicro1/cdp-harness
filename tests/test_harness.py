@@ -1739,11 +1739,11 @@ def main() -> int:
     names = [n for n, _ in chunks]
     body = "".join(t for n, t in chunks if n.startswith("chunk"))
     quar = "".join(t for n, t in chunks if n.startswith("quarantine"))
-    check("flat split: chunk names, sizes, quarantine, round-trip",
+    check("flat split: chunk rows keep sizes, quarantine bare, round-trip",
           names == ["chunk-00000", "chunk-00001", "chunk-00002",
                     "quarantine-00000"]
           and body.count("\n") == 250 and quar == "weird key+name.jpg\n"
-          and body == "".join(f"{i:032x}.jpg\n" for i in range(250)),
+          and body == "".join(f"{i:032x}.jpg\t100\n" for i in range(250)),
           str(names))
     check("flat split: empty listing yields zero chunks",
           list(s3_flat.split_listing([], 100)) == [])
@@ -1805,13 +1805,19 @@ def main() -> int:
     check("s3 transfer: orphaned inflight jobs swept back into the queue",
           "cat inflight/* >> queue.txt" in proc.stdout
           and "rm -f inflight/*" in proc.stdout)
-    check("runner: L job is server-side list-of-files with write invariant",
-          '--list-of-files "$BASE/chunks/$jprefix"' in runner
-          and runner.count("--overwrite=false") >= 2
+    check("runner: L job runs the put-from-url engine, Q streams files-from",
+          'copy-chunk "$jprefix"' in runner
+          and "--overwrite=false" in runner  # R jobs keep the azcopy pin
           and '--files-from "$BASE/chunks/$jprefix"' in runner)
     check("runner: list-bucket verb + flat verify auto-select",
           "list-bucket)" in runner and "s3_flat.py" in runner
           and "grep -qm1 $'^L\\t'" in runner)
+    flat_src = (SCRIPTS / "s3_flat.py").read_text()
+    check("s3_flat copy engine: API-enforced create-only server-side copy",
+          '"If-None-Match": "*"' in flat_src
+          and "x-ms-copy-source" in flat_src
+          and "generate_presigned_url" in flat_src
+          and "Transfers Completed" in flat_src)  # azcopy summary grammar
     src = (SCRIPTS / "s3_transfer.py").read_text()
     check("s3 verify collect skips comment rows; requeue contract intact",
           "$1 !~ /^#/" in src and "print $2" in src)

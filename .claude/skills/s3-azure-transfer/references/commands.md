@@ -109,9 +109,10 @@ listing.txt     # flat: the cutoff manifest ("key\tsize", sorted);
 listing.done    #   sentinel JSON {keys, unsafe}; plan.log = heartbeats
 chunks/         # flat: chunk-NNNNN + quarantine-NNNNN manifests
 
-# The copy each L (flat chunk) job runs — same S2S transport as R:
-azcopy copy "$S3_SRC_URL/" "$AZURE_DEST_URL?$AZURE_DEST_SAS" \
-  --list-of-files "$BASE/chunks/<chunk>" --overwrite=false
+# The copy each L (flat chunk) job runs — server-side Put Blob From URL
+# per key (s3_flat.py; presigned S3 GET source, If-None-Match: * commit;
+# azcopy list-of-files enumerates sequentially and is not used here):
+python3 "$BASE/s3_flat.py" copy-chunk <chunk> <concurrency>
 
 # The copy each R job runs (server-side; bytes go S3 -> Azure fabric)
 azcopy copy "$S3_SRC_URL/<prefix>/" \

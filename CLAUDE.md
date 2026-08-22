@@ -497,12 +497,16 @@ timeline. **FLAT buckets** (all keys at root, no prefixes — e.g. a
 auto-detects the shape and switches to `scripts/s3_flat.py`'s chunked
 mode — a range-sharded parallel listing (boto3 on the VM, detached in
 tmux; the laptop side stays stdlib) becomes the **cutoff manifest**,
-split into ~250k-key chunk files that azcopy copies server-side via
-`--list-of-files` (`L` jobs; unsafe-named keys ride rclone
-`--files-from` as `Q` jobs). Flat verify is a streamed merge-join of
-that manifest against the Azure dest listing — per-object name+size,
-drift-immune, `--deep` implied. Driven by the `s3-azure-transfer`
-skill.
+split into ~250k-key `key\tsize` chunk files that s3_flat.py copies
+itself via **Put Blob From URL** from locally presigned S3 GETs (`L`
+jobs — the vimeo/zoom transport; manifest sizes mean zero per-object
+HEADs, and `If-None-Match: *` makes create-only API-enforced on this
+path; azcopy's `--list-of-files` was measured at ~15 obj/s sequential
+enumeration and is not used for flat chunks). Unsafe-named keys ride
+rclone `--files-from` as `Q` jobs. Flat verify is a streamed
+merge-join of that manifest against the Azure dest listing —
+per-object name+size, drift-immune, `--deep` implied. Driven by the
+`s3-azure-transfer` skill.
 
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no

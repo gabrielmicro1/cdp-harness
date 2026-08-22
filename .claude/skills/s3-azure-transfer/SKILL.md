@@ -175,14 +175,19 @@ invocations. First call launches a range-sharded parallel S3 listing
 detached in tmux window `plan`. Re-running plan-jobs polls it
 (`keys_listed_so_far`). Once the listing lands, the same invocation
 splits `listing.txt` into chunk manifests (`--chunk-objects`, default
-250k — azcopy list-of-files degrades well above this) and writes the
-queue: `L` jobs (azcopy `--list-of-files` server-side copy — same S2S
-transport as R) plus `Q` jobs for keys whose names azcopy's list files
-can't be trusted with (spaces/`+`/unicode; streamed by rclone
-`--files-from`, expected ~empty on hex-hash buckets). The listing is
-also the **cutoff manifest** verify runs against. `--rebuild` re-splits
-from the existing listing; `--relist` discards the listing and starts
-over; both refuse while the `plan` window is alive.
+250k, rows are `key\tsize`) and writes the queue: `L` jobs — s3_flat.py
+drives Azure **Put Blob From URL** per key from locally presigned S3
+GETs (manifest sizes route the rare >256 MiB object to block staging;
+zero per-object HEADs; `If-None-Match: *` makes create-only
+**API-enforced** on this path, stronger than the R jobs' client-side
+`--overwrite=false`) — plus `Q` jobs for keys outside the safe charset
+(streamed by rclone `--files-from`, expected ~empty on hex-hash
+buckets). azcopy is NOT used for L jobs: its `--list-of-files`
+enumeration is sequential (~15 obj/s measured live — weeks at 242M
+objects). The listing is also the **cutoff manifest** verify runs
+against. `--rebuild` re-splits from the existing listing; `--relist`
+discards the listing and starts over; both refuse while the `plan`
+window is alive.
 
 ### 3. transfer `<slug>` — pilot first, then scale
 

@@ -96,11 +96,11 @@ def range_bounds(n: int) -> list[tuple[str | None, str | None]]:
 
 
 def split_listing(lines, per_chunk: int):
-    """Pure generator: manifest lines ("key" or "key\tsize") -> yields
-    (name, text) manifests. chunk-NNNNN hold azcopy-safe keys,
-    quarantine-NNNNN the rest; blank lines dropped; text is
-    newline-terminated bucket-relative keys (sizes stripped -- azcopy
-    list-of-files wants bare paths). O(per_chunk) memory."""
+    """Pure generator: manifest lines ("key\tsize") -> yields (name, text)
+    manifests. chunk-NNNNN keep the full "key\tsize" rows (the copy-chunk
+    engine routes single-shot vs block-staged by size WITHOUT any HEADs);
+    quarantine-NNNNN hold bare keys (rclone --files-from input) for names
+    outside the safe charset. Blank lines dropped; O(per_chunk) memory."""
     safe: list[str] = []
     quar: list[str] = []
     ci = qi = 0
@@ -110,9 +110,9 @@ def split_listing(lines, per_chunk: int):
             continue
         key = ln.split("\t", 1)[0]
         if SAFE_KEY_RE.match(key):
-            safe.append(key)
+            safe.append(ln)
             if len(safe) >= per_chunk:
-                yield f"chunk-{ci:05d}", "".join(k + "\n" for k in safe)
+                yield f"chunk-{ci:05d}", "".join(r + "\n" for r in safe)
                 ci += 1
                 safe = []
         else:
@@ -122,7 +122,7 @@ def split_listing(lines, per_chunk: int):
                 qi += 1
                 quar = []
     if safe:
-        yield f"chunk-{ci:05d}", "".join(k + "\n" for k in safe)
+        yield f"chunk-{ci:05d}", "".join(r + "\n" for r in safe)
     if quar:
         yield f"quarantine-{qi:05d}", "".join(k + "\n" for k in quar)
 
@@ -350,6 +350,166 @@ def cmd_split(per_chunk: int) -> int:
     return 0
 
 
+# ── copy-chunk: presigned-GET → Put Blob From URL server-side copy ──────────
+# azcopy's --list-of-files enumerates entries SEQUENTIALLY (~15 obj/s
+# measured live — weeks at 242M objects), so flat chunks are copied by the
+# same transport the vimeo/zoom ingests use: Azure fetches each object
+# from a presigned S3 GET; bytes never touch this VM; sizes come from the
+# manifest so there are ZERO per-object HEADs; If-None-Match: * makes the
+# copy API-enforced create-only (stronger than azcopy's client-side
+# --overwrite=false). Request budget: 1 Azure PUT per object.
+
+X_MS_VERSION = "2021-08-06"  # >= 2020-04-08: Put Blob/Block From URL
+SINGLE_SHOT_MAX = 256 * 1024 * 1024   # Put Blob From URL size ceiling
+BLOCK_SIZE = 128 * 1024 * 1024
+PRESIGN_TTL = 6 * 3600
+
+
+class _CopyCounters:
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.completed = self.skipped = self.failed = self.bytes = 0
+        self.errors: dict[str, int] = {}
+
+    def add(self, outcome, size=0, err=None):
+        with self.lock:
+            setattr(self, outcome, getattr(self, outcome) + 1)
+            if outcome == "completed":
+                self.bytes += size
+            if err:
+                self.errors[err] = self.errors.get(err, 0) + 1
+
+
+def _dest_headers():
+    return {"x-ms-version": X_MS_VERSION, "If-None-Match": "*"}
+
+
+def _azure_put(url, headers, tries=5):
+    """PUT with dest-side retry. Returns 'created' | 'exists' | raises."""
+    last = None
+    for attempt in range(tries):
+        req = urllib.request.Request(url, data=b"", method="PUT",
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=600):
+                return "created"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409 and "BlobAlreadyExists" in (
+                    exc.headers.get("x-ms-error-code") or ""):
+                return "exists"
+            if exc.code in (429, 500, 503) and attempt < tries - 1:
+                time.sleep(min(2 ** attempt,
+                               int(exc.headers.get("Retry-After") or 0)
+                               or 2 ** attempt))
+                last = exc
+                continue
+            code = exc.headers.get("x-ms-error-code") or str(exc.code)
+            raise CopyError(code) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            last = exc
+            if attempt < tries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise CopyError(type(exc).__name__) from exc
+    raise CopyError(type(last).__name__ if last else "retries-exhausted")
+
+
+class CopyError(Exception):
+    pass
+
+
+def _copy_one(presign, dest_url, sas, key, size, counters):
+    try:
+        src = presign(key)
+        blob = f"{dest_url}/{urllib.parse.quote(key)}"
+        if size <= SINGLE_SHOT_MAX:
+            h = _dest_headers()
+            h.update({"x-ms-blob-type": "BlockBlob",
+                      "x-ms-copy-source": src})
+            out = _azure_put(f"{blob}?{sas}", h)
+        else:
+            # block-staged server-side copy for the rare >256 MiB object
+            import base64
+            ids = []
+            for i, off in enumerate(range(0, size, BLOCK_SIZE)):
+                bid = base64.b64encode(f"pbfu{i:08d}".encode()).decode()
+                end = min(off + BLOCK_SIZE, size) - 1
+                h = {"x-ms-version": X_MS_VERSION,
+                     "x-ms-copy-source": src,
+                     "x-ms-source-range": f"bytes={off}-{end}"}
+                _azure_put(f"{blob}?comp=block&blockid="
+                           f"{urllib.parse.quote(bid)}&{sas}", h)
+                ids.append(bid)
+            body = ("<?xml version='1.0' encoding='utf-8'?><BlockList>"
+                    + "".join(f"<Uncommitted>{b}</Uncommitted>" for b in ids)
+                    + "</BlockList>").encode()
+            req = urllib.request.Request(
+                f"{blob}?comp=blocklist&{sas}", data=body, method="PUT",
+                headers=_dest_headers())
+            try:
+                with urllib.request.urlopen(req, timeout=600):
+                    out = "created"
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    out = "exists"
+                else:
+                    raise CopyError(exc.headers.get("x-ms-error-code")
+                                    or str(exc.code)) from exc
+        counters.add("completed" if out == "created" else "skipped", size)
+    except CopyError as exc:
+        counters.add("failed", err=str(exc))
+    except Exception as exc:  # noqa: BLE001 — one key must not kill the job
+        counters.add("failed", err=type(exc).__name__)
+
+
+def cmd_copy_chunk(name: str, concurrency: int) -> int:
+    import boto3.session
+    from botocore.config import Config
+    path = os.path.join(BASE, "chunks", name)
+    if not os.path.exists(path):
+        print(f"no such chunk manifest: {path}", file=sys.stderr)
+        return 1
+    bucket = os.environ["S3_BUCKET"]
+    dest_url = os.environ["AZURE_DEST_URL"]
+    sas = os.environ["AZURE_DEST_SAS"]
+    cli = boto3.session.Session().client(
+        "s3", region_name=os.environ.get("AWS_REGION") or None,
+        config=Config(signature_version="s3v4"))
+
+    def presign(key):  # pure local signing; no network
+        return cli.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=PRESIGN_TTL)
+
+    counters = _CopyCounters()
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=concurrency) as ex:
+        with open(path) as f:
+            futs = []
+            for ln in f:
+                ln = ln.rstrip("\n")
+                if not ln:
+                    continue
+                key, _, size = ln.partition("\t")
+                futs.append(ex.submit(_copy_one, presign, dest_url, sas,
+                                      key, int(size or 0), counters))
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+    status = ("Failed" if counters.failed else
+              "CompletedWithSkipped" if counters.skipped else "Completed")
+    # azcopy summary grammar on purpose: the runner's grab() parsing and
+    # the whole done.txt/status/ETA pipeline consume it unchanged
+    print(f"Transfers Completed: {counters.completed}")
+    print(f"Transfers Failed: {counters.failed}")
+    print(f"Transfers Skipped: {counters.skipped}")
+    print(f"Bytes Transferred: {counters.bytes}")
+    print(f"Final Job Status: {status}")
+    for err, n in sorted(counters.errors.items()):
+        print(f"error {err}: {n}")
+    return 1 if counters.failed else 0
+
+
 # ── verify (manifest vs Azure dest listing) ─────────────────────────────────
 
 def _http_get(url: str, tries: int = 5) -> bytes:
@@ -432,6 +592,9 @@ def main(argv: list[str]) -> int:
         if "--per-chunk" in argv:
             per_chunk = int(argv[argv.index("--per-chunk") + 1])
         return cmd_split(per_chunk)
+    if argv[0] == "copy-chunk":
+        conc = int(argv[2]) if len(argv) > 2 else 200
+        return cmd_copy_chunk(argv[1], conc)
     if argv[0] == "verify":
         # a trailing "deep" arg is accepted and ignored: per-object
         # name+size against the manifest IS the deep check here

@@ -65,12 +65,15 @@ worker() {
                     --recursive --overwrite=false --log-level ERROR 2>&1)"
                 rc=$?
             else
-                # L: flat-bucket chunk — same S2S transport, enumeration
-                # driven by the chunk manifest instead of a prefix listing
-                out="$(azcopy copy "$S3_SRC_URL/" \
-                    "$AZURE_DEST_URL?$AZURE_DEST_SAS" \
-                    --list-of-files "$BASE/chunks/$jprefix" \
-                    --overwrite=false --log-level ERROR 2>&1)"
+                # L: flat-bucket chunk — server-side Put Blob From URL
+                # driven by s3_flat.py (azcopy's list-of-files enumerates
+                # sequentially, ~15 obj/s measured live; this path presigns
+                # locally, needs zero per-object HEADs, and its
+                # If-None-Match: * makes create-only API-enforced). It
+                # prints azcopy's summary grammar so parsing below is
+                # engine-agnostic.
+                out="$(python3 "$BASE/s3_flat.py" copy-chunk "$jprefix" \
+                    "$conc" 2>&1)"
                 rc=$?
             fi
             jobid="$(printf '%s\n' "$out" \
