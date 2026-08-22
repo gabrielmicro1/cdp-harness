@@ -537,21 +537,30 @@ if os.path.isdir(infd):
                             .replace("\t", " "))
         except OSError:
             pass
-files = sum(num(r[4]) + num(r[6]) for r in done if len(r) >= 9)
-bytes_ = sum(num(r[7]) for r in done if len(r) >= 9)
+# objects/bytes come from BOTH ledgers: a job lands in failed.txt if ANY
+# object failed, but a chunk with 150 failures out of 250k still copied
+# 249,850 — counting only done.txt under-reported a real run by 13x
+finished = [r for r in done + failed if len(r) >= 9]
+files = sum(num(r[4]) + num(r[6]) for r in finished)
+bytes_ = sum(num(r[7]) for r in finished)
+objects_failed = sum(num(r[5]) for r in finished)
 p = subprocess.run(["tmux", "list-windows", "-t", "transfer",
                     "-F", "#{window_name}"], capture_output=True, text=True)
 windows = [w for w in (p.stdout or "").split() if w]
 now = time.time()
-recent = [r for r in done if len(r) >= 9 and num(r[0]) > now - 1800]
+recent = [r for r in finished if num(r[0]) > now - 1800]
 rate = None
 if recent:
     span = max(1, int(now) - min(num(r[0]) - num(r[8]) for r in recent))
     rate = round(sum(num(r[4]) for r in recent) / span, 1)
 eta_hours = None
 nwork = sum(1 for w in windows if w.startswith("w")) or 1
-if pending and done:
-    avg = sum(num(r[8]) for r in done if len(r) >= 9) / len(done)
+if pending and finished:
+    # weight by RECENT jobs when we have them: early chunks in an
+    # already-populated keyspace are all-skip and finish far too fast to
+    # predict fresh-copy work
+    sample = recent or finished
+    avg = sum(num(r[8]) for r in sample) / len(sample)
     eta_hours = round(pending * avg / nwork / 3600.0, 1)
 hb = []
 for f in sorted(os.listdir(base)):
@@ -564,6 +573,7 @@ print(json.dumps({
     "jobs": {"pending": pending, "inflight": inflight,
              "done": len(done), "failed": len(failed)},
     "files_done": files, "bytes_done": bytes_,
+    "objects_failed": objects_failed,
     "recent_files_per_sec": rate, "eta_hours": eta_hours,
     "tmux_windows": windows, "worker_heartbeats": hb,
     "recent_failures": ["\t".join(r)[:200] for r in failed[-5:]],
