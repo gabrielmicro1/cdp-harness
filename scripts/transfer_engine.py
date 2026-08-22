@@ -54,7 +54,8 @@ class Spec:
                  remote_type: str, extra_rclone_flags: str = "",
                  default_transfers: int = 32, default_checkers: int = 64,
                  default_tpslimit: int | None = None,
-                 remote_extra: str = "", extra_cli_opts: list | None = None):
+                 remote_extra: str = "", extra_cli_opts: list | None = None,
+                 default_os_disk_gb: int | None = None):
         self.source_name = source_name          # rclone remote name ("gcs")
         self.vm_prefix = vm_prefix              # "xfer-" / "xfer-dbx-"
         self.purpose = purpose                  # purpose=<...> tag
@@ -76,6 +77,10 @@ class Spec:
         # rclone.conf key (e.g. gdrive --team-drive). Each entry:
         # {"flag", "argname", "tag", "conf_key", "help"}
         self.extra_cli_opts = extra_cli_opts or []
+        # OS disk size override at create (None = image default, ~30 GB).
+        # Sources whose tooling stages per-object state on disk (s3/azcopy
+        # job-plan files) need real headroom; rclone sources don't.
+        self.default_os_disk_gb = default_os_disk_gb
 
     def vm_name(self, slug: str) -> str:
         return f"{self.vm_prefix}{slug}"
@@ -289,6 +294,9 @@ def cmd_create_vm(spec: Spec, root: Path, args) -> dict:
         val = getattr(args, opt["argname"], None)
         if val:
             create_args.append(f"{opt['tag']}={val}")
+    os_disk_gb = getattr(args, "os_disk_gb", None) or spec.default_os_disk_gb
+    if os_disk_gb:
+        create_args += ["--os-disk-size-gb", str(os_disk_gb)]
     if region and not region.startswith("("):
         create_args += ["--location", region]
     proc = common.run_az(create_args, dry_run=args.dry_run, timeout=900,
@@ -402,18 +410,30 @@ def cmd_allow_network(spec: Spec, root: Path, args) -> dict:
                     "UI can be) — re-run allow-network."}
 
 
-def cmd_write_azure_remote(spec: Spec, root: Path, args) -> dict:
-    cfg = load_cfg(root, args.slug)
-    set_subscription(cfg, args.dry_run)
-    vm = require_vm(spec, cfg, args.slug, args.dry_run)
-    expiry = common.iso(common.utc_now() + timedelta(days=args.sas_days))
+def mint_container_sas(cfg: dict, sas_days: int,
+                       dry_run: bool) -> tuple[str, str]:
+    """(sas, expiry) — racwl container SAS for the ingest write path.
+
+    One az call shared by every consumer (rclone sas_url, azcopy dest URL)
+    so the permission set and expiry policy live exactly once. Never
+    revoked; lapses on its own.
+    """
+    expiry = common.iso(common.utc_now() + timedelta(days=sas_days))
     proc = common.run_az(["storage", "container", "generate-sas",
                           "--account-name", cfg["storage_account"],
                           "-n", cfg["container"],
                           "--permissions", "racwl",
                           "--expiry", expiry, "--https-only",
-                          "-o", "tsv"], dry_run=args.dry_run, timeout=120)
-    sas = proc.stdout.strip() if not args.dry_run else "<sas-redacted>"
+                          "-o", "tsv"], dry_run=dry_run, timeout=120)
+    sas = proc.stdout.strip() if not dry_run else "<sas-redacted>"
+    return sas, expiry
+
+
+def cmd_write_azure_remote(spec: Spec, root: Path, args) -> dict:
+    cfg = load_cfg(root, args.slug)
+    set_subscription(cfg, args.dry_run)
+    vm = require_vm(spec, cfg, args.slug, args.dry_run)
+    sas, expiry = mint_container_sas(cfg, args.sas_days, args.dry_run)
     sas_url = (f"https://{cfg['storage_account']}.blob.core.windows.net/"
                f"{cfg['container']}?{sas}")
     section = f"[azure]\ntype = azureblob\nsas_url = {sas_url}\n"
@@ -873,6 +893,9 @@ def main(spec: Spec, doc: str) -> int:
     p.add_argument("--rg", help="override VM resource group "
                                "(default: company's RG)")
     p.add_argument("--vm-size", default="Standard_D8s_v7")
+    p.add_argument("--os-disk-gb", dest="os_disk_gb", type=int, default=None,
+                   help="create-vm: OS disk size in GB (default: the Spec's "
+                        "default_os_disk_gb, else the image default ~30 GB)")
     p.add_argument("--dest-prefix", default=None,
                    help=f"prefix inside <slug>-raw "
                         f"(default {spec.default_dest_prefix})")

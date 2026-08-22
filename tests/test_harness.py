@@ -1629,6 +1629,199 @@ def main() -> int:
           and out.get("oauth_client_id")
           == "12345-abc.apps.googleusercontent.com", proc.stdout[-300:])
 
+    print("\n— s3_transfer --dry-run (engine lifecycle, azcopy copy layer) —")
+    import s3_transfer  # noqa: E402  (scripts/ already on sys.path)
+    check("s3 Spec: secretless env_auth remote, no OAuth flow, 512 GB disk",
+          "env_auth = true" in s3_transfer.SPEC.remote_extra
+          and s3_transfer.SPEC.authorize_target == ""
+          and s3_transfer.SPEC.default_os_disk_gb == 512)
+    proc = run_script("s3_transfer.py", "plan", "democo",
+                      "--bucket", "demo-images", "--root", root, "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("s3 plan: xfer-s3 VM + s3-export dest + bucket source",
+          plan["vm_name"] == "xfer-s3-democo"
+          and plan["storage_account"] == "stdemoco"
+          and plan["dest"] == "democo-raw/s3-export"
+          and plan["source"] == "s3:demo-images")
+    proc = run_script("s3_transfer.py", "create-vm", "democo",
+                      "--bucket", "demo-images", "--root", root, "--dry-run")
+    check("s3 create-vm: 512 GB os disk for azcopy job-plan files",
+          "--os-disk-size-gb 512" in proc.stdout)
+    check("s3 create-vm: purpose + bucket tags, own VM name, standard shape",
+          "purpose=s3-transfer" in proc.stdout
+          and "s3_bucket=demo-images" in proc.stdout
+          and "-n xfer-s3-democo" in proc.stdout
+          and "--public-ip-sku Standard" in proc.stdout
+          and "--accelerated-networking true" in proc.stdout)
+    proc = run_script("gcs_transfer.py", "create-vm", "democo",
+                      "--bucket", "dwt-takeout-export-123", "--root", root,
+                      "--dry-run")
+    check("engine disk knob is additive: rclone sources keep default disk",
+          "--os-disk-size-gb" not in proc.stdout)
+    proc = run_script("s3_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("s3 allow-network: vnet path (VM family), never IP rules",
+          "network-rule add" in proc.stdout
+          and "--subnet" in proc.stdout
+          and "--service-endpoints Microsoft.Storage" in proc.stdout
+          and "--ip-address" not in proc.stdout)
+    proc = run_script("s3_transfer.py", "write-dest", "democo",
+                      "--root", root, "--dry-run")
+    check("s3 write-dest: racwl SAS on the container, secrets redacted",
+          "--permissions racwl" in proc.stdout
+          and "-n democo-raw" in proc.stdout
+          and "redacted" in proc.stdout
+          and "network-rule add" not in proc.stdout)
+    check("s3 write-dest: feeds both rclone conf and azcopy dest.env",
+          "rclone.conf" in proc.stdout and "dest.env" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "s3_transfer.py"), "write-s3-creds",
+         "democo", "--bucket", "demo-images", "--root", str(root),
+         "--dry-run"],
+        input="AKIASENTINEL\nSECRETSENTINEL\n", capture_output=True,
+        text=True)
+    check("s3 creds: neither stdin sentinel ever echoed",
+          proc.returncode == 0 and "AKIASENTINEL" not in proc.stdout
+          and "SECRETSENTINEL" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "s3_transfer.py"), "write-s3-creds",
+         "democo", "--bucket", "demo-images", "--root", str(root),
+         "--dry-run"],
+        input="only-one-line\n", capture_output=True, text=True)
+    check("s3 creds: refuses malformed stdin (must be exactly 2 lines)",
+          proc.returncode == 1 and "2 lines" in proc.stdout)
+    proc = run_script("s3_transfer.py", "plan-jobs", "democo",
+                      "--bucket", "demo-images", "--root", root, "--dry-run")
+    pj = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("s3 plan-jobs: root shallow job always queued",
+          pj["jobs"] >= 1 and pj["sample"][0] == "S (root)"
+          and pj["shallow_jobs"] >= 1)
+    proc = run_script("s3_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run")
+    check("s3 transfer: workers launched inside tmux session 'transfer'",
+          "tmux new-session -d -s transfer -n w1" in proc.stdout
+          and "runner.sh worker 1 200 0" in proc.stdout)
+    proc = run_script("s3_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run", "--pilot")
+    check("s3 pilot: one window, one job, then measure",
+          "runner.sh worker 1 200 1" in proc.stdout
+          and "-n w2" not in proc.stdout)
+    proc = run_script("s3_transfer.py", "verify", "democo",
+                      "--root", root, "--dry-run")
+    check("s3 verify: rollup runs VM-side via the runner",
+          "runner.sh verify" in proc.stdout)
+    runner = (SCRIPTS / "azcopy-runner.sh").read_text()
+    check("runner pins the write invariant + plan-disk hygiene",
+          "--overwrite=false" in runner and "--recursive" in runner
+          and "azcopy jobs rm" in runner and "flock" in runner)
+    boot = (SCRIPTS / "bootstrap-vm.sh").read_text()
+    check("bootstrap installs azcopy idempotently",
+          "command -v azcopy" in boot
+          and "downloadazcopy-v10-linux" in boot)
+    proc = run_script("s3_transfer.py", "teardown", "democo", "--root", root,
+                      "--dry-run", expect_rc=2)
+    check("s3 teardown also gated", '"not-confirmed"' in proc.stdout)
+    proc = run_script("s3_transfer.py", "teardown", "democo", "--root", root,
+                      "--dry-run", "--confirmed")
+    check("s3 confirmed teardown: our vnet-rule + PIP/NSG/VNET, IAM reminder",
+          "network-rule remove" in proc.stdout
+          and "public-ip delete" in proc.stdout
+          and "vnet delete" in proc.stdout
+          and "IAM access key" in proc.stdout)
+
+    print("\n— s3 flat-bucket mode (chunked list-of-files) —")
+    import s3_flat
+    lines = [f"{i:032x}.jpg\t100\n" for i in range(250)]
+    lines.insert(5, "\n")
+    lines.insert(100, "weird key+name.jpg\t9\n")
+    chunks = list(s3_flat.split_listing(lines, 100))
+    names = [n for n, _ in chunks]
+    body = "".join(t for n, t in chunks if n.startswith("chunk"))
+    quar = "".join(t for n, t in chunks if n.startswith("quarantine"))
+    check("flat split: chunk names, sizes, quarantine, round-trip",
+          names == ["chunk-00000", "chunk-00001", "chunk-00002",
+                    "quarantine-00000"]
+          and body.count("\n") == 250 and quar == "weird key+name.jpg\n"
+          and body == "".join(f"{i:032x}.jpg\n" for i in range(250)),
+          str(names))
+    check("flat split: empty listing yields zero chunks",
+          list(s3_flat.split_listing([], 100)) == [])
+    rb = s3_flat.range_bounds(256)
+    synth = sorted(["!bang", "00aa", "01", "7fzz", "ff00", "zzz", "0",
+                    "G-upper", "fe" * 16])
+    hits = [sum(1 for a, b in rb
+                if (a is None or k > a) and (b is None or k <= b))
+            for k in synth]
+    check("flat range_bounds: 256 total-coverage ranges, no loss/dupes",
+          len(rb) == 256 and rb[0][0] is None and rb[-1][1] is None
+          and all(h == 1 for h in hits), str(list(zip(synth, hits))))
+    man = [("a", 1), ("b", 2), ("c", 3), ("d", 4)]
+    azl = [("a", 1), ("c", 9), ("d", 4), ("e", 5)]
+    buf = io.StringIO()
+    st = s3_flat.merge_join(iter(man), iter(azl), buf)
+    rows = [r.split("\t") for r in buf.getvalue().splitlines()
+            if not r.startswith("#")]
+    check("flat verify merge-join: labels, totals, ok/bad counts",
+          st["ok"] == 2 and st["bad"] == 3
+          and [r[6] for r in rows] == ["MISSING-DEST", "SIZE-DIFF",
+                                       "EXTRA-DEST"]
+          and st["s3_count"] == 4 and st["az_count"] == 4
+          and st["s3_bytes"] == 10 and st["az_bytes"] == 19, str(st))
+    try:
+        s3_flat.merge_join(iter([("b", 1), ("a", 1)]), iter([]),
+                           io.StringIO())
+        sorted_guard = False
+    except s3_flat.SortError:
+        sorted_guard = True
+    check("flat verify merge-join: unsorted stream aborts loudly",
+          sorted_guard)
+    proc = run_script("s3_transfer.py", "plan-jobs", "democo",
+                      "--bucket", "demo-images", "--root", root,
+                      "--dry-run", "--flat")
+    fj = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("s3 plan-jobs --flat: sharded listing launched in window 'plan'",
+          fj.get("listing_started") is True and fj.get("flat") is True
+          and "runner.sh list-bucket" in proc.stdout
+          and "-n plan" in proc.stdout
+          and "s3_flat.py" in proc.stdout)
+    proc = run_script("s3_transfer.py", "plan-jobs", "democo",
+                      "--bucket", "demo-images", "--root", root,
+                      "--dry-run", "--no-flat")
+    check("s3 plan-jobs --no-flat: forces the prefix path",
+          "list-bucket" not in proc.stdout
+          and '"S (root)"' in proc.stdout)
+    proc = run_script("s3_transfer.py", "probe", "democo",
+                      "--bucket", "demo-images", "--root", root, "--dry-run")
+    check("s3 probe: cheap root-shape sample runs before the dirs survey",
+          "--max-depth 1" in proc.stdout and "head -1000" in proc.stdout
+          and proc.stdout.index("--max-depth 1")
+          < proc.stdout.index("--dirs-only")
+          and '"flat_suspected"' in proc.stdout)
+    proc = run_script("s3_transfer.py", "transfer", "democo",
+                      "--root", root, "--dry-run")
+    check("s3 transfer: orphaned inflight jobs swept back into the queue",
+          "cat inflight/* >> queue.txt" in proc.stdout
+          and "rm -f inflight/*" in proc.stdout)
+    check("runner: L job is server-side list-of-files with write invariant",
+          '--list-of-files "$BASE/chunks/$jprefix"' in runner
+          and runner.count("--overwrite=false") >= 2
+          and '--files-from "$BASE/chunks/$jprefix"' in runner)
+    check("runner: list-bucket verb + flat verify auto-select",
+          "list-bucket)" in runner and "s3_flat.py" in runner
+          and "grep -qm1 $'^L\\t'" in runner)
+    src = (SCRIPTS / "s3_transfer.py").read_text()
+    check("s3 verify collect skips comment rows; requeue contract intact",
+          "$1 !~ /^#/" in src and "print $2" in src)
+    boot = (SCRIPTS / "bootstrap-vm.sh").read_text()
+    check("bootstrap installs python3-boto3 for the flat lister",
+          "python3-boto3" in boot)
+    flat_src = (SCRIPTS / "s3_flat.py").read_text()
+    check("s3_flat: creds via env only (boto3 env_auth; no key handling)",
+          "AWS_SECRET_ACCESS_KEY" not in flat_src
+          and "AWS_ACCESS_KEY_ID" not in flat_src
+          and "argv" not in flat_src.split("def main")[0])
+
     print("\n— qwilr_transfer --dry-run (first VM-less ingest) —")
     proc = run_script("qwilr_transfer.py", "plan", "democo", "--root", root)
     qplan = json.loads(proc.stdout[proc.stdout.index("{"):])

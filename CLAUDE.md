@@ -43,7 +43,7 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, qwilr, vimeo, zoom) *populate* `<slug>-raw`
+   skills (gcs, dropbox, gdrive, s3, qwilr, vimeo, zoom) *populate* `<slug>-raw`
    from a cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on
    the local qwilr/vimeo/zoom pulls, whose writes are additionally create-only
    via `If-None-Match: *`) — they are the ingest path, not an audit path. They
@@ -91,6 +91,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   dropbox-azure-transfer/references/commands.md
   gdrive-azure-transfer/SKILL.md           # Google Drive → <slug>-raw (same engine)
   gdrive-azure-transfer/references/commands.md
+  s3-azure-transfer/SKILL.md               # AWS S3 → <slug>-raw (engine VM lifecycle, azcopy server-side copy)
+  s3-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
@@ -109,10 +111,13 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   gcs_transfer.py            # thin GCS CLI over transfer_engine (Spec only)
   dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
   gdrive_transfer.py         # thin Google Drive CLI over transfer_engine (Spec only)
+  s3_transfer.py             # S3 → blob via azcopy server-side copy on the VM; engine lifecycle + own copy layer
+  s3_flat.py                 # VM-side flat-bucket engine: sharded listing, chunk split, manifest verify (pushed with the runner)
+  azcopy-runner.sh           # VM-side azcopy job-queue worker (ssh-piped by s3_transfer.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
   zoom_transfer.py           # Zoom recordings → blob via Put-Block-From-URL server-side copy; local, standalone
-  bootstrap-vm.sh            # transfer-VM bootstrap (rclone+tmux), ssh-piped
+  bootstrap-vm.sh            # transfer-VM bootstrap (rclone+azcopy+tmux), ssh-piped
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
   verify_completion.py       # completion checklist
@@ -201,7 +206,11 @@ Cached so daily runs skip discovery entirely.
                                          // is dropped from the per-source view; an object with
                                          // "redundant_bytes" = only that many bytes duplicate
                                          // (a partial/aborted export still holding unique
-                                         // data — that prefix STAYS in the per-source view).
+                                         // data — that prefix STAYS in the per-source view,
+                                         // showing only its unique bytes: apply_duplicates()
+                                         // subtracts the redundant share, so per-source rows
+                                         // and the chart match the deduplicated headline;
+                                         // affected service rows carry a "deduplicated" flag).
                                          // reconcile.duplicate_sources() subtracts these from
                                          // the headline total and %-complete, and always
                                          // emits a note so the subtraction is never silent.
@@ -416,17 +425,19 @@ leftovers. `vm.exists: false` is normal and blocks nothing.
 Some companies' corpora arrive in a cloud source we must pull ourselves:
 Google Workspace Data Export buckets (`dwt-takeout-export-<digits>`, browser
 OAuth by the customer's super admin only — no service accounts, no HMAC
-keys), a Dropbox account, or a Google Drive (My Drive or Shared Drive).
-rclone-with-a-token on a temporary Azure VM is the viable path for all of
-them. `scripts/transfer_engine.py` is the ONE engine; `gcs_transfer.py` /
+keys), a Dropbox account, a Google Drive (My Drive or Shared Drive), or an
+AWS S3 bucket. A temporary Azure VM is the viable path for all of them.
+`scripts/transfer_engine.py` is the ONE engine; `gcs_transfer.py` /
 `dropbox_transfer.py` / `gdrive_transfer.py` are thin Spec-only CLIs over
-it, driven by the matching `*-azure-transfer` skills. The workflow: VM
-`xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive: `xfer-gdr-<slug>`, so
-they can run concurrently) in the company's RG and the SA's region, static
-Standard-SKU public IP (never deallocated before teardown), rclone copy in
-a tmux session into `<slug>-raw/workspace-export/` (Dropbox:
-`dropbox-export/`, Drive: `gdrive-export/`). Rules that differ from the
-sizing path — do not cross-contaminate:
+it (rclone-with-a-token copies), and `s3_transfer.py` reuses the engine's
+VM lifecycle but swaps the copy layer for azcopy (see below) — all driven
+by the matching `*-azure-transfer` skills. The workflow: VM
+`xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive: `xfer-gdr-<slug>`, S3:
+`xfer-s3-<slug>`, so they can run concurrently) in the company's RG and
+the SA's region, static Standard-SKU public IP (never deallocated before
+teardown), the copy in a tmux session into `<slug>-raw/workspace-export/`
+(Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`).
+Rules that differ from the sizing path — do not cross-contaminate:
 
 - **Network rules are engine-run via `allow-network`** (policy change,
   2026-08: the harness grants access itself — the Microsoft.Storage service
@@ -453,6 +464,45 @@ sizing path — do not cross-contaminate:
   The transfer VM needs the `Microsoft.Storage` service endpoint on its
   subnet + a vnet-rule on the SA. The laptop-based sizing path is unaffected
   (external IP, IP rules work).
+
+**S3 rides the engine's VM but not its rclone.** An S3 corpus can be
+hundreds of millions of small objects (bacancy-scale listing is nothing
+next to a 300M-object images bucket), and any streaming copy — rclone
+included, whose cross-provider copies always pass through the VM — is
+months of wall clock at that shape. `scripts/s3_transfer.py` therefore
+reuses transfer_engine's VM lifecycle (create/allow-network/check-azure/
+teardown run the engine functions verbatim; `mint_container_sas` is
+shared) but copies with **azcopy S3→Blob server-to-server** (presigned S3
+GETs driving Put Blob/Block From URL — the storage fabric pulls from S3
+directly; the VM issues only control calls; days, not months). The bucket
+is split into per-prefix azcopy jobs (`plan-jobs`; one job's plan file at
+300M objects would be 100+ GB, hence also the 512 GB OS disk via the
+Spec's `default_os_disk_gb`) drained by K tmux worker windows running
+`scripts/azcopy-runner.sh`; loose objects at split levels get shallow
+rclone jobs so nothing is orphaned. The read-only AWS key (client-made
+IAM user: `s3:GetObject` + `s3:ListBucket` on the bucket) arrives as 2
+stdin lines → 600 env file on the VM; rclone's `[s3]` remote is
+secretless (`env_auth = true`, same env file) and serves listing/probe/
+verify. `probe` is the day-one gate: requester-pays detection and a
+storage-class sample — GLACIER/DEEP_ARCHIVE objects fail server-side
+copy (`InvalidObjectState`) until restored. Write invariant, stated
+honestly: no-delete is server-enforced (racwl SAS); no-overwrite is the
+runner's pinned `--overwrite=false` (client-side, NOT the API-enforced
+`If-None-Match: *` of the local pulls). Verify is a per-job count+byte
+rollup (S3 multipart ETags aren't MD5s — size-match is the honest
+invariant); resume = re-run transfer (skips are normal). Always pilot
+one job (`transfer --pilot`) to measure objects/s before quoting a
+timeline. **FLAT buckets** (all keys at root, no prefixes — e.g. a
+300M-hex-hash images bucket) can't be prefix-split: `plan-jobs`
+auto-detects the shape and switches to `scripts/s3_flat.py`'s chunked
+mode — a range-sharded parallel listing (boto3 on the VM, detached in
+tmux; the laptop side stays stdlib) becomes the **cutoff manifest**,
+split into ~250k-key chunk files that azcopy copies server-side via
+`--list-of-files` (`L` jobs; unsafe-named keys ride rclone
+`--files-from` as `Q` jobs). Flat verify is a streamed merge-join of
+that manifest against the Azure dest listing — per-object name+size,
+drift-immune, `--deep` implied. Driven by the `s3-azure-transfer`
+skill.
 
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
