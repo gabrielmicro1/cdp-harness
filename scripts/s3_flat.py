@@ -385,34 +385,69 @@ def _dest_headers():
     return {"x-ms-version": X_MS_VERSION, "If-None-Match": "*"}
 
 
-def _azure_put(url, headers, tries=5):
-    """PUT with dest-side retry. Returns 'created' | 'exists' | raises."""
-    last = None
+_TLS = None  # thread-local holder, created lazily (keeps import light)
+
+
+def _conn(host):
+    """Persistent per-thread HTTPS connection. urllib.request opens a new
+    TLS session per request — at 550 req/s that's 550 handshakes/s and ~4
+    CPU cores per worker (measured live); one keep-alive connection per
+    thread makes the copy loop latency-bound instead of CPU-bound."""
+    global _TLS
+    if _TLS is None:
+        import threading
+        _TLS = threading.local()
+    c = getattr(_TLS, "conn", None)
+    if c is None or getattr(_TLS, "host", None) != host:
+        if c is not None:
+            c.close()
+        import http.client
+        c = http.client.HTTPSConnection(host, timeout=600)
+        _TLS.conn, _TLS.host = c, host
+    return c
+
+
+def _drop_conn():
+    if _TLS is not None and getattr(_TLS, "conn", None) is not None:
+        _TLS.conn.close()
+        _TLS.conn = None
+
+
+def _azure_put(url, headers, body=b"", tries=5):
+    """PUT over the thread's keep-alive connection, with dest-side retry.
+    Returns 'created' | 'exists' | raises CopyError."""
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path + ("?" + parts.query if parts.query else "")
+    last = "retries-exhausted"
     for attempt in range(tries):
-        req = urllib.request.Request(url, data=b"", method="PUT",
-                                     headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=600):
+            c = _conn(parts.netloc)
+            c.request("PUT", path, body=body, headers=headers)
+            r = c.getresponse()
+            r.read()  # drain so the connection can be reused
+            if r.status in (200, 201):
                 return "created"
-        except urllib.error.HTTPError as exc:
-            if exc.code == 409 and "BlobAlreadyExists" in (
-                    exc.headers.get("x-ms-error-code") or ""):
+            code = r.getheader("x-ms-error-code") or str(r.status)
+            if r.status == 409 and "BlobAlreadyExists" in code:
                 return "exists"
-            if exc.code in (429, 500, 503) and attempt < tries - 1:
+            if r.status in (429, 500, 503) and attempt < tries - 1:
                 time.sleep(min(2 ** attempt,
-                               int(exc.headers.get("Retry-After") or 0)
+                               int(r.getheader("Retry-After") or 0)
                                or 2 ** attempt))
-                last = exc
+                last = code
                 continue
-            code = exc.headers.get("x-ms-error-code") or str(exc.code)
-            raise CopyError(code) from exc
-        except (urllib.error.URLError, OSError) as exc:
-            last = exc
+            raise CopyError(code)
+        except CopyError:
+            raise
+        except (OSError, Exception) as exc:  # noqa: BLE001 — includes
+            # http.client exceptions; a dropped keep-alive is normal churn
+            _drop_conn()
+            last = type(exc).__name__
             if attempt < tries - 1:
                 time.sleep(2 ** attempt)
                 continue
-            raise CopyError(type(exc).__name__) from exc
-    raise CopyError(type(last).__name__ if last else "retries-exhausted")
+            raise CopyError(last) from exc
+    raise CopyError(last)
 
 
 class CopyError(Exception):
@@ -444,18 +479,8 @@ def _copy_one(presign, dest_url, sas, key, size, counters):
             body = ("<?xml version='1.0' encoding='utf-8'?><BlockList>"
                     + "".join(f"<Uncommitted>{b}</Uncommitted>" for b in ids)
                     + "</BlockList>").encode()
-            req = urllib.request.Request(
-                f"{blob}?comp=blocklist&{sas}", data=body, method="PUT",
-                headers=_dest_headers())
-            try:
-                with urllib.request.urlopen(req, timeout=600):
-                    out = "created"
-            except urllib.error.HTTPError as exc:
-                if exc.code == 409:
-                    out = "exists"
-                else:
-                    raise CopyError(exc.headers.get("x-ms-error-code")
-                                    or str(exc.code)) from exc
+            out = _azure_put(f"{blob}?comp=blocklist&{sas}",
+                             _dest_headers(), body=body)
         counters.add("completed" if out == "created" else "skipped", size)
     except CopyError as exc:
         counters.add("failed", err=str(exc))
