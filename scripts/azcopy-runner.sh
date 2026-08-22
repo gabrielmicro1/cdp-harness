@@ -112,6 +112,14 @@ worker() {
             rc=$?
             jobid="rclone"; comp=""; fail=""; skip=""; bytes=""
         fi
+        # a job that failed without a parseable summary died before azcopy
+        # even started (bad invocation, unbound var, ...) — keep its output
+        # or the only evidence dies with this variable (learned live)
+        if [ "$rc" -ne 0 ] && [ -z "${comp:-}" ] && [ "$jtype" != "S" ] \
+                && [ "$jtype" != "Q" ]; then
+            printf '%s\n' "$out" | sed 's/sig=[^&"]*/sig=REDACTED/g' \
+                > "$BASE/logs/job-${jprefix//\//_}.err"
+        fi
         local end row dest
         end=$(date +%s)
         row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \

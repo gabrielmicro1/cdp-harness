@@ -117,10 +117,14 @@ def cmd_write_dest(root: Path, args) -> dict:
                            f"[azure]\ntype = azureblob\n"
                            f"sas_url = {base}?{sas}\n",
                            dry_run=args.dry_run)
-    env = (f"AZURE_DEST_URL={base}/{prefix}\n"
-           f"AZURE_DEST_SAS={sas}\n"
-           f"AZURE_DEST_CONTAINER={cfg['container']}\n"
-           f"AZURE_DEST_PREFIX={prefix}\n")
+    # values are SINGLE-QUOTED: the SAS contains '&', and sourcing an
+    # unquoted VAR=a&b line backgrounds the assignment at the '&' — the
+    # var lands empty and azcopy hits Azure with no SAS at all (401,
+    # found live on checkmate). az SAS/URLs never contain single quotes.
+    env = (f"AZURE_DEST_URL='{base}/{prefix}'\n"
+           f"AZURE_DEST_SAS='{sas}'\n"
+           f"AZURE_DEST_CONTAINER='{cfg['container']}'\n"
+           f"AZURE_DEST_PREFIX='{prefix}'\n")
     _write_env(vm["public_ip"], DEST_ENV, env, args.dry_run)
     return {"remote": "azure", "container": cfg["container"],
             "dest_prefix": prefix, "sas_expiry": expiry,
@@ -146,11 +150,13 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
                 "hint": f"bucket {bucket} returned no x-amz-bucket-region — "
                         "typo in the bucket name? (a nonexistent bucket "
                         "still 404s without the header)"}
-    env = (f"AWS_ACCESS_KEY_ID={key_id}\n"
-           f"AWS_SECRET_ACCESS_KEY={secret}\n"
-           f"AWS_REGION={region}\n"
-           f"S3_BUCKET={bucket}\n"
-           f"S3_SRC_URL=https://{bucket}.s3.{region}.amazonaws.com\n")
+    # single-quoted for the same reason as dest.env (see cmd_write_dest);
+    # AWS secrets are base64-ish (never contain single quotes)
+    env = (f"AWS_ACCESS_KEY_ID='{key_id}'\n"
+           f"AWS_SECRET_ACCESS_KEY='{secret}'\n"
+           f"AWS_REGION='{region}'\n"
+           f"S3_BUCKET='{bucket}'\n"
+           f"S3_SRC_URL='https://{bucket}.s3.{region}.amazonaws.com'\n")
     _write_env(vm["public_ip"], AWS_ENV, env, args.dry_run)
     section = (f"[s3]\ntype = s3\nprovider = AWS\nenv_auth = true\n"
                f"region = {region}\n")
