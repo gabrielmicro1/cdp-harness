@@ -128,7 +128,7 @@ def split_listing(lines, per_chunk: int):
 
 
 def merge_join(manifest_rows, azure_rows, out, now=time.time,
-               missing_out=None):
+               missing_out=None, sizediff_out=None):
     """Stream compare two lexically sorted (key, size) iterators; write
     mismatch rows (runner 8-field shape, capped at MISMATCH_CAP) plus
     #progress sentinels to `out`. Returns totals for the #done line.
@@ -192,7 +192,13 @@ def merge_join(manifest_rows, azure_rows, out, now=time.time,
                 emit(m[0], 1, m[1], 1, a[1], "SIZE-DIFF")
                 # NOT added to missing_out: the create-only engine cannot
                 # overwrite a bad blob — SIZE-DIFF is a deliberate
-                # remediation decision, never a silent re-copy
+                # remediation decision, never a silent re-copy. It gets
+                # its OWN uncapped file so the full population is
+                # quantifiable (the verify.tsv sample is capped at 1000
+                # and is lexically biased toward the start of the
+                # keyspace — useless for characterising the class).
+                if sizediff_out is not None:
+                    sizediff_out.write(f"{m[0]}\t{m[1]}\t{a[1]}\n")
             m = next(man, None)
             a = next(az, None)
     return stats
@@ -600,11 +606,15 @@ def iter_azure_listing():
 def cmd_verify() -> int:
     out_path = os.path.join(BASE, "verify.tsv")
     miss_path = os.path.join(BASE, "missing.txt")
-    with open(out_path, "w") as out, open(miss_path + ".tmp", "w") as miss:
+    diff_path = os.path.join(BASE, "sizediff.txt")
+    with open(out_path, "w") as out, \
+            open(miss_path + ".tmp", "w") as miss, \
+            open(diff_path + ".tmp", "w") as diff:
         try:
             stats = merge_join(iter_manifest(os.path.join(BASE,
                                                           "listing.txt")),
-                               iter_azure_listing(), out, missing_out=miss)
+                               iter_azure_listing(), out, missing_out=miss,
+                               sizediff_out=diff)
         except SortError as exc:
             out.write(f"#error\tunsorted\t{exc}\n")
             log(f"verify ABORTED: {exc}")
@@ -612,6 +622,7 @@ def cmd_verify() -> int:
         kv = "\t".join(f"{k}={v}" for k, v in stats.items())
         out.write(f"#done\t{int(time.time())}\t{kv}\n")
     os.replace(miss_path + ".tmp", miss_path)
+    os.replace(diff_path + ".tmp", diff_path)
     log(f"verify done: {stats}")
     return 0
 

@@ -2039,9 +2039,13 @@ def main() -> int:
     azl = [("a", 1), ("c", 9), ("d", 4), ("e", 5)]
     buf = io.StringIO()
     miss = io.StringIO()
-    st = s3_flat.merge_join(iter(man), iter(azl), buf, missing_out=miss)
+    sdiff = io.StringIO()
+    st = s3_flat.merge_join(iter(man), iter(azl), buf, missing_out=miss,
+                            sizediff_out=sdiff)
     check("flat verify: missing.txt gets only MISSING-DEST (mop-up input)",
           miss.getvalue() == "b\t2\n")
+    check("flat verify: sizediff.txt gets SIZE-DIFF uncapped (s3+az sizes)",
+          sdiff.getvalue() == "c\t3\t9\n")
     rows = [r.split("\t") for r in buf.getvalue().splitlines()
             if not r.startswith("#")]
     check("flat verify merge-join: labels, totals, ok/bad counts",
