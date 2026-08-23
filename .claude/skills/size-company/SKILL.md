@@ -68,7 +68,10 @@ Never reimplement the phases in Bash — the deterministic logic lives in
   Check `gz.uncertain` in the run file — nonzero means some gz logical sizes
   are floors, not measurements; for a dump-heavy container raise
   `GZ_STREAM_BUDGET` (compressed bytes; the streams are one-time, cached by
-  ETag) and re-size.
+  ETag) and re-size. For a milestone-grade answer where every archive is
+  stream-measured (zip CDs verified too, coverage stats recorded), use the
+  deep-verify skill instead — it runs on an in-region VM and its
+  measurements replay in all later daily runs via the cache.
 - `skipped-unchanged` — UsedCapacity metric matched the last run; a
   copied-forward run file was written. Expected on most days. Note the metric
   is account-level: a scrub-side write can force one redundant re-size (harmless).

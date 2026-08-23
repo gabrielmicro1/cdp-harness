@@ -6,13 +6,14 @@ companion to CLAUDE.md (operational rules) and
 `.claude/skills/size-company/SKILL.md` (how to run it). When this document and
 the code disagree, the code wins — fix this file.
 
-Accurate as of `ecb2d46` (2026-08-14). Key files:
+Accurate as of the deep-verify change (2026-08-23). Key files:
 
 | File | Role |
 |---|---|
 | `scripts/corpus_sizer_rest.py` | The sizer. Single stdlib-only file, runs as a detached process. |
 | `scripts/phases.py` | Harness side: skip-check / launch / poll / harvest / cleanup / status. |
 | `scripts/size_company.py`, `scripts/fleet_size.py` | Thin CLIs over `phases.py` (one company = fleet of one). |
+| `scripts/deep_verify.py` | Deep-verify step machine: the sizer with `DEEP_VERIFY=1` on an in-region VM (§13). |
 | `scripts/reconcile.py` | Turns run files into flags/notes/percentages for reports. |
 | `tests/test_harness.py` | Offline verification incl. a fake in-memory Azure container. |
 
@@ -281,10 +282,18 @@ time, never correctness*:
    company's cache at once — the first fleet run after such a harness upgrade
    does full re-sizes fleet-wide. Both intentional; the second is worth
    remembering when a morning run is mysteriously slow.
-5. **gz staleness** (`gz_cached_row_stale`): a cached gz row that is not
+5. **Staleness** (`cached_row_stale`, mode-aware): exact/terminal methods
+   (`*-exact`, `*-truncated`, `zip-exact-mismatch(*)`, `*-tiny`,
+   `zip:0entries` — see `_method_terminal`) are NEVER stale in any mode:
+   this is what lets a shallow daily run replay deep-verify measurements at
+   zero HTTP without re-shallowing them. Shallow mode otherwise applies only
+   the gz rule (`gz_cached_row_stale`): a cached gz row that is not
    `gz-exact` but that the *current* streaming trigger would now stream
    (threshold/floor-min in effect this run) is re-measured once — a
-   deliberate one-time miss, not a bug. Pre-taxonomy cache rows report
+   deliberate one-time miss, not a bug. Deep mode treats every non-terminal
+   cached row as stale (one re-measure converts trust into measurement; a
+   repeat deep run on an unchanged container is then listing-only, except
+   non-terminal residuals like a garbage `.xz`, deliberately re-attempted). Pre-taxonomy cache rows report
    `gz-trailer` even when floored; `uncompressed == compressed` is the tell
    that catches those too. Disabled entirely when streaming is off
    (`GZ_STREAM_BUDGET <= 0`) — re-reading the trailer every run would gain
@@ -477,9 +486,11 @@ Runtime ≈ listing time + (zip/gz misses × round-trip cost ÷ SIZER_WORKERS).
 
 Sizing originally ran on in-region VMs via `az vm run-command` (the
 `SIZING-SKILL.md` runbook, retired 2026-08 and preserved in git history along
-with the VM implementation — commit `c3ba27c` and earlier). If a container
-ever appears that is too slow to size over the internet, the facts you'd need
-to resurrect it: run-command allows ONE invocation at a time per VM (a
+with the VM implementation — commit `c3ba27c` and earlier). A VM sizing path
+EXISTS again since deep verify (§13) — but it is built on the transfer
+engines' ssh+tmux lifecycle, NOT on run-command; if a container is ever too
+slow to size shallow over the internet, extend `deep_verify.py` rather than
+resurrecting run-command. For the record, run-command's sharp edges were: run-command allows ONE invocation at a time per VM (a
 VM-side sleep loop jams the slot — poll with instant scripts, wait locally);
 its instance-view output is capped at 4KB; the script and SAS travel
 base64-piped through the command; and an in-region VM cannot be allowed by
@@ -522,3 +533,58 @@ so discovery (`config.json`'s `vm` block) never assumes one.
 9. `sizing-runs/` is append-only; bytes are ints; presentation is decimal
    (÷10⁹) at the edges only.
 10. Fleet operations isolate per-company failures and report every outcome.
+
+## 13. Deep verify (DEEP_VERIFY=1 on an in-region VM)
+
+Deep verify converts the sizer's metadata-trusted numbers into measurements:
+`DEEP_VERIFY=1` makes `size_blob` stream-decompress every compressed blob —
+the totals then come from counted output bytes, not zip central directories
+or gz trailers. It exists because the numbers feed data-sale contracts. Run
+via `scripts/deep_verify.py` (a step machine over `transfer_engine.py`'s VM
+lifecycle — create `deepv-<slug>` → allow-network → push sizer + cache +
+`rl` SAS env → tmux → poll → harvest + auto-teardown; no state file, VM
+tags carry the pre-run UsedCapacity). Daily shallow runs are untouched.
+
+**Kinds.** `blob_kind` knows `bz2` (`.bz2/.tbz2/.tar.bz2`) and `xz`
+(`.xz/.txz/.tar.xz`) in BOTH modes (so deep cache rows replay on shallow
+runs); shallow sizes them at content-length with zero HTTP (`bz2-stored` /
+`xz-stored` rows — cached, but counted as neither hit nor miss so the
+"mass misses = re-upload" signal stays honest). Formats with no stdlib
+codec (`UNMEASURABLE_EXTS`: .7z/.rar/.zst/.tzst) stay kind `stored` and are
+bucketed per-format in the verification stats.
+
+**Deep gz** is the existing streaming machinery with forced knobs
+(`_init_from_env`: threshold 0, floor-min 0, budget 2^63 — `StreamBudget`
+survives purely as the egress ledger). **Deep zip**: `_parse_cd` collects a
+per-entry map (`entries_out`: lho/flags/method/csize/usize, zip64-resolved)
+and `zip_stream_exact` walks the local entries in ONE sequential GET
+(`_ByteCursor` gap-skips headers/descriptors), inflating deflate entries
+(raw `wbits=-15`) and counting stored entries' csize; encrypted/unsupported/
+corrupt entries fall back to their CD usize and count as cd-trusted
+(`zip-partial(k/Ncd)`). A clean walk is `zip-exact`, or
+`zip-exact-mismatch(cd=N)` when the CD lied — the STREAMED value goes into
+totals (silent at run level by policy; quantified in
+`verification.cd_mismatches`). **Deep bz2/xz**: `_stream_exact_multi`
+(shared bz2/lzma decompressor API: `needs_input`/`unused_data`, xz stream
+padding stripped between streams); truncation → `{kind}-truncated` at the
+exact partial, decode failure → `{kind}-stored` fallback (trusted bucket).
+All streams route through `_stream_with_retry`: transport errors retry with
+budget re-reservation; decode errors (`StreamDecodeError`, `TruncatedStream`
+— both ValueError) are terminal.
+
+**Coverage** (`coverage_class`, applied per row in the consumer so cached
+replays classify identically): measured (streams, truncated partials,
+trivial blobs, loose stored files) / trusted (CDs, trailers, `*-stored`
+placeholders, `err:*` floors) / unmeasurable (no-codec formats,
+per-extension). Emitted as summary.json's `verification` block only when
+deep (shallow summaries are byte-identical to before); `phases.summary_to_run`
+passes it through, copied-forward carries it, `reconcile.company_summary`
+exposes `verification` + `deep_verified_at`, reports badge it, and
+`verify_completion` shows an informational never-gating check.
+`stream_compressed_bytes` counts successful measurement egress per run
+(failed attempts and cache replays excluded), so warm deep runs report ~0.
+
+**Tests**: `tests/test_harness.py` "deep verify" sections — the
+shallow→deep→warm→shallow cycle (staleness both ways, CD-tampering, bz2/xz
+fixtures), consumer rendering, and the deep_verify.py dry-run + fake-ssh
+harvest.

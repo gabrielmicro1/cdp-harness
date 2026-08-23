@@ -84,6 +84,7 @@ companies/                   # ALL runtime state; gitignored (local only)
   report-company/SKILL.md
   report-all/SKILL.md
   verify-completion/SKILL.md
+  deep-verify/SKILL.md                     # stream-measure every archive on an in-region VM
   daily-brief/SKILL.md
   gcs-azure-transfer/SKILL.md              # GCS export → <slug>-raw via transfer VM
   gcs-azure-transfer/references/commands.md
@@ -107,6 +108,8 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   discover_company.py        # az discovery for onboarding → config.json
   size_company.py            # single-company sizing CLI (fleet of one)
   fleet_size.py              # fleet sizing CLI (launch-all / poll-all / harvest)
+  deep_verify.py             # deep-verify step machine: sizer w/ DEEP_VERIFY=1 on an
+                             # in-region VM (engine lifecycle), auto-teardown at harvest
   transfer_engine.py         # cloud→Azure transfer engine (VM, rclone, tmux)
   gcs_transfer.py            # thin GCS CLI over transfer_engine (Spec only)
   dropbox_transfer.py        # thin Dropbox CLI over transfer_engine (Spec only)
@@ -262,7 +265,10 @@ Cached so daily runs skip discovery entirely.
   "sources": {                           // keyed by top-level blob prefix ("(root)" for none)
     "gdrive": {"blob_count": 400, "compressed_bytes": 1, "uncompressed_bytes": 2}
   },
-  "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing method blob counts —
+  "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing KIND blob counts (zip/gz/
+                                         // bz2/xz/stored — bz2 and xz are kinds in BOTH modes so
+                                         // deep-verify cache rows replay on shallow runs; shallow
+                                         // sizes them at content-length, zero HTTP) —
                                          // gz>0 triggers the gz-accuracy notes; the per-blob gz
                                          // method taxonomy (gz-trailer/gz-floor/gz-bad-trailer/
                                          // gz-tiny/gz-exact/gz-truncated) lives in the
@@ -281,6 +287,22 @@ Cached so daily runs skip discovery entirely.
   },
   "sources_l2": {"workspace-export/hubspot": [4, 0, 400000000000]}, // top-40 second-level
                                          // [files, comp, unc] triples + "(other)" rollup
+  "verification": {                      // present ONLY on deep-verify runs (scripts/
+    "deep": true,                        // deep_verify.py); null/absent on shallow + old runs.
+    "measured_blobs": 9812,              // measured = stream-decompressed or trivially exact
+    "measured_bytes": 3298000000000,     // (uncompressed bytes — the commercial column);
+    "trusted_blobs": 3,                  // trusted = still metadata (zip CDs for unstreamable
+    "trusted_bytes": 1200000000,         // entries, stream failures, err:* floors);
+    "unmeasurable_blobs": 2,             // unmeasurable = no stdlib codec (.7z/.rar/.zst),
+    "unmeasurable_bytes": 40000000000,   // counted at stored size, broken out per-format:
+    "unmeasurable_by_format": {".7z": [2, 40000000000]},   // ext → [blobs, stored bytes]
+    "cd_mismatches": 1,                  // zips whose CD lied — the STREAMED value is in the
+                                         // totals (silent by policy; per-blob detail in the
+                                         // blob-index method zip-exact-mismatch(cd=N))
+    "stream_compressed_bytes": 3100000000000  // per-run egress ledger (successful streams)
+  },                                     // copied-forward carries it (container unchanged ⇒
+                                         // certification holds); verify_completion surfaces it
+                                         // as an INFORMATIONAL check — it never gates
   "notes": []                            // free-form strings (e.g. truncation fallback used)
 }
 ```
@@ -417,6 +439,35 @@ Sizing no longer uses VMs, but discovery still records what it finds (prefer
 useful context — most companies have NO VM at all (am-city-inc's RG holds
 only the storage account), some have `vm-*-extract` / `vm-dwt-transfer`
 leftovers. `vm.exists: false` is normal and blocks nothing.
+
+### Deep verify (the sanctioned sizing-VM path)
+
+`scripts/deep_verify.py` (driven by the deep-verify skill) is the ONE
+sizing operation that uses a VM: it runs the same `corpus_sizer_rest.py`
+with `DEEP_VERIFY=1` on a temporary in-region VM (`deepv-<slug>`), which
+stream-decompresses EVERY compressed blob (zip/gz/bz2/xz) so the totals are
+measurements, not zip-CD/gz-trailer trust. This is a genuine bulk-download
+job — exactly the case the local-only rule's rationale carves out — so the
+in-region rule applies again: free egress, ~4–5 TB/h. It borrows rules from
+BOTH families and they must not cross-contaminate further:
+
+- From **sizing**: the SAS stays account-level **`rl` read-only** (1-day
+  default; `--sas-days 2` allowed for >1-day streams). Deep verify never
+  gains a write path; the vnet-rule grant is account-config plumbing (same
+  sanction as the transfer engines), not a data write.
+- From the **transfer engines** (`transfer_engine.py` reused verbatim):
+  VM lifecycle, `allow-network` (service endpoint + vnet-rule — IP rules
+  never match same-region VMs), secrets over ssh stdin into a 600 env file,
+  **no state file** (VM + tags are the truth; `.fleet-state.json` is never
+  touched), teardown removes exactly our rule.
+- Lifecycle is **one-shot**: `step <slug>` advances one phase per call
+  (create → grant+push+launch → poll → harvest + auto-teardown); the
+  pre-run UsedCapacity metric rides VM tags so harvest can stamp the run
+  file. Results land as a normal `sizing-runs/` file (method `sized`) with
+  the `verification` block, and the pulled blob-index makes every
+  measurement replay in later shallow daily runs (exact methods are
+  terminal in the cache — dailies never "re-shallow" them; a repeat deep
+  run on an unchanged container is listing-only).
 
 ---
 

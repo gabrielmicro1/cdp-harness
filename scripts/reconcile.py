@@ -178,8 +178,34 @@ def lore_notes(run: dict | None) -> list[str]:
             f"timestamps (e.g. a Google Takeout run), not source names — the "
             f"real sources are one level deeper. Consider re-splitting on the "
             f"second path segment before sharing per-source numbers.")
+    ver = run.get("verification")
     gzinfo = run.get("gz")
-    if gzinfo is not None:
+    if ver:
+        # deep-verified run: supersedes the gz-uncertainty notes below —
+        # archives were stream-decompressed, not trailer/CD-estimated
+        if not ver.get("trusted_bytes") and not ver.get("unmeasurable_bytes"):
+            notes.append(
+                "Deep verify: every archive in the container was "
+                "stream-decompressed and measured exactly — the totals are "
+                "measurements, not metadata estimates.")
+        else:
+            bits = []
+            if ver.get("trusted_bytes"):
+                bits.append(f"{ver['trusted_bytes'] / 1e9:.1f} GB across "
+                            f"{ver['trusted_blobs']} blob(s) still rely on "
+                            f"archive metadata (unstreamable entries or "
+                            f"stream failures)")
+            if ver.get("unmeasurable_bytes"):
+                fmts = ", ".join(sorted(ver.get("unmeasurable_by_format",
+                                                {})))
+                bits.append(f"{ver['unmeasurable_bytes'] / 1e9:.1f} GB in "
+                            f"{ver['unmeasurable_blobs']} blob(s) use "
+                            f"formats with no measurable index"
+                            + (f" ({fmts})" if fmts else "")
+                            + ", counted at stored size")
+            notes.append("Deep verify: archive sizes are stream-measured, "
+                         "with a residual — " + "; ".join(bits) + ".")
+    elif gzinfo is not None:
         if gzinfo.get("uncertain", 0) > 0:
             notes.append(
                 f"{gzinfo['uncertain']} gz blob(s) "
@@ -484,6 +510,14 @@ def company_summary(root: Path, slug: str) -> dict:
     stalled = bool(latest and pct is not None and pct < 100
                    and days_since_change is not None and days_since_change >= 3)
 
+    # deep-verify state: the LATEST run's coverage block feeds numbers; the
+    # newest run carrying one (any age) dates the last certification, so
+    # "deep-verified <date>" survives later shallow runs
+    verification = (latest or {}).get("verification")
+    deep_verified_at = next(
+        (r["timestamp"] for r in common.latest_runs(root, slug, 30)
+         if r.get("verification")), None)
+
     return {
         "slug": slug,
         "config": cfg,
@@ -503,6 +537,8 @@ def company_summary(root: Path, slug: str) -> dict:
         "delta_24h": delta_24h(root, slug),
         "stalled": stalled,
         "days_since_change": days_since_change,
+        "verification": verification,
+        "deep_verified_at": deep_verified_at,
         "service_rows": rows,
         "unexpected_sources": unexpected,
         # post-split view; consumers render per-source numbers from THIS, not

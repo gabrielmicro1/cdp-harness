@@ -124,6 +124,8 @@ def build(root: Path):
         run = s["latest_run"]
         last = (f'{esc(run["timestamp"][:10])} · {esc(run["method"])}'
                 if run else "never")
+        if run and s.get("verification"):
+            last += " · deep-verified"
         link = latest_report_link(root, slug)
         link_html = f'<a href="{esc(link)}">report</a>' if link else ""
         body.append(f'<tr><td>{esc(slug)}</td><td>{" ".join(badges)}</td>'
@@ -136,6 +138,8 @@ def build(root: Path):
             "uncompressed_total": s["uncompressed_total"],
             "delta_24h": d24, "eta": s["eta"], "stalled": s["stalled"],
             "last_outcome": lr.get("outcome"), "last_reason": lr.get("reason"),
+            "deep_verified": bool(s.get("verification")),
+            "deep_verified_at": s.get("deep_verified_at"),
         })
     body.append("</table>")
 

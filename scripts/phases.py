@@ -150,6 +150,8 @@ def write_copied_forward_run(root: Path, slug: str, metric, metric_at) -> Path:
         "gz": prev.get("gz"),
         "detected_services": prev.get("detected_services", {}),
         "sources_l2": prev.get("sources_l2", {}),
+        "verification": prev.get("verification"),  # unchanged container keeps
+                                                   # its deep-verify coverage
         "notes": [f"copied forward from {prev['timestamp']} (UsedCapacity unchanged)"],
     }
     common.write_json(path, run)
@@ -210,11 +212,13 @@ def ip_rule_remove_if_ours(cfg: dict, ip: str, we_added: bool,
                   dry_run=dry_run, check=False)
 
 
-def mint_sas(cfg: dict, dry_run: bool = False) -> str:
-    """Account SAS, rl only, 1-day expiry, https-only. Read-only is policy —
-    we never write to client storage (see CLAUDE.md principle 3)."""
+def mint_sas(cfg: dict, dry_run: bool = False, days: int = 1) -> str:
+    """Account SAS, rl only, https-only. 1-day expiry by default (sizing
+    policy); deep_verify.py may pass days=2 for a monster-container VM run.
+    Read-only is policy — we never write to client storage (see CLAUDE.md
+    principle 3)."""
     from datetime import timedelta
-    expiry = (common.utc_now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%MZ")
+    expiry = (common.utc_now() + timedelta(days=days)).strftime("%Y-%m-%dT%H:%MZ")
     proc = common.run_az([
         "storage", "account", "generate-sas",
         "--account-name", cfg["storage_account"],
@@ -353,6 +357,9 @@ def summary_to_run(slug: str, summary: dict, skip_info: dict,
         "gz": summary.get("gz"),
         "detected_services": summary.get("detected_services", {}),
         "sources_l2": summary.get("sources_l2", {}),
+        "verification": summary.get("verification"),  # deep-verify coverage
+                                                      # block; None for
+                                                      # shallow/old summaries
         "notes": notes,
     }
 

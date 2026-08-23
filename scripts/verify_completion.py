@@ -85,6 +85,25 @@ def verify(root: Path, slug: str, tolerance: float) -> dict:
                         "by_type": errs.get("by_type", {}),
                         "note": "review only — never auto-fails"}
 
+    ver = s.get("verification")
+    total_ver_bytes = (sum(ver.get(k, 0) for k in
+                           ("measured_bytes", "trusted_bytes",
+                            "unmeasurable_bytes")) if ver else 0)
+    checks["deep_verify"] = {
+        "pass": True,  # informational — never gates completion
+        "verified": bool(ver),
+        "verified_at": s.get("deep_verified_at"),
+        "measured_pct_of_bytes": (round(ver["measured_bytes"]
+                                        / total_ver_bytes * 100, 2)
+                                  if ver and total_ver_bytes else None),
+        "trusted_bytes": ver.get("trusted_bytes") if ver else None,
+        "unmeasurable_bytes": ver.get("unmeasurable_bytes") if ver else None,
+        "cd_mismatches": ver.get("cd_mismatches") if ver else None,
+        "note": ("informational — never gates" if ver else
+                 "no deep-verify run — archive sizes are metadata-trusted "
+                 "(zip central directories / gz trailers)"),
+    }
+
     hard = [checks["headline"]["pass"], checks["services"]["pass"],
             checks["zero_bytes"]["pass"] is not False,
             checks["unexpected_sources"]["pass"]]

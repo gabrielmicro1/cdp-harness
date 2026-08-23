@@ -27,6 +27,14 @@ Env:
   GZ_STREAM_BUDGET   per-run cap on compressed bytes spent exact-streaming gz
                       blobs (default 50_000_000_000); 0 disables streaming
                       entirely (and cache staleness re-checks with it)
+  DEEP_VERIFY        "1" = deep-verify mode: stream-decompress EVERY compressed
+                      blob (zip, gz, bz2, xz) and measure exact uncompressed
+                      sizes instead of trusting zip central directories / gz
+                      trailers. Forces GZ_STREAM_THRESHOLD=0, FLOOR_MIN=0 and
+                      an uncapped budget. Emits a "verification" coverage block
+                      in summary.json. Intended to run on an in-region VM
+                      (bulk download); results cache by ETag so repeats are
+                      listing-only. Default "0" (shallow — daily behavior).
 
 Writes in OUT_DIR:
   <TAG>.log           progress
@@ -53,12 +61,21 @@ reads only indexes/trailers):
                      counting output bytes) under a per-run byte budget —
                      method becomes gz-exact; a failed stream falls back to
                      the trailer value, counted uncertain. See GZ_STREAM_*.
+  .bz2/.tbz2      -> shallow: content-length (no cheap trailer exists); deep:
+  .xz/.txz           exact multi-stream decompress (stdlib bz2/lzma). Methods:
+                     bz2-stored/xz-stored (untouched), bz2-exact/xz-exact
+                     (streamed), bz2-truncated/xz-truncated (ends mid-stream;
+                     exact partial count).
+  .7z/.rar/.zst   -> stored size (no stdlib codec); deep verify counts them
+                     as an "unmeasurable format" residual, never silently.
   everything else -> uncompressed = content-length (accurate for loose files).
 Read-only; writes nothing back to the blob.
 """
+import bz2
 import gzip
 import hashlib
 import json
+import lzma
 import os
 import queue
 import re
@@ -82,6 +99,7 @@ EXPECTED_SERVICES: tuple = ()
 GZ_STREAM_THRESHOLD = 256_000_000
 GZ_STREAM_FLOOR_MIN = 8_000_000
 GZ_STREAM_BUDGET = 50_000_000_000
+DEEP_VERIFY = False
 BASE = LOG = OUT = SUMMARY = SUMMARY_JSON = DONE = INDEX = ""
 
 
@@ -89,6 +107,7 @@ def _init_from_env():
     global SA, CONTAINER, SAS, TAG, MAX_ZIP_ENTRIES, SIZER_WORKERS, LIST_WORKERS
     global CACHE_FILE, SEED_TSV, EXPECTED_SERVICES
     global GZ_STREAM_THRESHOLD, GZ_STREAM_FLOOR_MIN, GZ_STREAM_BUDGET
+    global DEEP_VERIFY
     global BASE, LOG, OUT, SUMMARY, SUMMARY_JSON, DONE, INDEX
     SA = os.environ["SA"]
     CONTAINER = os.environ["CONTAINER"]
@@ -105,6 +124,14 @@ def _init_from_env():
     GZ_STREAM_THRESHOLD = int(os.environ.get("GZ_STREAM_THRESHOLD", "256000000"))
     GZ_STREAM_FLOOR_MIN = int(os.environ.get("GZ_STREAM_FLOOR_MIN", "8000000"))
     GZ_STREAM_BUDGET = int(os.environ.get("GZ_STREAM_BUDGET", "50000000000"))
+    DEEP_VERIFY = os.environ.get("DEEP_VERIFY", "0").lower() not in ("", "0", "false")
+    if DEEP_VERIFY:
+        # deep mode measures everything: gz knobs forced so the existing gz
+        # streaming machinery covers every gz blob; budget effectively uncapped
+        # (StreamBudget stays in place purely as the egress-accounting ledger)
+        GZ_STREAM_THRESHOLD = 0
+        GZ_STREAM_FLOOR_MIN = 0
+        GZ_STREAM_BUDGET = 1 << 63
     BASE = os.path.join(os.environ.get("OUT_DIR", "/var/tmp"), TAG)
     LOG, OUT = f"{BASE}.log", f"{BASE}.sizes.tsv"
     SUMMARY, SUMMARY_JSON = f"{BASE}.summary", f"{BASE}.summary.json"
@@ -149,15 +176,34 @@ def blob_kind(name):
         return "zip"
     if lname.endswith((".tar.gz", ".tgz", ".gz")):
         return "gz"
+    if lname.endswith((".tar.bz2", ".tbz2", ".bz2")):
+        return "bz2"
+    if lname.endswith((".tar.xz", ".txz", ".xz")):
+        return "xz"
     return "stored"
 
 
+# Compressed formats with no stdlib codec: sized at stored bytes in both
+# modes, but deep verify buckets them as an "unmeasurable format" residual in
+# the verification stats so the shortfall is quantified, never silent.
+UNMEASURABLE_EXTS = (".7z", ".rar", ".zst", ".tzst")
+
+
+def unmeasurable_ext(name):
+    lname = name.lower()
+    for ext in UNMEASURABLE_EXTS:
+        if lname.endswith(ext):
+            return ext
+    return None
+
+
 # ── per-blob cache (blob-index) ──────────────────────────────────────────────
-# Rows exist only for zip/gz blobs (stored blobs cost nothing to size — the
-# listing already carries their size). Error rows are never cached, so
-# transient failures retry next run. A cache can only cost time, never
-# correctness: any doubt → miss.
-CACHEABLE_KINDS = ("zip", "gz")
+# Rows exist for compressed-kind blobs (plain stored blobs cost nothing to
+# size — the listing already carries their size). Error rows are never cached,
+# so transient failures retry next run. A cache can only cost time, never
+# correctness: any doubt → miss. bz2/xz rows exist so a deep run's exact
+# measurements replay on later shallow runs.
+CACHEABLE_KINDS = ("zip", "gz", "bz2", "xz")
 
 
 def _check_header(line, fingerprint):
@@ -432,11 +478,15 @@ ZIP_TAIL_RETRY = 8_000_000
 CD_SIG = 0x02014b50
 
 
-def _parse_cd(cd, total_entries, matcher=None):
+def _parse_cd(cd, total_entries, matcher=None, entries_out=None):
     """Walk the central directory: sum uncompressed sizes and, when a matcher
     is given, attribute matched entry paths to services (exact per-entry
     usize — zero extra requests). Returns (total_uncomp, entries_seen, svc)
-    with svc = {service: [bytes, entry_count]}."""
+    with svc = {service: [bytes, entry_count]}. When entries_out is a list,
+    appends (local_header_offset, flags, method, csize, usize) per entry —
+    the map zip_stream_exact walks (deep verify); zip64 saturation of csize
+    and the offset is resolved from the extra field (the zip64 record holds
+    values only for saturated fields, in usize/csize/offset order)."""
     total_uncomp = 0
     n = 0
     p = 0
@@ -449,19 +499,30 @@ def _parse_cd(cd, total_entries, matcher=None):
     while p + 46 <= len(cd) and n < cap:
         if cd[p:p + 4] != sig:
             break
-        (_s, _vm, _vn, _fl, _meth, _mt, _md, _crc, csize, usize,
-         name_len, extra_len, cmt_len, _dn, _ia, _ea, _lho) = struct.unpack(
+        (_s, _vm, _vn, flags, meth, _mt, _md, _crc, csize, usize,
+         name_len, extra_len, cmt_len, _dn, _ia, _ea, lho) = struct.unpack(
             "<IHHHHHHIIIHHHHHII", cd[p:p + 46])
         name_end = p + 46 + name_len
         extra_end = name_end + extra_len
-        if usize == 0xFFFFFFFF:  # ZIP64 — real usize is in the extra field
+        if (usize == 0xFFFFFFFF or (entries_out is not None
+                                    and (csize == 0xFFFFFFFF
+                                         or lho == 0xFFFFFFFF))):
             ex = cd[name_end:extra_end]
             xp = 0
             while xp + 4 <= len(ex):
                 xid, xlen = struct.unpack("<HH", ex[xp:xp + 4])
                 if xid == 0x0001:
                     zdata = ex[xp + 4:xp + 4 + xlen]
-                    usize = struct.unpack("<Q", zdata[0:8])[0]
+                    zoff = 0
+                    if usize == 0xFFFFFFFF and zoff + 8 <= len(zdata):
+                        usize = struct.unpack("<Q", zdata[zoff:zoff + 8])[0]
+                        zoff += 8
+                    if csize == 0xFFFFFFFF and zoff + 8 <= len(zdata):
+                        csize = struct.unpack("<Q", zdata[zoff:zoff + 8])[0]
+                        zoff += 8
+                    if lho == 0xFFFFFFFF and zoff + 8 <= len(zdata):
+                        lho = struct.unpack("<Q", zdata[zoff:zoff + 8])[0]
+                        zoff += 8
                     break
                 xp += 4 + xlen
         if matcher is not None:
@@ -475,6 +536,8 @@ def _parse_cd(cd, total_entries, matcher=None):
                 rec = svc.setdefault(hit, [0, 0])
                 rec[0] += usize
                 rec[1] += 1
+        if entries_out is not None:
+            entries_out.append((lho, flags, meth, csize, usize))
         total_uncomp += usize
         n += 1
         p = extra_end + cmt_len
@@ -497,8 +560,10 @@ def _eocd64_scan(tail, idx, clen):
     return None
 
 
-def zip_uncompressed(name, clen, matcher=None):
-    """Return (uncompressed_bytes, note, svc). Range-reads only EOCD + CD."""
+def zip_uncompressed(name, clen, matcher=None, entries_out=None):
+    """Return (uncompressed_bytes, note, svc). Range-reads only EOCD + CD.
+    entries_out (a list, deep verify) receives the per-entry stream map from
+    _parse_cd; the fallback paths that never reach the CD leave it empty."""
     if clen < EOCD_SIZE:
         return clen, "zip-tiny", {}  # empty/placeholder blob — nothing to read
     tail_sizes = [min(clen, 65557)]
@@ -538,7 +603,7 @@ def zip_uncompressed(name, clen, matcher=None):
     if not cd_size:
         return 0, "zip:0entries", {}  # empty archive — no CD to fetch
     cd = fetch_range(name, cd_off, cd_off + cd_size - 1)
-    total_uncomp, n, svc = _parse_cd(cd, total_entries, matcher)
+    total_uncomp, n, svc = _parse_cd(cd, total_entries, matcher, entries_out)
     note = (f"zip:{n}entries" if total_entries is None or n == total_entries
             else f"zip:partial{n}/{total_entries}")
     return total_uncomp, note, svc
@@ -585,14 +650,23 @@ def stream_blob_chunks(name, chunk=1 << 20):
 _DECOMP_STEP = 64 << 20  # bound per decompress call — caps transient memory
 
 
-class TruncatedGzStream(ValueError):
-    """The blob ends mid-member (a truncated upload). .partial carries the
-    exact byte count decompressed before the cut — the true logical size of
-    the content that actually exists in storage."""
+class TruncatedStream(ValueError):
+    """The blob ends mid-member/mid-stream (a truncated upload). .partial
+    carries the exact byte count decompressed before the cut — the true
+    logical size of the content that actually exists in storage."""
 
     def __init__(self, partial):
-        super().__init__("truncated gzip stream")
+        super().__init__("truncated compressed stream")
         self.partial = partial
+
+
+TruncatedGzStream = TruncatedStream  # back-compat alias (pre-deep-verify name)
+
+
+class StreamDecodeError(ValueError):
+    """Deterministic decode failure (corrupt/misnamed bytes, or a blob whose
+    layout contradicts its own index). ValueError subclass so the retry
+    helper's decode-vs-transport split treats it as terminal."""
 
 
 def gz_stream_exact(name):
@@ -614,8 +688,155 @@ def gz_stream_exact(name):
                 total += len(d.decompress(d.unconsumed_tail, _DECOMP_STEP))
             chunk = d.unused_data if d.eof else b""
     if not d.eof:
-        raise TruncatedGzStream(total)
+        raise TruncatedStream(total)
     return total
+
+
+def _stream_exact_multi(name, new_decomp):
+    """Exact uncompressed size for bz2/xz: stream-decompress every stream in
+    the blob (concatenated streams are legal in both formats), counting
+    output bytes only, memory bounded by _DECOMP_STEP. `new_decomp` is
+    bz2.BZ2Decompressor or lzma.LZMADecompressor — they share the
+    decompress(data, max_length)/.eof/.unused_data/.needs_input API (which
+    differs from zlib's unconsumed_tail, hence a sibling of gz_stream_exact
+    rather than a replacement). Decode failures raise StreamDecodeError;
+    a blob that ends mid-stream raises TruncatedStream(partial)."""
+    total = 0
+    d = new_decomp()
+    started = False
+    for chunk in stream_blob_chunks(name):
+        data = chunk
+        while data:
+            if d.eof:
+                # xz stream padding (null bytes between/after streams) is
+                # legal; nulls can never start a real bz2/xz stream
+                data = data.lstrip(b"\x00")
+                if not data:
+                    break
+                d = new_decomp()
+            try:
+                out = d.decompress(data, _DECOMP_STEP)
+                total += len(out)
+                while not d.eof and not d.needs_input:
+                    step = d.decompress(b"", _DECOMP_STEP)
+                    if not step:
+                        break
+                    total += len(step)
+            except Exception as exc:
+                raise StreamDecodeError(f"{type(exc).__name__}: {exc}") from exc
+            started = True
+            data = d.unused_data if d.eof else b""
+    if started and not d.eof:
+        raise TruncatedStream(total)
+    if not started:
+        raise StreamDecodeError("empty blob — nothing to decompress")
+    return total
+
+
+class _ByteCursor:
+    """Forward-only cursor over a chunk generator with absolute positions —
+    the transport zip_stream_exact walks. Unexpected EOF (the blob is shorter
+    than its central directory claims) raises StreamDecodeError, which the
+    retry helper treats as terminal."""
+
+    def __init__(self, gen):
+        self.gen = gen
+        self.buf = b""
+        self.off = 0   # consumed bytes within buf
+        self.pos = 0   # absolute bytes consumed so far
+
+    def _fill(self):
+        try:
+            self.buf = next(self.gen)
+            self.off = 0
+        except StopIteration:
+            raise StreamDecodeError("blob shorter than its central directory "
+                                    "claims") from None
+
+    def skip_to(self, abs_pos):
+        if abs_pos < self.pos:
+            raise StreamDecodeError("central directory offsets run backwards")
+        self.skip(abs_pos - self.pos)
+
+    def skip(self, n):
+        while n:
+            if self.off >= len(self.buf):
+                self._fill()
+            take = min(n, len(self.buf) - self.off)
+            self.off += take
+            self.pos += take
+            n -= take
+
+    def read(self, n):
+        return b"".join(self.iter_read(n))
+
+    def iter_read(self, n):
+        while n:
+            if self.off >= len(self.buf):
+                self._fill()
+            take = min(n, len(self.buf) - self.off)
+            piece = self.buf[self.off:self.off + take]
+            self.off += take
+            self.pos += take
+            n -= take
+            yield piece
+
+    def close(self):
+        self.gen.close()
+
+
+LOCAL_HDR_SIG = struct.pack("<I", 0x04034b50)
+
+
+def zip_stream_exact(name, entries):
+    """Deep verify: measure a zip by decompressing its entries in ONE
+    sequential GET, walking the local entries in offset order (gap-skipping
+    makes data descriptors and archive-decoration bytes irrelevant).
+    Returns (measured_total, cd_trusted_entries): deflate entries are
+    inflated and counted; stored entries count their csize (measured by
+    construction); encrypted / unsupported-method / per-entry decode
+    failures fall back to the CD's usize for that entry and count as
+    cd-trusted. Blob-level layout contradictions raise StreamDecodeError
+    (the caller falls back to the CD total)."""
+    cur = _ByteCursor(stream_blob_chunks(name))
+    total = 0
+    trusted = 0
+    try:
+        for lho, flags, meth, csize, usize in sorted(entries):
+            cur.skip_to(lho)
+            hdr = cur.read(30)
+            if hdr[:4] != LOCAL_HDR_SIG:
+                raise StreamDecodeError("bad local header signature")
+            nlen, xlen = struct.unpack("<HH", hdr[26:30])
+            cur.skip(nlen + xlen)
+            if flags & 0x1 or meth not in (0, 8):
+                cur.skip(csize)     # encrypted or unsupported compression
+                total += usize
+                trusted += 1
+                continue
+            if meth == 0:           # stored — the csize bytes ARE the content
+                cur.skip(csize)
+                total += csize
+                continue
+            d = zlib.decompressobj(wbits=-15)  # raw deflate
+            out = 0
+            try:
+                for piece in cur.iter_read(csize):
+                    out += len(d.decompress(piece, _DECOMP_STEP))
+                    while d.unconsumed_tail and not d.eof:
+                        out += len(d.decompress(d.unconsumed_tail,
+                                                _DECOMP_STEP))
+                out += len(d.flush())
+            except zlib.error:
+                # this entry is corrupt: trust its CD usize, realign at the
+                # next entry's offset (skip_to handles the leftover bytes)
+                total += usize
+                trusted += 1
+                continue
+            total += out
+    finally:
+        cur.close()  # the CD tail is deliberately left unread
+    return total, trusted
 
 
 class StreamBudget:
@@ -639,8 +860,10 @@ class StreamBudget:
 def gz_stream_candidate(method, clen):
     """Should this gz blob be stream-measured exactly? Big blobs always
     (wrap risk); floored/garbage trailers above a small floor (multi-member
-    risk without letting thousands of tiny bgzip files eat the budget)."""
-    if GZ_STREAM_BUDGET <= 0:
+    risk without letting thousands of tiny bgzip files eat the budget).
+    clen < 4 (gz-tiny) can never decompress — excluded even in deep mode,
+    where the forced threshold of 0 would otherwise sweep it in."""
+    if GZ_STREAM_BUDGET <= 0 or clen < 4:
         return False
     if clen >= GZ_STREAM_THRESHOLD:
         return True
@@ -655,10 +878,37 @@ def gz_cached_row_stale(method, clen, uncomp):
     the trailer every run would gain nothing)."""
     if GZ_STREAM_BUDGET <= 0 or method in ("gz-exact", "gz-truncated"):
         return False  # gz-truncated is content-exact until the ETag changes
+    if clen < 4:
+        return False  # gz-tiny — nothing to stream
     if clen >= GZ_STREAM_THRESHOLD:
         return True
     floored = method in ("gz-floor", "gz-bad-trailer") or uncomp == clen
     return floored and clen >= GZ_STREAM_FLOOR_MIN
+
+
+def _method_terminal(method):
+    """Methods whose value can never be improved by re-measuring the same
+    bytes: exact stream measurements, truncated-stream exact partials, and
+    trivial cases. Terminal rows are never stale in ANY mode — this is what
+    lets a shallow daily run replay deep-verify results at zero HTTP without
+    ever 're-shallowing' them."""
+    return (method in ("gz-exact", "gz-truncated", "bz2-exact", "bz2-truncated",
+                       "xz-exact", "xz-truncated", "zip-exact",
+                       "gz-tiny", "zip-tiny", "zip:0entries")
+            or method.startswith("zip-exact-mismatch"))
+
+
+def cached_row_stale(kind, method, clen, uncomp):
+    """Mode-aware staleness for a cached row. Shallow: only the existing gz
+    migration rule applies (zip CD rows and bz2/xz placeholders replay as
+    hits). Deep: everything non-terminal is stale — one re-measure converts
+    metadata-trusted rows into measurements; a repeat deep run on an
+    unchanged container is then listing-only."""
+    if not DEEP_VERIFY:
+        if kind == "gz":
+            return gz_cached_row_stale(method, clen, uncomp)
+        return False
+    return not _method_terminal(method)
 
 
 def gz_uncertain_row(kind, method, clen):
@@ -672,20 +922,22 @@ def gz_uncertain_row(kind, method, clen):
     return method == "gz-trailer" and clen >= GZ_STREAM_THRESHOLD
 
 
-def _gz_stream_with_retry(name, clen, budget, attempts=3):
+def _stream_with_retry(stream_fn, name, clen, budget, attempts=3):
     """Retry only transport-layer failures (network blips) — a decode
     failure (zlib.error: non-gzip/corrupt bytes; ValueError: truncated
-    stream) is deterministic and re-reading the same bytes can never
-    succeed, so it's raised immediately with no retry or sleep. The first
-    attempt spends the reservation `size_blob` already made; each RETRY
-    must reserve its own re-download budget — if that reservation fails,
-    stop and raise the last error (the caller's fallback handles it)."""
+    stream / StreamDecodeError) is deterministic and re-reading the same
+    bytes can never succeed, so it's raised immediately with no retry or
+    sleep. The first attempt spends the reservation `size_blob` already
+    made; each RETRY must reserve its own re-download budget — if that
+    reservation fails, stop and raise the last error (the caller's
+    fallback handles it). `stream_fn(name)` does one full streaming pass
+    (gz_stream_exact, a _stream_exact_multi wrapper, or zip_stream_exact)."""
     last = None
     for i in range(attempts):
         if i > 0 and not budget.reserve(clen):
             raise last
         try:
-            return gz_stream_exact(name)
+            return stream_fn(name)
         except (zlib.error, ValueError):
             raise  # deterministic decode failure — retrying can't help
         except Exception as exc:  # noqa: BLE001 — transport-layer, retry
@@ -726,20 +978,48 @@ def discover_prefixes():
 
 
 def size_blob(name, clen, etag, kind, matcher, budget=None):
-    """Worker-pool job. Never raises — failures become err:* rows, and a
-    failed exact-stream falls back to the trailer value (counted uncertain)."""
+    """Worker-pool job. Never raises — failures become err:* rows, a failed
+    gz exact-stream falls back to the trailer value (counted uncertain), and
+    a failed deep zip/bz2/xz stream falls back to the metadata-trusted value
+    (CD total / stored size — counted in the verification trusted bucket)."""
     uncomp, method, svc, err = clen, "stored", {}, None
     try:
         if kind == "zip":
-            uncomp, method, svc = zip_uncompressed(name, clen, matcher)
+            entries = [] if DEEP_VERIFY else None
+            uncomp, method, svc = zip_uncompressed(name, clen, matcher,
+                                                   entries_out=entries)
+            if (DEEP_VERIFY and budget is not None and entries
+                    and method == f"zip:{len(entries)}entries"
+                    and budget.reserve(clen)):
+                cd_total = uncomp
+                try:
+                    streamed, trusted_n = _stream_with_retry(
+                        lambda nm: zip_stream_exact(nm, entries),
+                        name, clen, budget)
+                    if trusted_n:
+                        uncomp = streamed
+                        method = f"zip-partial({trusted_n}/{len(entries)}cd)"
+                    elif streamed == cd_total:
+                        uncomp, method = streamed, "zip-exact"
+                    else:
+                        # measurement beats metadata (silently: quantified in
+                        # verification.cd_mismatches, no run-level note)
+                        uncomp = streamed
+                        method = f"zip-exact-mismatch(cd={cd_total})"
+                        logmsg(f"cd mismatch {name}: cd={cd_total} "
+                               f"streamed={streamed}")
+                except Exception as exc:  # noqa: BLE001 — keep the CD value
+                    logmsg(f"zip stream fallback {name}: "
+                           f"{type(exc).__name__}: {str(exc)[:120]}")
         elif kind == "gz":
             uncomp, method = gz_uncompressed(name, clen)
             if (budget is not None and gz_stream_candidate(method, clen)
                     and budget.reserve(clen)):
                 try:
-                    uncomp, method = (_gz_stream_with_retry(name, clen, budget),
+                    uncomp, method = (_stream_with_retry(gz_stream_exact,
+                                                         name, clen, budget),
                                        "gz-exact")
-                except TruncatedGzStream as exc:
+                except TruncatedStream as exc:
                     # blob ends mid-member: the partial count IS the exact
                     # logical size of what exists (a garbage trailer would
                     # over- or undercount arbitrarily)
@@ -748,12 +1028,69 @@ def size_blob(name, clen, etag, kind, matcher, budget=None):
                 except Exception as exc:  # noqa: BLE001 — keep trailer value
                     logmsg(f"stream fallback {name}: {type(exc).__name__}: "
                            f"{str(exc)[:120]}")
+        elif kind in ("bz2", "xz"):
+            # only reached in deep mode — shallow enqueues these directly
+            # (content-length, no HTTP) without a pool submission
+            method = f"{kind}-stored"
+            decomp = (bz2.BZ2Decompressor if kind == "bz2"
+                      else lzma.LZMADecompressor)
+            if (DEEP_VERIFY and budget is not None and clen
+                    and budget.reserve(clen)):
+                try:
+                    uncomp = _stream_with_retry(
+                        lambda nm: _stream_exact_multi(nm, decomp),
+                        name, clen, budget)
+                    method = f"{kind}-exact"
+                except TruncatedStream as exc:
+                    uncomp, method = exc.partial, f"{kind}-truncated"
+                    logmsg(f"truncated {kind} {name}: exact partial "
+                           f"{exc.partial}")
+                except Exception as exc:  # noqa: BLE001 — keep stored value
+                    logmsg(f"stream fallback {name}: {type(exc).__name__}: "
+                           f"{str(exc)[:120]}")
     except Exception as exc:  # noqa: BLE001
         err = type(exc).__name__
         method, uncomp = f"err:{err}", clen
         logmsg(f"ERROR {name}: {err}: {str(exc)[:160]}")
     return {"name": name, "clen": clen, "uncomp": uncomp, "method": method,
             "kind": kind, "etag": etag, "svc": svc, "cached": False, "err": err}
+
+
+def coverage_class(kind, method, name):
+    """Verification bucket for a row — computed from (kind, method, name)
+    alone so cached replays classify identically to fresh measurements.
+    measured  = the number is a byte count we (or the listing) observed:
+                exact streams, truncated-stream partials, trivial blobs, and
+                loose stored files (content-length IS their logical size).
+    trusted   = the number comes from metadata we did not verify: zip CDs,
+                gz trailers, bz2/xz stored placeholders, err:* floors.
+    unmeasurable = compressed formats with no stdlib codec (.7z/.rar/.zst) —
+                counted at stored size, surfaced per-format."""
+    if method.startswith("err:"):
+        return "trusted"
+    if kind == "stored":
+        return "unmeasurable" if unmeasurable_ext(name) else "measured"
+    if kind == "zip":
+        if (method in ("zip-exact", "zip-tiny", "zip:0entries")
+                or method.startswith("zip-exact-mismatch")):
+            return "measured"
+        return "trusted"
+    if kind == "gz":
+        return ("measured" if method in ("gz-exact", "gz-truncated", "gz-tiny")
+                else "trusted")
+    # bz2 / xz
+    return ("measured" if method.endswith(("-exact", "-truncated"))
+            else "trusted")
+
+
+def _method_streamed(method):
+    """Rows whose value came from a full streaming pass this run — the
+    egress ledger (verification.stream_compressed_bytes) counts their clen
+    when not served from cache."""
+    return (method in ("gz-exact", "gz-truncated", "bz2-exact",
+                       "bz2-truncated", "xz-exact", "xz-truncated",
+                       "zip-exact")
+            or method.startswith(("zip-exact-mismatch", "zip-partial(")))
 
 
 class Aggregator:
@@ -771,6 +1108,11 @@ class Aggregator:
         self.cache_hits = self.cache_misses = 0
         self.gz_streamed = self.gz_streamed_bytes = 0
         self.gz_uncertain = self.gz_uncertain_bytes = 0
+        self.ver = {"measured": [0, 0], "trusted": [0, 0],
+                    "unmeasurable": [0, 0]}         # [blobs, unc_bytes]
+        self.unmeasurable_fmt = defaultdict(lambda: [0, 0])  # ext → [blobs, bytes]
+        self.cd_mismatches = 0
+        self.stream_comp_bytes = 0
         self.matcher = matcher
         self.tsv = open(tsv_path, "w", buffering=1)
         self.tsv.write(f"#matcher\t{fingerprint}\n")
@@ -801,8 +1143,22 @@ class Aggregator:
             self.err_types[r["err"]] += 1
         if r["cached"]:
             self.cache_hits += 1
-        elif r["kind"] in CACHEABLE_KINDS:
+        elif r["kind"] in CACHEABLE_KINDS and not r.get("no_http"):
+            # shallow bz2/xz placeholder rows did no fetch: neither hit nor
+            # miss, so "mass misses on a warm run = re-upload" stays honest
             self.cache_misses += 1
+        cls = coverage_class(r["kind"], r["method"], name)
+        v = self.ver[cls]
+        v[0] += 1
+        v[1] += uncomp
+        if cls == "unmeasurable":
+            fmt = self.unmeasurable_fmt[unmeasurable_ext(name) or "?"]
+            fmt[0] += 1
+            fmt[1] += clen
+        if r["method"].startswith("zip-exact-mismatch"):
+            self.cd_mismatches += 1
+        if not r["cached"] and _method_streamed(r["method"]):
+            self.stream_comp_bytes += clen
         if r["kind"] == "gz":
             if r["method"] == "gz-exact" and not r["cached"]:
                 self.gz_streamed += 1
@@ -883,14 +1239,23 @@ def enumerate_and_size(cache, matcher):
                          "svc": {}, "cached": False, "err": None})
             return
         hit = cache_lookup(cache, name, etag, clen)
-        if hit and kind == "gz" and gz_cached_row_stale(hit[3], clen, hit[2]):
-            hit = None  # one-time re-measure under the current trigger
+        if hit and cached_row_stale(kind, hit[3], clen, hit[2]):
+            hit = None  # one-time re-measure under the current trigger/mode
         if hit:
             _etag, _clen, uncomp, method, det = hit
             results.put({"name": name, "clen": clen, "uncomp": uncomp,
                          "method": method, "kind": kind, "etag": etag,
                          "svc": json.loads(det) if det else {},
                          "cached": True, "err": None})
+            return
+        if kind in ("bz2", "xz") and not DEEP_VERIFY:
+            # shallow: no cheap trailer exists — content-length placeholder,
+            # zero HTTP, no pool. Cached (so deep-exact rows replay later and
+            # these replay tomorrow) but flagged no_http for the miss counter.
+            results.put({"name": name, "clen": clen, "uncomp": clen,
+                         "method": f"{kind}-stored", "kind": kind,
+                         "etag": etag, "svc": {}, "cached": False,
+                         "err": None, "no_http": True})
             return
         inflight.acquire()
         fut = size_pool.submit(size_blob, name, clen, etag, kind, matcher, budget)
@@ -966,6 +1331,18 @@ def write_summary(agg, dur_s):
                      f"({agg.gz_streamed_bytes/1e9:.2f} GB), "
                      f"{agg.gz_uncertain} uncertain "
                      f"({agg.gz_uncertain_bytes/1e9:.2f} GB compressed)")
+    if DEEP_VERIFY:
+        m_blobs, m_bytes = agg.ver["measured"]
+        t_blobs, t_bytes = agg.ver["trusted"]
+        u_blobs, u_bytes = agg.ver["unmeasurable"]
+        pct = (m_bytes / tu * 100) if tu else 100.0
+        lines.insert(lines.index(""),
+                     f"verification: {pct:.1f}% of bytes measured exact "
+                     f"({m_blobs} blobs); trusted {t_blobs} blobs "
+                     f"({t_bytes/1e9:.2f} GB); unmeasurable {u_blobs} blobs "
+                     f"({u_bytes/1e9:.2f} GB); cd mismatches "
+                     f"{agg.cd_mismatches}; streamed "
+                     f"{agg.stream_comp_bytes/1e9:.2f} GB compressed")
     for k in sorted(agg.per, key=lambda k: -agg.per[k][2]):
         f_, c_, u_ = agg.per[k]
         r_ = (u_ / c_) if c_ else 0.0
@@ -995,6 +1372,20 @@ def write_summary(agg, dur_s):
             agg.detected.items(), key=lambda kv: -kv[1]["bytes"])},
         "sources_l2": rollup_l2(agg.l2),
     }
+    if DEEP_VERIFY:
+        machine["verification"] = {
+            "deep": True,
+            "measured_blobs": agg.ver["measured"][0],
+            "measured_bytes": agg.ver["measured"][1],
+            "trusted_blobs": agg.ver["trusted"][0],
+            "trusted_bytes": agg.ver["trusted"][1],
+            "unmeasurable_blobs": agg.ver["unmeasurable"][0],
+            "unmeasurable_bytes": agg.ver["unmeasurable"][1],
+            "unmeasurable_by_format": {k: list(v) for k, v in
+                                       sorted(agg.unmeasurable_fmt.items())},
+            "cd_mismatches": agg.cd_mismatches,
+            "stream_compressed_bytes": agg.stream_comp_bytes,
+        }
     with open(SUMMARY_JSON, "w") as f:
         json.dump(machine, f, separators=(",", ":"))
         f.write("\n")

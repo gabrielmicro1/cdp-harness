@@ -242,6 +242,9 @@ def build_html(s: dict) -> str:
             f"stalled · no growth in {s['days_since_change']:.0f} days", "err"))
     if not s["expected_confirmed"]:
         header_badges.append(badge("manifest figures unconfirmed", "warn"))
+    if s.get("deep_verified_at"):
+        header_badges.append(badge(
+            f"deep-verified {s['deep_verified_at'][:10]}", "ok"))
 
     kpis = []
     pct_txt = f"{pct:.1f}%" if pct is not None else "—"
@@ -279,6 +282,11 @@ def build_html(s: dict) -> str:
                     f'{run["errors"]["total"]} sizing errors')
         if run.get("method") == "copied-forward":
             run_meta += " · unchanged since last full sizing (copied forward)"
+        ver = s.get("verification")
+        if ver:
+            run_meta += (f' · deep-verified: {ver["measured_blobs"]:,} blobs / '
+                         f'{common.human_bytes(ver["measured_bytes"])} '
+                         f'stream-measured')
 
     notes_html = ""
     if s["notes"]:

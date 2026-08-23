@@ -36,7 +36,14 @@ scan, error counts surfaced). Your job is the **judgment layer** on top:
    or ambiguous checklist; a wrongly-closed company silently drops out of the
    morning stall radar.
 
-Tolerance is a parameter. For a run with a `gz` field (new-style, post
+Tolerance is a parameter. For a run carrying a `verification` block (a
+deep-verify pass ran — see the deep-verify skill): the totals are stream
+MEASUREMENTS, not metadata estimates. With `trusted_bytes` and
+`unmeasurable_bytes` both 0, do NOT loosen tolerance — a shortfall is real
+data that never arrived. A nonzero residual is quantified per bucket; only
+that residual can justify loosening, and the `deep_verify` check in the
+output (informational, never gating) carries the numbers. For a run with a
+`gz` field (new-style, post
 gz-accuracy-tiers), only loosen it when `gz.uncertain` is nonzero — that
 field quantifies exactly how many bytes are still trailer-floored and
 unmeasured (budget-exhausted or streaming-failed) after exact-streaming ran,

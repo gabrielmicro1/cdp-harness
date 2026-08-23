@@ -1282,6 +1282,218 @@ def main() -> int:
         (sizer.GZ_STREAM_BUDGET, sizer.GZ_STREAM_THRESHOLD,
          sizer.GZ_STREAM_FLOOR_MIN) = _saved_gz_globals2
 
+    print("\n— deep verify: sizer end-to-end (shallow→deep→warm→shallow) —")
+    import bz2 as _bz2
+    import lzma as _lzma
+    tam = bytearray(make_zip({"t.txt": 4000}))
+    _p = bytes(tam).find(struct.pack("<I", 0x02014b50))
+    tam[_p + 24:_p + 28] = struct.pack("<I", 123456)  # CD usize lie
+    dv = {
+        "src/ok.zip": make_zip({"docs/a.txt": 5000, "b.txt": 1200}),
+        "src/tampered.zip": bytes(tam),
+        "src/multi.bz2": _bz2.compress(b"A" * 10000) + _bz2.compress(b"B" * 20000),
+        "src/data.xz": _lzma.compress(b"C" * 30000),
+        "src/trunc.bz2": _bz2.compress(b"D" * 50000)[:-10],
+        "src/notxz.xz": b"garbage, not xz at all!!",
+        "src/arch.7z": b"7z" + b"\x00" * 104,
+        "src/logs.gz": gzip.compress(b"E" * 40000),
+        "src/plain.txt": b"F" * 777,
+    }
+    dv_etags = {n: f"0xD{i:02d}" for i, n in enumerate(sorted(dv))}
+    dv_counters = {"range_gets": 0, "streams": 0}
+
+    def dv_listing(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        prefix = q.get("prefix", [""])[0]
+        delim = q.get("delimiter", [""])[0]
+        blobs, prefs, seen = [], [], set()
+        for n in sorted(n for n in dv if n.startswith(prefix)):
+            rest = n[len(prefix):]
+            if delim and delim in rest:
+                p = prefix + rest.split(delim)[0] + delim
+                if p not in seen:
+                    seen.add(p)
+                    prefs.append(p)
+                continue
+            blobs.append(n)
+        parts = ["<EnumerationResults><Blobs>"]
+        for n in blobs:
+            parts.append(f"<Blob><Name>{n}</Name><Properties>"
+                         f"<Content-Length>{len(dv[n])}</Content-Length>"
+                         f"<Etag>{dv_etags[n]}</Etag></Properties></Blob>")
+        for p in prefs:
+            parts.append(f"<BlobPrefix><Name>{p}</Name></BlobPrefix>")
+        parts.append("</Blobs><NextMarker/></EnumerationResults>")
+        return "".join(parts).encode()
+
+    def dv_http(url, extra_headers=None):
+        if "comp=list" in url:
+            return dv_listing(url)
+        name = urllib.parse.unquote(
+            url.split("/deep-raw/", 1)[1].split("?", 1)[0])
+        data = dv[name]
+        rng = (extra_headers or {}).get("Range")
+        if rng:
+            dv_counters["range_gets"] += 1
+            a, b = rng[len("bytes="):].split("-")
+            return data[int(a):int(b) + 1]
+        return data
+
+    def dv_stream(name, chunk=1 << 20):
+        dv_counters["streams"] += 1
+        data = dv[name]
+        for i in range(0, len(data), 997):  # odd size exercises boundaries
+            yield data[i:i + 997]
+
+    dwork = tmp / "deep-work"
+    dwork.mkdir()
+    denv = {"SA": "fakesa", "CONTAINER": "deep-raw", "SAS": "sig=x",
+            "TAG": "deepco", "OUT_DIR": str(dwork),
+            "SIZER_WORKERS": "4", "LIST_WORKERS": "2"}
+    os.environ.update(denv)
+    for k in ("CACHE_FILE", "SEED_TSV", "DEEP_VERIFY", "EXPECTED_SERVICES"):
+        os.environ.pop(k, None)
+    real_http_dv, real_stream_dv = sizer.http_get, sizer.stream_blob_chunks
+
+    def dv_tsv():
+        rows = {}
+        for line in (dwork / "deepco.sizes.tsv").read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            f = line.split("\t")
+            rows[f[0]] = (int(f[1]), int(f[2]), f[4])  # clen, uncomp, method
+        return rows
+
+    def dv_reset(cache_from_index: bool):
+        cache_path = tmp / "deepco-cache.tsv.gz"
+        if cache_from_index:
+            shutil.copy(dwork / "deepco.index.tsv.gz", cache_path)
+            os.environ["CACHE_FILE"] = str(cache_path)
+        else:
+            os.environ.pop("CACHE_FILE", None)
+        for f in dwork.glob("deepco.*"):
+            f.unlink()
+        dv_counters["range_gets"] = dv_counters["streams"] = 0
+
+    try:
+        sizer.http_get = dv_http
+        sizer.stream_blob_chunks = dv_stream
+
+        # ── phase 1: SHALLOW cold — bz2/xz are zero-HTTP placeholders ──
+        sizer.main()
+        s_sh = json.loads((dwork / "deepco.summary.json").read_text())
+        t1 = dv_tsv()
+        check("shallow: no verification block in summary",
+              "verification" not in s_sh)
+        check("shallow: bz2/xz placeholders, zero HTTP for them",
+              t1["src/multi.bz2"][2] == "bz2-stored"
+              and t1["src/multi.bz2"][1] == t1["src/multi.bz2"][0]
+              and t1["src/data.xz"][2] == "xz-stored"
+              and dv_counters["streams"] == 0
+              and dv_counters["range_gets"] == 5,  # 2 zips×2 + 1 gz trailer
+              f"{t1} ranges={dv_counters['range_gets']}")
+        check("shallow: methods histogram gains bz2/xz kinds",
+              s_sh["methods"] == {"zip": 2, "gz": 1, "bz2": 2, "xz": 2,
+                                  "stored": 2}, str(s_sh["methods"]))
+        check("shallow: placeholder rows are neither hits nor misses",
+              s_sh["cache"] == {"hits": 0, "misses": 3}, str(s_sh["cache"]))
+        check("shallow: tampered zip trusts the lying CD (by design)",
+              t1["src/tampered.zip"][1] == 123456,
+              str(t1["src/tampered.zip"]))
+
+        # ── phase 2: DEEP seeded from the shallow index — every
+        # metadata-trusted row is stale and re-measured ──
+        dv_reset(cache_from_index=True)
+        os.environ["DEEP_VERIFY"] = "1"
+        sizer.main()
+        s_dp = json.loads((dwork / "deepco.summary.json").read_text())
+        t2 = dv_tsv()
+        check("deep: every compressed blob streamed (shallow rows stale)",
+              dv_counters["streams"] == 7 and s_dp["cache"]["hits"] == 0
+              and s_dp["cache"]["misses"] == 7,
+              f"streams={dv_counters['streams']} cache={s_dp['cache']}")
+        check("deep: zip measured exact",
+              t2["src/ok.zip"][2] == "zip-exact"
+              and t2["src/ok.zip"][1] == 6200, str(t2["src/ok.zip"]))
+        check("deep: CD mismatch — streamed value wins, method carries cd=",
+              t2["src/tampered.zip"][2] == "zip-exact-mismatch(cd=123456)"
+              and t2["src/tampered.zip"][1] == 4000,
+              str(t2["src/tampered.zip"]))
+        check("deep: multi-stream bz2 + xz exact",
+              t2["src/multi.bz2"][1] == 30000
+              and t2["src/multi.bz2"][2] == "bz2-exact"
+              and t2["src/data.xz"][1] == 30000
+              and t2["src/data.xz"][2] == "xz-exact")
+        check("deep: truncated bz2 → exact partial",
+              t2["src/trunc.bz2"][2] == "bz2-truncated"
+              and 0 < t2["src/trunc.bz2"][1] < 50000,
+              str(t2["src/trunc.bz2"]))
+        check("deep: garbage .xz falls back to stored (trusted bucket)",
+              t2["src/notxz.xz"][2] == "xz-stored")
+        check("deep: gz streamed exact under forced knobs",
+              t2["src/logs.gz"][2] == "gz-exact"
+              and t2["src/logs.gz"][1] == 40000)
+        ver = s_dp["verification"]
+        check("deep: verification arithmetic closes against totals",
+              ver["measured_blobs"] + ver["trusted_blobs"]
+              + ver["unmeasurable_blobs"] == s_dp["blobs"]
+              and ver["measured_bytes"] + ver["trusted_bytes"]
+              + ver["unmeasurable_bytes"] == s_dp["unc"], str(ver))
+        check("deep: buckets, mismatch count, 7z residual",
+              ver["measured_blobs"] == 7 and ver["trusted_blobs"] == 1
+              and ver["cd_mismatches"] == 1
+              and ver["unmeasurable_by_format"] == {".7z": [1, 106]},
+              str(ver))
+        deep_delta = sum(t2[n][1] - t1[n][1] for n in t1)
+        check("deep: totals shift by exactly the per-blob re-measurements",
+              s_dp["unc"] == s_sh["unc"] + deep_delta
+              and t2["src/tampered.zip"][1] - t1["src/tampered.zip"][1]
+              == 4000 - 123456,
+              f"sh={s_sh['unc']} dp={s_dp['unc']} delta={deep_delta}")
+
+        # ── phase 3: DEEP warm — exact rows terminal; only the garbage
+        # xz (non-terminal xz-stored) is deliberately re-attempted ──
+        dv_reset(cache_from_index=True)
+        sizer.main()
+        s_dw = json.loads((dwork / "deepco.summary.json").read_text())
+        check("deep warm: only the non-terminal residual re-streams",
+              dv_counters["streams"] == 1 and dv_counters["range_gets"] == 0
+              and s_dw["cache"] == {"hits": 6, "misses": 1},
+              f"streams={dv_counters['streams']} cache={s_dw['cache']}")
+        # stream_compressed_bytes is the PER-RUN egress ledger (successful
+        # measurements only — the garbage xz's failed attempt ends xz-stored
+        # and is not counted); every coverage bucket must match exactly
+        cov = lambda v: {k: x for k, x in v.items()  # noqa: E731
+                         if k != "stream_compressed_bytes"}
+        check("deep warm: identical totals + coverage buckets",
+              s_dw["unc"] == s_dp["unc"]
+              and cov(s_dw["verification"]) == cov(s_dp["verification"])
+              and s_dw["verification"]["stream_compressed_bytes"] == 0,
+              f'{s_dw["verification"]} vs {s_dp["verification"]}')
+
+        # ── phase 4: SHALLOW warm from the deep index — measurements
+        # replay at zero HTTP; nothing is ever re-shallowed ──
+        os.environ.pop("DEEP_VERIFY", None)
+        dv_reset(cache_from_index=True)
+        sizer.main()
+        s_sw = json.loads((dwork / "deepco.summary.json").read_text())
+        t4 = dv_tsv()
+        check("shallow-after-deep: zero HTTP, all compressed rows replay",
+              dv_counters["streams"] == 0 and dv_counters["range_gets"] == 0
+              and s_sw["cache"] == {"hits": 7, "misses": 0},
+              f"streams={dv_counters['streams']} cache={s_sw['cache']}")
+        check("shallow-after-deep: deep totals + methods survive",
+              s_sw["unc"] == s_dp["unc"]
+              and t4["src/tampered.zip"][2] == "zip-exact-mismatch(cd=123456)"
+              and t4["src/multi.bz2"][2] == "bz2-exact"
+              and "verification" not in s_sw)
+    finally:
+        sizer.http_get, sizer.stream_blob_chunks = real_http_dv, real_stream_dv
+        for k in denv:
+            os.environ.pop(k, None)
+        for k in ("CACHE_FILE", "SEED_TSV", "DEEP_VERIFY"):
+            os.environ.pop(k, None)
+
     print("\n— local sizing end-to-end (fake sizer, real launch/poll/harvest) —")
     summary = {"sa": "stdemoco", "container": "democo-raw", "blobs": 5,
                "comp": 10, "unc": 20, "zero": 0, "errors": 1,
@@ -1315,6 +1527,15 @@ def main() -> int:
           run["gz"] == {"streamed": 2, "streamed_bytes": 900,
                         "uncertain": 1, "uncertain_bytes": 100})
     check("summary_to_run tolerates missing gz", old_run.get("gz") is None)
+    check("summary_to_run tolerates missing verification",
+          run.get("verification") is None
+          and old_run.get("verification") is None)
+    deep_mapped = phases.summary_to_run(
+        "democo", dict(summary, verification={"deep": True,
+                                              "measured_bytes": 5}),
+        {"metric": 1, "metric_at": "t"}, [])
+    check("summary_to_run verification passthrough",
+          deep_mapped["verification"] == {"deep": True, "measured_bytes": 5})
 
     fake_sizer = tmp / "fake_sizer.py"
     fake_sizer.write_text(
@@ -1438,6 +1659,64 @@ def main() -> int:
     nn = " ".join(reconcile.lore_notes(new_unc))
     check("new run: quantified note", "3" in nn and "7.5" in nn
           and "measur" in nn)
+
+    print("\n— deep verify: notes + consumers —")
+    ver_clean = {"deep": True, "measured_blobs": 9, "measured_bytes": 100,
+                 "trusted_blobs": 0, "trusted_bytes": 0,
+                 "unmeasurable_blobs": 0, "unmeasurable_bytes": 0,
+                 "unmeasurable_by_format": {}, "cd_mismatches": 0,
+                 "stream_compressed_bytes": 50}
+    vrun = dict(base_run, gz={"streamed": 0, "streamed_bytes": 0,
+                              "uncertain": 3,
+                              "uncertain_bytes": 7_500_000_000},
+                verification=ver_clean)
+    vn = " ".join(reconcile.lore_notes(vrun))
+    check("deep-verified run: certification note, gz-uncertainty suppressed",
+          "stream-decompressed" in vn and "trailer" not in vn
+          and "7.5" not in vn, vn)
+    ver_resid = dict(ver_clean, trusted_blobs=2, trusted_bytes=3_000_000_000,
+                     unmeasurable_blobs=1,
+                     unmeasurable_bytes=40_000_000_000,
+                     unmeasurable_by_format={".7z": [1, 40_000_000_000]})
+    rn = " ".join(reconcile.lore_notes(dict(vrun, verification=ver_resid)))
+    check("deep-verified run: residual note quantified per bucket",
+          "3.0 GB" in rn and "40.0 GB" in rn and ".7z" in rn, rn)
+
+    import gen_report
+    import verify_completion as vc
+    democo_status_snap = (root / "democo" / "status.json").read_text()
+    res_nodeep = vc.verify(root, "democo", 0.5)
+    check("verify_completion: no deep run → informational, still passing",
+          res_nodeep["checks"]["deep_verify"]["pass"] is True
+          and res_nodeep["checks"]["deep_verify"]["verified"] is False,
+          str(res_nodeep["checks"]["deep_verify"]))
+    latest_democo = common.latest_runs(root, "democo", 1)[0]
+    deep_run_file = root / "democo" / "sizing-runs" / "20270101T000000Z.json"
+    common.write_json(deep_run_file,
+                      dict(latest_democo, timestamp="2027-01-01T00:00:00Z",
+                           verification=ver_clean, notes=[]))
+    s_deep = reconcile.company_summary(root, "democo")
+    check("company_summary exposes verification + deep_verified_at",
+          s_deep["verification"] == ver_clean
+          and s_deep["deep_verified_at"] == "2027-01-01T00:00:00Z")
+    html_deep = gen_report.build_html(s_deep)
+    check("report renders deep-verified badge + run_meta line",
+          "deep-verified 2027-01-01" in html_deep
+          and "stream-measured" in html_deep)
+    res_deep = vc.verify(root, "democo", 0.5)
+    dvchk = res_deep["checks"]["deep_verify"]
+    check("verify_completion deep check populated, never in hard gates",
+          dvchk["verified"] is True and dvchk["pass"] is True
+          and dvchk["measured_pct_of_bytes"] == 100.0
+          and res_deep["verdict"] == res_nodeep["verdict"],
+          str(dvchk))
+    cf_deep_path = phases.write_copied_forward_run(root, "democo", 5, "t9")
+    cf_deep = common.read_json(cf_deep_path)
+    check("copied-forward carries verification",
+          cf_deep["verification"] == ver_clean)
+    cf_deep_path.unlink()
+    deep_run_file.unlink()
+    (root / "democo" / "status.json").write_text(democo_status_snap)
 
     print("\n— fleet_size --dry-run —")
     proc = run_script("fleet_size.py", "launch-all", "--root", root,
@@ -1834,6 +2113,109 @@ def main() -> int:
           "AWS_SECRET_ACCESS_KEY" not in flat_src
           and "AWS_ACCESS_KEY_ID" not in flat_src
           and "argv" not in flat_src.split("def main")[0])
+
+    print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
+    proc = run_script("deep_verify.py", "step", "democo", "--root", root,
+                      "--dry-run")
+    out = proc.stdout
+    check("step dry-run creates deepv VM with purpose tag",
+          "az vm create" in out and "deepv-democo" in out
+          and "purpose=deep-verify" in out)
+    check("step dry-run pipes bootstrap over ssh stdin (redacted)",
+          "sudo bash -s" in out and "redacted" in out)
+    check("step dry-run reads UsedCapacity for the run stamp",
+          "UsedCapacity" in out)
+    check("step dry-run reports vm-created phase",
+          '"phase": "vm-created"' in out)
+    check("step dry-run never mints a write SAS", "racwl" not in out)
+    proc = run_script("deep_verify.py", "teardown", "democo", "--root", root,
+                      "--dry-run", expect_rc=2)
+    check("teardown refuses without --confirmed",
+          "not-confirmed" in proc.stdout)
+    proc = run_script("deep_verify.py", "status", "democo", "--root", root,
+                      "--dry-run")
+    check("status dry-run reports pre-create",
+          '"phase": "pre-create"' in proc.stdout)
+
+    print("\n— deep_verify harvest (fake ssh, real run-file plumbing) —")
+    from types import SimpleNamespace
+    import deep_verify as dvmod
+    import transfer_engine as engmod
+    dsum = {"sa": "stdemoco", "container": "democo-raw", "blobs": 2,
+            "comp": 10, "unc": 30, "zero": 0, "errors": 0, "err_types": {},
+            "methods": {"zip": 1, "stored": 1}, "dur_s": 7,
+            "src": {"a": [2, 10, 30]}, "cache": {"hits": 0, "misses": 1},
+            "gz": {"streamed": 0, "streamed_bytes": 0,
+                   "uncertain": 0, "uncertain_bytes": 0},
+            "detected_services": {}, "sources_l2": {},
+            "verification": {"deep": True, "measured_blobs": 2,
+                             "measured_bytes": 30, "trusted_blobs": 0,
+                             "trusted_bytes": 0, "unmeasurable_blobs": 0,
+                             "unmeasurable_bytes": 0,
+                             "unmeasurable_by_format": {},
+                             "cd_mismatches": 0,
+                             "stream_compressed_bytes": 10}}
+    dv_index_bytes = gzip.compress(
+        b"#matcher\tabc\nzz.zip\t0xF\t10\t30\tzip-exact\t\n")
+    fake_vm = {"name": "deepv-democo", "power_state": "VM running",
+               "public_ip": "9.9.9.9",
+               "tags": {"used_capacity": "4321", "used_capacity_at": "cap-at"},
+               "location": "eastus"}
+
+    def fake_ssh(ip, cmd, stdin_data=None, dry_run=False, timeout=120,
+                 check=True):
+        import base64 as _b64
+        out = ""
+        if "test -e" in cmd and ".done" in cmd:
+            out = "yes"
+        elif cmd.startswith("cat") and "summary.json" in cmd:
+            out = json.dumps(dsum)
+        elif cmd.startswith("base64 <"):
+            out = _b64.b64encode(dv_index_bytes).decode()
+        elif "tmux has-session" in cmd:
+            out = "dead"
+        return subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+
+    torn = []
+    saved_eng = (engmod.run_ssh, engmod.get_vm, engmod.set_subscription,
+                 engmod.cmd_teardown)
+    democo_status_snap2 = (root / "democo" / "status.json").read_text()
+    try:
+        engmod.run_ssh = fake_ssh
+        engmod.get_vm = lambda spec, cfg, slug, dry: dict(fake_vm)
+        engmod.set_subscription = lambda cfg, dry: None
+        engmod.cmd_teardown = lambda spec, r_, a: (
+            torn.append(a.slug) or {"ok": True,
+                                    "deleted": ["vm:deepv-democo"]})
+        ns = SimpleNamespace(slug="democo", dry_run=False, no_cache=False,
+                             workers=16, list_workers=8, sas_days=1,
+                             keep_vm=False, confirmed=False, force=False,
+                             rg=None, vm_size="Standard_D8s_v7",
+                             os_disk_gb=None, dest_prefix="", container=None,
+                             used_capacity=None, used_capacity_at=None)
+        n_before = len(common.sizing_runs(root, "democo"))
+        res = dvmod.cmd_step(root, ns)
+        check("fake-ssh harvest: phase complete, run file written",
+              res["phase"] == "complete"
+              and len(common.sizing_runs(root, "democo")) == n_before + 1,
+              str(res)[:300])
+        hr = common.read_json(Path(res["run_file"]))
+        check("harvested run: sized + verification + capacity from VM tags",
+              hr["method"] == "sized"
+              and hr["verification"]["measured_bytes"] == 30
+              and hr["used_capacity_bytes"] == 4321
+              and hr["used_capacity_at"] == "cap-at"
+              and "deep verify on VM deepv-democo" in hr["notes"][0])
+        dv_idx = root / "democo" / "blob-index.tsv.gz"
+        check("harvest replaced company blob-index from the VM",
+              dv_idx.exists()
+              and "zip-exact" in gzip.open(dv_idx, "rt").read())
+        check("auto-teardown ran after harvest", torn == ["democo"])
+        Path(res["run_file"]).unlink()
+    finally:
+        (engmod.run_ssh, engmod.get_vm, engmod.set_subscription,
+         engmod.cmd_teardown) = saved_eng
+        (root / "democo" / "status.json").write_text(democo_status_snap2)
 
     print("\n— qwilr_transfer --dry-run (first VM-less ingest) —")
     proc = run_script("qwilr_transfer.py", "plan", "democo", "--root", root)
