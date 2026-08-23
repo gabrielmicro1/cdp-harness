@@ -1810,6 +1810,8 @@ def main() -> int:
           and "rm -f inflight/*" in proc.stdout)
     check("runner: L job runs the put-from-url engine, Q streams files-from",
           'copy-chunk "$jprefix"' in runner
+          # --no-traverse or rclone enumerates the whole dest prefix
+          and "--no-traverse" in runner
           and "--overwrite=false" in runner  # R jobs keep the azcopy pin
           and '--files-from "$BASE/chunks/$jprefix"' in runner)
     check("runner: list-bucket verb + flat verify auto-select",

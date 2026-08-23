@@ -98,9 +98,13 @@ worker() {
         elif [ "$jtype" = "Q" ]; then
             # Q job: quarantine manifest — keys whose names azcopy list
             # files can't be trusted with stream via rclone --files-from
+            # --no-traverse is MANDATORY here: without it rclone lists the
+            # whole destination prefix to build its check list — 2h+ and
+            # still going for 21 files against a 242M-blob dest (measured
+            # live). With it, rclone stats only the named objects.
             rclone copy "s3:$S3_BUCKET" \
                 "azure:$AZURE_DEST_CONTAINER/$AZURE_DEST_PREFIX" \
-                --files-from "$BASE/chunks/$jprefix" \
+                --files-from "$BASE/chunks/$jprefix" --no-traverse \
                 --transfers 16 --checkers 16 --retries 5 \
                 --log-file "$BASE/logs/shallow-w$n.log" --log-level ERROR
             rc=$?
