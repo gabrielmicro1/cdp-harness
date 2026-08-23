@@ -602,6 +602,16 @@ def cmd_status(root: Path, args) -> dict:
             if detail.get("bytes_done") else None, **detail}
 
 
+def _verify_stale(done_line: str, ledger_ts: str) -> bool:
+    """True when copy jobs finished AFTER the verify that produced
+    done_line — its numbers no longer describe the container."""
+    try:
+        verify_ts = int(done_line.split("\t")[1])
+        return int(ledger_ts or 0) > verify_ts
+    except (IndexError, ValueError):
+        return False
+
+
 def cmd_verify(root: Path, args) -> dict:
     """Tier-1: per-job count+byte rollup S3 vs Azure (listing-only), run in
     a tmux window; --deep adds rclone check --size-only. Size-match is the
@@ -634,9 +644,19 @@ def cmd_verify(root: Path, args) -> dict:
                 "counts/bytes differ — re-run transfer (resume is safe), "
                 "then re-verify"}
     windows = _tmux_windows(ip, args.dry_run)
-    state = eng.run_ssh(ip, f"tail -1 {XFER_DIR}/verify.tsv 2>/dev/null",
-                        dry_run=args.dry_run, check=False)
-    last = (state.stdout or "").strip()
+    # LAST= / LEDGER= markers, never line positions: an empty field must
+    # not be able to masquerade as the next one
+    state = eng.run_ssh(
+        ip, f"echo \"LAST=$(tail -1 {XFER_DIR}/verify.tsv 2>/dev/null)\"; "
+            f"echo \"LEDGER=$(cat {XFER_DIR}/done.txt {XFER_DIR}/failed.txt "
+            "2>/dev/null | awk -F'\\t' '{if ($1+0 > m) m = $1+0} "
+            "END {print m+0}')\"",
+        dry_run=args.dry_run, check=False)
+    out_lines = (state.stdout or "").splitlines()
+    last = next((l[5:] for l in out_lines if l.startswith("LAST=")),
+                "").strip()
+    ledger_ts = next((l[7:] for l in out_lines if l.startswith("LEDGER=")),
+                     "0").strip()
     if args.dry_run:
         pass
     elif last.startswith("#error"):
@@ -645,6 +665,14 @@ def cmd_verify(root: Path, args) -> dict:
                 "hint": "the flat comparator hit a listing-order violation "
                         "— inspect verify.tsv and plan.log on the VM "
                         "before re-running verify"}
+    elif last.startswith("#done") and _verify_stale(last, ledger_ts):
+        # copy work landed AFTER this verify finished (e.g. a mop-up):
+        # collecting would report stale numbers as if they were fresh —
+        # the one way this command could certify the wrong thing
+        eng.run_ssh(ip, f"mv {XFER_DIR}/verify.tsv "
+                        f"{XFER_DIR}/verify.tsv.superseded.$(date +%s)",
+                    check=False)
+        last = ""  # fall through to the launch path below
     elif last.startswith("#done"):
         parts = dict(kv.split("=") for kv in last.split("\t")[2:]
                      if "=" in kv)

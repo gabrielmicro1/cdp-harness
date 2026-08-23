@@ -1990,6 +1990,12 @@ def main() -> int:
                       "--root", root, "--dry-run")
     check("s3 verify: rollup runs VM-side via the runner",
           "runner.sh verify" in proc.stdout)
+    _done = "#done\t1000\tok=1\tbad=0"
+    check("s3 verify: a finished verify older than the ledger is stale",
+          s3_transfer._verify_stale(_done, "2000") is True
+          and s3_transfer._verify_stale(_done, "500") is False
+          and s3_transfer._verify_stale("#done", "9") is False
+          and s3_transfer._verify_stale(_done, "junk") is False)
     runner = (SCRIPTS / "azcopy-runner.sh").read_text()
     check("runner pins the write invariant + plan-disk hygiene",
           "--overwrite=false" in runner and "--recursive" in runner
