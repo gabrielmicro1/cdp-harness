@@ -2106,7 +2106,25 @@ def main() -> int:
     check("runner: list-bucket verb + flat verify auto-select",
           "list-bucket)" in runner and "s3_flat.py" in runner
           and "grep -qm1 $'^L\\t'" in runner)
+    _rows = [("v3", 100, "AAA", True), ("v2", 100, "AAA", False),
+             ("v1", 250, "BBB", False), ("v0", 250, "BBB", False)]
+    _sel, _skip = s3_flat.select_distinct_versions(_rows)
+    check("versions: byte-identical re-uploads skipped, distinct kept",
+          [v for v, _, _ in _sel] == ["v1"]
+          and sorted(v for v, _, _ in _skip) == ["v0", "v2"],
+          f"sel={_sel} skip={_skip}")
+    _sel2, _ = s3_flat.select_distinct_versions(
+        [("v1", 10, "X", False), ("v2", 10, "X", False)])
+    check("versions: no current version -> first distinct still selected",
+          [v for v, _, _ in _sel2] == ["v1"])
+    check("versions: blob name is _noncurrent/<key>/<versionId>",
+          s3_flat.version_blob_name("a/b.jpg", "VID")
+          == "_noncurrent/a/b.jpg/VID")
     flat_src = (SCRIPTS / "s3_flat.py").read_text()
+    check("runner: V jobs share L's summary parsing (ledger stays populated)",
+          'copy-versions "$jprefix"' in runner
+          and '[ "$jtype" = "V" ]' in runner
+          and 'Transfers Completed' in flat_src)
     check("s3_flat copy engine: API-enforced create-only server-side copy",
           '"If-None-Match": "*"' in flat_src
           and "x-ms-copy-source" in flat_src
@@ -2123,6 +2141,148 @@ def main() -> int:
           "AWS_SECRET_ACCESS_KEY" not in flat_src
           and "AWS_ACCESS_KEY_ID" not in flat_src
           and "argv" not in flat_src.split("def main")[0])
+
+    print("\n— github_transfer --dry-run (engine lifecycle, VM-side puller) —")
+    import github_transfer  # noqa: E402
+    import github_vm_pull  # noqa: E402
+    check("github Spec: PAT flow (no OAuth), no rclone source, 512 GB disk",
+          github_transfer.SPEC.vm_prefix == "xfer-gh-"
+          and github_transfer.SPEC.authorize_target == ""
+          and github_transfer.SPEC.remote_type == ""
+          and github_transfer.SPEC.default_dest_prefix == "github-export"
+          and github_transfer.SPEC.default_os_disk_gb == 512)
+    proc = run_script("github_transfer.py", "plan", "democo",
+                      "--login", "demo-org", "--root", root, "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("github plan: xfer-gh VM + github-export dest + login source",
+          plan["vm_name"] == "xfer-gh-democo"
+          and plan["dest"] == "democo-raw/github-export"
+          and plan["source"] == "github:demo-org")
+    proc = run_script("github_transfer.py", "create-vm", "democo",
+                      "--login", "demo-org", "--owner-type", "org",
+                      "--root", root, "--dry-run")
+    check("github create-vm: 512 GB staging disk + login/owner tags",
+          "--os-disk-size-gb 512" in proc.stdout
+          and "purpose=github-transfer" in proc.stdout
+          and "gh_login=demo-org" in proc.stdout
+          and "gh_owner_type=org" in proc.stdout
+          and "-n xfer-gh-democo" in proc.stdout)
+    proc = run_script("github_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("github allow-network: vnet path (VM family), never IP rules",
+          "network-rule add" in proc.stdout and "--subnet" in proc.stdout
+          and "--ip-address" not in proc.stdout)
+    proc = run_script("github_transfer.py", "write-dest", "democo",
+                      "--root", root, "--dry-run")
+    check("github write-dest: racwl SAS, both consumers, redacted",
+          "--permissions racwl" in proc.stdout
+          and "rclone.conf" in proc.stdout and "dest.env" in proc.stdout
+          and "redacted" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "github_transfer.py"), "write-token",
+         "democo", "--root", str(root), "--dry-run"],
+        input="ghp_SENTINELTOKEN\n", capture_output=True, text=True)
+    check("github write-token: PAT sentinel never echoed",
+          proc.returncode == 0 and "ghp_SENTINELTOKEN" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "github_transfer.py"), "write-token",
+         "democo", "--root", str(root), "--dry-run"],
+        input="line-one\nline-two\n", capture_output=True, text=True)
+    check("github write-token: refuses malformed stdin (must be 1 line)",
+          proc.returncode == 1 and "1 line" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "github_transfer.py"), "probe",
+         "democo", "--login", "demo-org", "--root", str(root), "--dry-run"],
+        input="ghp_SENTINELTOKEN\n", capture_output=True, text=True)
+    check("github probe: laptop-side API JSON only, token redacted",
+          proc.returncode == 0
+          and "api.github.com/rate_limit" in proc.stdout
+          and "token-redacted" in proc.stdout
+          and "ghp_SENTINELTOKEN" not in proc.stdout
+          and "az vm" not in proc.stdout, proc.stdout[-300:])
+    proc = run_script("github_transfer.py", "transfer", "democo",
+                      "--login", "demo-org", "--root", root, "--dry-run")
+    check("github transfer: pushes puller, tmux pull window, envs sourced",
+          "github_vm_pull.py" in proc.stdout
+          and "tmux new-session -d -s transfer -n pull" in proc.stdout
+          and "github.env" in proc.stdout and "dest.env" in proc.stdout)
+    proc = run_script("github_transfer.py", "verify", "democo",
+                      "--root", root, "--dry-run")
+    check("github verify: laptop path — ip rule + rl SAS + manifest fetch",
+          "--permissions rl" in proc.stdout
+          and "network-rule add" in proc.stdout
+          and "manifest.json" in proc.stdout
+          and "racwl" not in proc.stdout)
+    proc = run_script("github_transfer.py", "teardown", "democo",
+                      "--root", root, "--dry-run", expect_rc=2)
+    check("github teardown also gated", '"not-confirmed"' in proc.stdout)
+    proc = run_script("github_transfer.py", "teardown", "democo",
+                      "--root", root, "--dry-run", "--confirmed")
+    check("github confirmed teardown: engine set + PAT-revocation reminder",
+          "network-rule remove" in proc.stdout
+          and "vnet delete" in proc.stdout
+          and "fine-grained PAT" in proc.stdout)
+    pull_src = (SCRIPTS / "github_vm_pull.py").read_text()
+    check("puller: askpass custody + mirror + wikis + markers + lfs detect",
+          "GIT_ASKPASS" in pull_src and "x-access-token" in pull_src
+          and "--mirror" in pull_src and ".wiki.git" in pull_src
+          and "state=all" in pull_src and ".cdp-complete" in pull_src
+          and "filter=lfs" in pull_src)
+    check("puller: azcopy no-overwrite pin, upstream's weaker flag dropped",
+          "--overwrite=false" in pull_src
+          and "ifSourceNewer" not in pull_src)
+    boot = (SCRIPTS / "bootstrap-vm.sh").read_text()
+    check("bootstrap installs git + git-lfs for the puller",
+          "git git-lfs" in boot)
+    check("puller wiki classifier: absent vs transient",
+          github_vm_pull.wiki_absent("remote: Repository not found.")
+          and github_vm_pull.wiki_absent("fatal: repo does not exist")
+          and not github_vm_pull.wiki_absent("connection reset by peer"))
+    m = github_vm_pull.build_manifest("demo-org", "org", "TS", [
+        {"repo": "a", "clone": "ok", "bytes": 100, "wiki": "ok",
+         "wiki_bytes": 10, "json": "ok"},
+        {"repo": "b", "clone": "failed", "bytes": 0, "json": "ok"},
+        {"repo": "c", "clone": "ok", "bytes": 50, "lfs": "failed",
+         "json": "ok"}])
+    check("puller manifest: failed set includes lfs failures, bytes sum",
+          m["failed_repos"] == ["b", "c"]
+          and m["total_clone_bytes"] == 160)
+    _p = "github-export"
+    _clean = {
+        f"{_p}/repos/a.git/.cdp-complete": {"size": 0},
+        f"{_p}/repos/a.git/packed-refs": {"size": 100},
+        f"{_p}/wikis/a.wiki.git/.cdp-complete": {"size": 0},
+        f"{_p}/wikis/a.wiki.git/x": {"size": 10},
+        f"{_p}/json/a/.cdp-complete": {"size": 0},
+        f"{_p}/manifest.json": {"size": 5},
+    }
+    _man = {"results": [{"repo": "a", "clone": "ok", "bytes": 100,
+                         "wiki": "ok", "wiki_bytes": 10, "json": "ok"}],
+            "failed_repos": [], "repo_count": 1, "total_clone_bytes": 110}
+    r = github_transfer.compare_manifest_to_blobs(_man, _clean, _p)
+    check("github verify math: clean pass",
+          r["ok"] and not r["short_uploads"] and not r["missing_markers"])
+    _short = dict(_clean)
+    _short[f"{_p}/repos/a.git/packed-refs"] = {"size": 40}
+    r = github_transfer.compare_manifest_to_blobs(_man, _short, _p)
+    check("github verify math: short upload fails",
+          not r["ok"] and r["short_uploads"])
+    _nomark = dict(_clean)
+    del _nomark[f"{_p}/json/a/.cdp-complete"]
+    r = github_transfer.compare_manifest_to_blobs(_man, _nomark, _p)
+    check("github verify math: missing marker fails",
+          not r["ok"] and r["missing_markers"] == [f"{_p}/json/a/"])
+    _extra = dict(_clean)
+    _extra[f"{_p}/repos/a.git/old-pack"] = {"size": 60}
+    r = github_transfer.compare_manifest_to_blobs(_man, _extra, _p)
+    check("github verify math: stale extra is informational, not a failure",
+          r["ok"] and r["stale_extra"] == [f"{_p}/repos/a.git/"])
+    _man_f = dict(_man)
+    _man_f["failed_repos"] = ["b"]
+    r = github_transfer.compare_manifest_to_blobs(_man_f, _clean, _p)
+    check("github verify math: failed_repos surfaced verbatim",
+          not r["ok"] and r["failed_repos"] == ["b"])
 
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,

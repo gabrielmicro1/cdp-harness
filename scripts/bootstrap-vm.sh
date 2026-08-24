@@ -8,7 +8,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 # python3-boto3: flat-bucket range-sharded S3 listing (s3_flat.py) — VM-only
 # dependency; laptop-side harness scripts stay stdlib-only
-apt-get install -y -qq tmux curl unzip python3-boto3 >/dev/null
+# git + git-lfs: the github-azure-transfer puller (mirror clones + LFS
+# fetch; a fetch-only path needs just the binaries, no `git lfs install`).
+# Harmless few-MB extra for the other sources.
+apt-get install -y -qq tmux curl unzip python3-boto3 git git-lfs >/dev/null
 
 if ! command -v rclone >/dev/null 2>&1; then
     curl -fsSL https://rclone.org/install.sh | bash

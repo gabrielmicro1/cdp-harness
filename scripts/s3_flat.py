@@ -210,6 +210,46 @@ class SortError(Exception):
 
 # ── S3 range-sharded listing (VM only; boto3 imported lazily) ───────────────
 
+VERSION_PREFIX = "_noncurrent"   # reserved: no live key starts with "_"
+
+
+def version_blob_name(key: str, version_id: str) -> str:
+    """Dest-relative name for a NONCURRENT version.
+
+    "<_noncurrent>/<key>/<versionId>" keeps every revision grouped under its
+    own key, preserves the client's one-folder-per-bucket layout, and cannot
+    collide with a live key (verified: no key in the manifest starts with
+    "_"). Version ids are opaque and NOT time-ordered -- ordering lives in
+    the versions manifest, never in the name."""
+    return f"{VERSION_PREFIX}/{key}/{version_id}"
+
+
+def select_distinct_versions(rows):
+    """Pure: version records for ONE key -> the noncurrent ones worth
+    copying.
+
+    rows: iterable of (version_id, size, etag, is_latest). A noncurrent
+    version is skipped when its ETag matches the current version's (a
+    byte-identical re-upload -- 85.6% of this bucket) or an already-selected
+    older revision's (duplicates among the history itself). ETag equality is
+    a sound identity test here: these are single-part objects (~196 KB avg),
+    so the ETag is the content MD5.
+
+    Returns (selected, skipped_dup) as lists of (version_id, size, etag)."""
+    current_etag = next((e for _, _, e, latest in rows if latest), None)
+    seen = {current_etag} if current_etag else set()
+    selected, skipped = [], []
+    for vid, size, etag, latest in rows:
+        if latest:
+            continue
+        if etag in seen:
+            skipped.append((vid, size, etag))
+        else:
+            seen.add(etag)
+            selected.append((vid, size, etag))
+    return selected, skipped
+
+
 def _list_shard(bucket, region, idx, start_after, end, out_dir):
     import boto3.session  # apt python3-boto3; VM-only dependency
     from botocore.config import Config
@@ -319,6 +359,226 @@ def cmd_list() -> int:
 
 
 # ── split ───────────────────────────────────────────────────────────────────
+
+def _version_shard(bucket, region, idx, start_after, end, out_dir):
+    """One KeyMarker-range shard of list_object_versions. Writes
+    "key\tversionId\tsize\tetag\tisLatest\tlastModified" rows, grouped
+    by key in listing order. KeyMarker is exclusive like StartAfter, so the
+    same range partition used for the current-object listing applies."""
+    import boto3.session
+    from botocore.config import Config
+    final = os.path.join(out_dir, f"vshard-{idx:03d}.tsv")
+    if os.path.exists(final):
+        return
+    cli = boto3.session.Session().client(
+        "s3", region_name=region or None,
+        config=Config(retries={"max_attempts": 10, "mode": "adaptive"}))
+    dm = 0
+    with open(final + ".part", "w") as f:
+        kw = {"Bucket": bucket, "MaxKeys": 1000}
+        if start_after:
+            kw["KeyMarker"] = start_after
+        done = False
+        while not done:
+            r = cli.list_object_versions(**kw)
+            for o in r.get("Versions", []):
+                key = o["Key"]
+                if end is not None and key > end:
+                    done = True
+                    break
+                if "\t" in key or "\n" in key or "\r" in key:
+                    continue
+                etag = (o.get("ETag") or "").strip('"')
+                f.write(f"{key}\t{o['VersionId']}\t{o['Size']}\t{etag}\t"
+                        f"{int(bool(o['IsLatest']))}\t"
+                        f"{o['LastModified'].strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+            for o in r.get("DeleteMarkers", []):
+                if end is None or o["Key"] <= end:
+                    dm += 1
+            if done or not r.get("IsTruncated"):
+                break
+            kw["KeyMarker"] = r["NextKeyMarker"]
+            kw["VersionIdMarker"] = r["NextVersionIdMarker"]
+    os.replace(final + ".part", final)
+    if dm:
+        with open(os.path.join(out_dir, f"deletemarkers-{idx:03d}.count"),
+                  "w") as f:
+            f.write(str(dm))
+
+
+def _version_shard_group(bucket, region, jobs, out_dir, threads):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(_version_shard, bucket, region, i, a, b, out_dir)
+                for i, a, b in jobs]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+
+
+def cmd_list_versions() -> int:
+    """Full version history -> versions.txt (all records) + versions.done."""
+    bucket = os.environ["S3_BUCKET"]
+    region = os.environ.get("AWS_REGION", "")
+    done_path = os.path.join(BASE, "versions.done")
+    if os.path.exists(done_path):
+        print(open(done_path).read().strip())
+        return 0
+    shards = int(os.environ.get("FLAT_SHARDS", DEFAULT_SHARDS))
+    workers = int(os.environ.get("FLAT_LIST_WORKERS", DEFAULT_LIST_WORKERS))
+    procs = int(os.environ.get("FLAT_LIST_PROCS", os.cpu_count() or 8))
+    out_dir = os.path.join(BASE, "vshards")
+    os.makedirs(out_dir, exist_ok=True)
+    ranges = range_bounds(shards)
+    threads = max(1, workers // max(1, procs))
+    groups: list[list] = [[] for _ in range(procs)]
+    for i, (a, b) in enumerate(ranges):
+        groups[i % procs].append((i, a, b))
+    groups = [g for g in groups if g]
+    log(f"list-versions start: {len(ranges)} shards, {len(groups)} procs x "
+        f"{threads} threads")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=procs) as ex:
+        futs = [ex.submit(_version_shard_group, bucket, region, g, out_dir,
+                          threads) for g in groups]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+    rows = 0
+    tmp = os.path.join(BASE, "versions.txt.tmp")
+    with open(tmp, "w") as out:
+        for i in range(len(ranges)):
+            with open(os.path.join(out_dir, f"vshard-{i:03d}.tsv")) as f:
+                for ln in f:
+                    out.write(ln)
+                    rows += 1
+    dms = 0
+    for name in os.listdir(out_dir):
+        if name.startswith("deletemarkers-"):
+            dms += int(open(os.path.join(out_dir, name)).read().strip() or 0)
+    os.replace(tmp, os.path.join(BASE, "versions.txt"))
+    sentinel = {"version_records": rows, "delete_markers": dms}
+    with open(done_path, "w") as f:
+        json.dump(sentinel, f)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    log(f"list-versions done: {sentinel}")
+    print(json.dumps(sentinel))
+    return 0
+
+
+def iter_key_groups(path):
+    """versions.txt (grouped by key) -> (key, [(vid, size, etag, latest)])."""
+    cur_key, rows = None, []
+    with open(path) as f:
+        for ln in f:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) < 5:
+                continue
+            key, vid, size, etag, latest = parts[0], parts[1], parts[2], parts[3], parts[4]
+            if key != cur_key:
+                if cur_key is not None:
+                    yield cur_key, rows
+                cur_key, rows = key, []
+            rows.append((vid, int(size), etag, latest == "1"))
+    if cur_key is not None:
+        yield cur_key, rows
+
+
+def cmd_split_versions(per_chunk: int, distinct_only: bool = True) -> int:
+    """versions.txt -> vchunk-NNNNN manifests of NONCURRENT versions worth
+    copying, and vjobs.txt/queue additions. Rows: key\tvid\tsize."""
+    src = os.path.join(BASE, "versions.txt")
+    if not os.path.exists(src):
+        print(json.dumps({"ok": False, "cause": "no-versions-listing"}))
+        return 1
+    tmp_dir = os.path.join(BASE, "vchunks.tmp")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir)
+    jobs, buf, ci = [], [], 0
+    sel_n = sel_b = dup_n = dup_b = 0
+
+    def flush():
+        nonlocal ci, buf
+        if not buf:
+            return
+        name = f"vchunk-{ci:05d}"
+        with open(os.path.join(tmp_dir, name), "w") as f:
+            f.writelines(buf)
+        jobs.append(f"V\t{name}\n")
+        ci += 1
+        buf = []
+
+    for key, rows in iter_key_groups(src):
+        selected, skipped = select_distinct_versions(rows)
+        dup_n += len(skipped)
+        dup_b += sum(s for _, s, _ in skipped)
+        take = selected if distinct_only else selected + skipped
+        for vid, size, _etag in take:
+            sel_n += 1
+            sel_b += size
+            buf.append(f"{key}\t{vid}\t{size}\n")
+            if len(buf) >= per_chunk:
+                flush()
+    flush()
+    final_dir = os.path.join(BASE, "vchunks")
+    shutil.rmtree(final_dir, ignore_errors=True)
+    os.replace(tmp_dir, final_dir)
+    with open(os.path.join(BASE, "vjobs.txt"), "w") as f:
+        f.writelines(jobs)
+    with open(os.path.join(BASE, "queue.txt"), "a") as f:
+        f.writelines(jobs)
+    with open(os.path.join(BASE, "jobs.txt"), "a") as f:
+        f.writelines(jobs)
+    out = {"ok": True, "version_jobs": len(jobs), "to_copy": sel_n,
+           "to_copy_bytes": sel_b, "skipped_duplicates": dup_n,
+           "skipped_duplicate_bytes": dup_b, "distinct_only": distinct_only}
+    log(f"split-versions: {out}")
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_copy_versions(name: str, concurrency: int) -> int:
+    """Copy one vchunk: presigned GET per (key, versionId) -> Put Blob From
+    URL at _noncurrent/<key>/<versionId>. Same transport, counters and
+    summary grammar as copy-chunk."""
+    import boto3.session
+    from botocore.config import Config
+    path = os.path.join(BASE, "vchunks", name)
+    if not os.path.exists(path):
+        print(f"no such version chunk: {path}", file=sys.stderr)
+        return 1
+    bucket = os.environ["S3_BUCKET"]
+    dest_url = os.environ["AZURE_DEST_URL"]
+    sas = os.environ["AZURE_DEST_SAS"]
+    cli = boto3.session.Session().client(
+        "s3", region_name=os.environ.get("AWS_REGION") or None,
+        config=Config(signature_version="s3v4"))
+    counters = _CopyCounters()
+
+    def presign_v(key, vid):
+        return cli.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key, "VersionId": vid},
+            ExpiresIn=PRESIGN_TTL)
+
+    def one(line):
+        key, vid, size = line.rstrip("\n").split("\t")
+        _copy_one(lambda _k: presign_v(key, vid), dest_url, sas,
+                  version_blob_name(key, vid), int(size), counters)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=concurrency) as ex:
+        with open(path) as f:
+            futs = [ex.submit(one, ln) for ln in f if ln.strip()]
+        for fut in concurrent.futures.as_completed(futs):
+            fut.result()
+    status = ("Failed" if counters.failed else
+              "CompletedWithSkipped" if counters.skipped else "Completed")
+    print(f"Transfers Completed: {counters.completed}")
+    print(f"Transfers Failed: {counters.failed}")
+    print(f"Transfers Skipped: {counters.skipped}")
+    print(f"Bytes Transferred: {counters.bytes}")
+    print(f"Final Job Status: {status}")
+    for err, n in sorted(counters.errors.items()):
+        print(f"error {err}: {n}")
+    return 1 if counters.failed else 0
+
 
 def cmd_split(per_chunk: int) -> int:
     listing = os.path.join(BASE, "listing.txt")
@@ -630,7 +890,8 @@ def cmd_verify() -> int:
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: s3_flat.py list | split [--per-chunk N] | verify "
-              "[deep]", file=sys.stderr)
+              "[deep] | list-versions | split-versions [--per-chunk N] "
+              "[--all] | copy-versions <vchunk> [conc]", file=sys.stderr)
         return 64
     os.makedirs(BASE, exist_ok=True)
     if argv[0] == "list":
@@ -643,6 +904,17 @@ def main(argv: list[str]) -> int:
     if argv[0] == "copy-chunk":
         conc = int(argv[2]) if len(argv) > 2 else 200
         return cmd_copy_chunk(argv[1], conc)
+    if argv[0] == "list-versions":
+        return cmd_list_versions()
+    if argv[0] == "split-versions":
+        per_chunk = 250_000
+        if "--per-chunk" in argv:
+            per_chunk = int(argv[argv.index("--per-chunk") + 1])
+        return cmd_split_versions(per_chunk,
+                                  distinct_only="--all" not in argv)
+    if argv[0] == "copy-versions":
+        conc = int(argv[2]) if len(argv) > 2 else 200
+        return cmd_copy_versions(argv[1], conc)
     if argv[0] == "verify":
         # a trailing "deep" arg is accepted and ignored: per-object
         # name+size against the manifest IS the deep check here

@@ -12,7 +12,9 @@
 # rclone copy of the LOOSE files directly at that level (the objects a
 # prefix split would otherwise orphan; these few DO stream through the VM),
 # Q = rclone --files-from copy of a quarantine manifest (keys whose names
-# azcopy list files can't be trusted with; expected ~empty).
+# azcopy list files can't be trusted with; expected ~empty),
+# V = noncurrent object VERSIONS from a vchunk manifest (presigned GET per
+# VersionId -> _noncurrent/<key>/<versionId>; L's transport and grammar).
 # ~/xfer-jobs/jobs.txt is the immutable master list (verify iterates it);
 # queue.txt is the consumable copy. --overwrite=false is pinned: the copy
 # only ever creates blobs that don't already exist, so re-running is a safe
@@ -58,8 +60,17 @@ worker() {
         printf '%s\n' "$job" > "$BASE/inflight/w$n"
         local start rc out jobid comp fail skip bytes status
         start=$(date +%s)
-        if [ "$jtype" = "R" ] || [ "$jtype" = "L" ]; then
-            if [ "$jtype" = "R" ]; then
+        if [ "$jtype" = "R" ] || [ "$jtype" = "L" ] || [ "$jtype" = "V" ]; then
+            if [ "$jtype" = "V" ]; then
+                # V: noncurrent S3 object VERSIONS — same server-side
+                # transport as L, but each presigned GET carries a VersionId
+                # and the blob lands at _noncurrent/<key>/<versionId>.
+                # Shares L's summary parsing below (same grammar) so the
+                # ledger, status and ETA stay engine-agnostic.
+                out="$(python3 "$BASE/s3_flat.py" copy-versions "$jprefix" \
+                    "$conc" 2>&1)"
+                rc=$?
+            elif [ "$jtype" = "R" ]; then
                 out="$(azcopy copy "$S3_SRC_URL/$jprefix/" \
                     "$AZURE_DEST_URL/$jprefix?$AZURE_DEST_SAS" \
                     --recursive --overwrite=false --log-level ERROR 2>&1)"

@@ -43,7 +43,7 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, s3, qwilr, vimeo, zoom) *populate* `<slug>-raw`
+   skills (gcs, dropbox, gdrive, s3, github, qwilr, vimeo, zoom) *populate* `<slug>-raw`
    from a cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on
    the local qwilr/vimeo/zoom pulls, whose writes are additionally create-only
    via `If-None-Match: *`) — they are the ingest path, not an audit path. They
@@ -94,6 +94,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   gdrive-azure-transfer/references/commands.md
   s3-azure-transfer/SKILL.md               # AWS S3 → <slug>-raw (engine VM lifecycle, azcopy server-side copy)
   s3-azure-transfer/references/commands.md
+  github-azure-transfer/SKILL.md           # GitHub org → <slug>-raw (engine VM lifecycle, VM-side git+API puller)
+  github-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
@@ -117,6 +119,8 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   s3_transfer.py             # S3 → blob via azcopy server-side copy on the VM; engine lifecycle + own copy layer
   s3_flat.py                 # VM-side flat-bucket engine: sharded listing, chunk split, manifest verify (pushed with the runner)
   azcopy-runner.sh           # VM-side azcopy job-queue worker (ssh-piped by s3_transfer.py)
+  github_transfer.py         # GitHub → blob via VM mirror-clone + azcopy; engine lifecycle + own pull layer
+  github_vm_pull.py          # VM-side puller: mirror+wiki clones, 4 JSONL exports, LFS, stage-then-azcopy (pushed like s3_flat.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
   zoom_transfer.py           # Zoom recordings → blob via Put-Block-From-URL server-side copy; local, standalone
@@ -480,14 +484,17 @@ keys), a Dropbox account, a Google Drive (My Drive or Shared Drive), or an
 AWS S3 bucket. A temporary Azure VM is the viable path for all of them.
 `scripts/transfer_engine.py` is the ONE engine; `gcs_transfer.py` /
 `dropbox_transfer.py` / `gdrive_transfer.py` are thin Spec-only CLIs over
-it (rclone-with-a-token copies), and `s3_transfer.py` reuses the engine's
-VM lifecycle but swaps the copy layer for azcopy (see below) — all driven
-by the matching `*-azure-transfer` skills. The workflow: VM
-`xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive: `xfer-gdr-<slug>`, S3:
-`xfer-s3-<slug>`, so they can run concurrently) in the company's RG and
+it (rclone-with-a-token copies), and `s3_transfer.py` / `github_transfer.py`
+reuse the engine's VM lifecycle but swap the copy layer (azcopy
+server-side copy for S3, a VM-side git+API puller for GitHub — see
+below) — all driven by the matching `*-azure-transfer` skills. The
+workflow: VM `xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive:
+`xfer-gdr-<slug>`, S3: `xfer-s3-<slug>`, GitHub: `xfer-gh-<slug>`, so
+they can run concurrently) in the company's RG and
 the SA's region, static Standard-SKU public IP (never deallocated before
 teardown), the copy in a tmux session into `<slug>-raw/workspace-export/`
-(Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`).
+(Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`,
+GitHub: `github-export/`).
 Rules that differ from the sizing path — do not cross-contaminate:
 
 - **Network rules are engine-run via `allow-network`** (policy change,
@@ -558,6 +565,38 @@ rclone `--files-from` as `Q` jobs. Flat verify is a streamed
 merge-join of that manifest against the Azure dest listing —
 per-object name+size, drift-immune, `--deep` implied. Driven by the
 `s3-azure-transfer` skill.
+
+**GitHub rides the engine's VM with its own pull layer.** rclone has no
+GitHub backend, so `scripts/github_transfer.py` reuses the engine's VM
+lifecycle (like s3) and pushes `scripts/github_vm_pull.py` to the VM
+(a harness-idiom rewrite of cdp-platform's `github_pull.py` @ dc320d1 —
+see `docs/github-transfer-handoff.md`), which pulls everything VM-side
+in tmux: per repo a `git clone --mirror`, the `.wiki.git` clone when a
+wiki exists (absent wiki = skip, not failure), `git lfs fetch --all`
+when `.gitattributes` declares `filter=lfs` (bootstrap installs
+git+git-lfs), and 4 paginated JSONL exports (issues, pulls,
+issue_comments, review_comments; 404 = feature disabled = skip; 403
+with the rate limit INTACT = fatal scope error, never retried), staged
+under `~/xfer-gh/dest/` (512 GB OS disk — staging holds the whole
+corpus) then azcopied to `github-export/` with `--overwrite=false`
+(client-side no-overwrite, the s3-path honesty — not `If-None-Match`).
+Auth is a client-made **fine-grained PAT** (Contents/Issues/Pull
+requests = read; org resource owner, so an org owner must APPROVE it —
+the known day-one stall, gated by the laptop-side `probe`): 1 stdin
+line → ssh stdin → 600 env file on the VM → a 0700 GIT_ASKPASS helper,
+never a clone URL/argv/tags; client revokes it after verify.
+**Upload-what-succeeded**: a pass with failed repos still uploads what
+completed (per-repo `.cdp-complete` resume markers; re-run mops up);
+manifest.json rides the same azcopy job, and **verify runs on the
+laptop** (the VM is normally gone) comparing that manifest against a
+dest listing via `phases.ip_rule_ensure` + rl SAS — the one VM-family
+verify on the laptop path. Certifies staged→container only; no
+source-size claim (git packing ≠ API diskUsage). Out of scope: Actions
+logs/artifacts, Packages, Projects, Discussions, release assets. Wikis
+ARE in scope. Multi-org = one cycle per org with `--dest-prefix
+github-export/<org-login>` (the zoom multi-account convention); pin
+`"prefix": "github-export"` on the github service in
+`expected-data-sizes.json`. Driven by the `github-azure-transfer` skill.
 
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
