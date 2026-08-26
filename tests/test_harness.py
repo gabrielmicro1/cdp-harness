@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -64,6 +65,29 @@ def main() -> int:
     root = tmp / "companies"
     shutil.copytree(FIXTURES, root)
 
+    # The democo fixtures encode "grew yesterday" / "one day since last
+    # change" but the stall logic in reconcile/phases compares against the
+    # real clock — rebase the date-sensitive timestamps onto now (run files
+    # renamed to match) so the fixtures can't rot as the calendar advances.
+    now = common.utc_now()
+
+    def _rebase_democo_run(old_name: str, days_ago: int) -> str:
+        runs_dir = root / "democo" / "sizing-runs"
+        run = common.read_json(runs_dir / old_name)
+        ts = now - timedelta(days=days_ago)
+        run["timestamp"] = common.iso(ts)
+        run["used_capacity_at"] = common.iso(ts - timedelta(hours=1))
+        (runs_dir / old_name).unlink()
+        common.write_json(runs_dir / f"{common.ts_basic(ts)}.json", run)
+        return run["timestamp"]
+
+    _rebase_democo_run("20260811T090000Z.json", 2)
+    democo_last_ts = _rebase_democo_run("20260812T090000Z.json", 1)
+    democo_status = common.read_json(root / "democo" / "status.json")
+    democo_status["last_run"]["timestamp"] = democo_last_ts
+    democo_status["last_change_detected_at"] = democo_last_ts
+    common.write_json(root / "democo" / "status.json", democo_status)
+
     print("\n— reconcile —")
     s = reconcile.company_summary(root, "democo")
     check("pct_complete ≈ 73.3", abs(s["pct_complete"] - 73.3) < 0.1,
@@ -71,7 +95,11 @@ def main() -> int:
     check("delta_24h = 100 GB", s["delta_24h"] == 100_000_000_000,
           str(s["delta_24h"]))
     check("rate = 100 GB/day", abs(s["rate_bytes_per_day"] - 1e11) < 1e9)
-    check("eta ~13 days out", s["eta"] is not None and s["eta"][:7] == "2026-08",
+    # remaining 1.335 TB at 100 GB/day = 13.35 days after the latest run
+    # (now-1d), i.e. ~12.35 days from now
+    check("eta ~13 days out", s["eta"] is not None and
+          abs((common.parse_iso(s["eta"]) - now).total_seconds() / 86400
+              - 12.35) < 0.5,
           str(s["eta"]))
     check("not stalled (grew yesterday)", s["stalled"] is False)
     flags = {r["service"]: r["flags"] for r in s["service_rows"]}
@@ -475,7 +503,8 @@ def main() -> int:
     check("copied-forward method", cf["method"] == "copied-forward")
     check("copied-forward totals preserved",
           cf["totals"]["uncompressed_bytes"] == 3_665_000_000_000)
-    check("copied_from set", cf["copied_from"] == "2026-08-12T09:00:00Z")
+    check("copied_from set", cf["copied_from"] == democo_last_ts,
+          str(cf["copied_from"]))
     check("copied-forward tolerates old runs (empty detection)",
           cf.get("detected_services", {}) == {} and cf.get("cache") is None)
     st = phases.update_status(root, "democo", "skipped-unchanged", "test")
@@ -483,7 +512,7 @@ def main() -> int:
     check("last_run outcome recorded",
           st["last_run"]["outcome"] == "skipped-unchanged")
     # age the last change past the stall threshold → next no-growth run stalls
-    st["last_change_detected_at"] = "2026-08-01T00:00:00Z"
+    st["last_change_detected_at"] = common.iso(now - timedelta(days=10))
     common.save_status(root, "democo", st)
     phases.write_copied_forward_run(root, "democo", 1_564_500_000_000,
                                     "2026-08-13T09:00:00Z")
@@ -492,11 +521,11 @@ def main() -> int:
     # growth resumes → back to pushing
     grown = json.loads(json.dumps(cf))
     # filename/timestamp must sort AFTER the real-clock copied-forward runs
-    grown["timestamp"] = "2026-12-31T00:00:00Z"
+    grown_name = f"{common.ts_basic(now + timedelta(days=1))}.json"
+    grown["timestamp"] = common.iso(now + timedelta(days=1))
     grown["method"] = "sized"
     grown["totals"]["uncompressed_bytes"] += 50_000_000_000
-    common.write_json(root / "democo" / "sizing-runs" / "20261231T000000Z.json",
-                      grown)
+    common.write_json(root / "democo" / "sizing-runs" / grown_name, grown)
     st = phases.update_status(root, "democo", "sized")
     check("growth resumed → pushing", st["stage"] == "pushing")
     check("last_change_detected_at refreshed",
@@ -1623,11 +1652,11 @@ def main() -> int:
               str(env_dump2))
         phases.harvest_one(root, "democo", cfg,
                            {**st2, "metric": 1, "metric_at": "t"})
-        # The far-future-dated run file from the earlier stall/"growth resumed"
-        # test (20261231T000000Z.json) sorts after any real-clock run and would
-        # otherwise outrank the harvest above as "latest" — its job there is
-        # done, so drop it here for this check to see the real latest run.
-        (root / "democo" / "sizing-runs" / "20261231T000000Z.json").unlink()
+        # The future-dated run file from the earlier stall/"growth resumed"
+        # test (now+1d) sorts after any real-clock run and would otherwise
+        # outrank the harvest above as "latest" — its job there is done, so
+        # drop it here for this check to see the real latest run.
+        (root / "democo" / "sizing-runs" / grown_name).unlink()
         cf2 = common.read_json(phases.write_copied_forward_run(
             root, "democo", 999, "t2"))
         check("copied-forward carries detected_services",
