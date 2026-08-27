@@ -37,6 +37,19 @@ sizer reads only:
 - for `.gz`/`.tgz`/`.tar.gz`: the last 4 bytes (the gzip ISIZE trailer) first;
   large or floored/implausible blobs get an exact streaming decompress
   instead, under a per-run byte budget (§8, §9);
+- for `.parquet`: a 64 KB tail Range GET — the last 8 bytes give the footer
+  length + `PAR1` magic, and the footer (a thrift-compact `FileMetaData`,
+  parsed by a stdlib decoder) almost always fits in the same tail; sum of
+  the column chunks' `total_uncompressed_size` (fallback: row groups'
+  `total_byte_size`). This is decompressed PAGE bytes — codecs undone,
+  dictionary/RLE encodings intact — the parquet analog of "uncompressed",
+  which understates a warehouse console's logical size (BigQuery prices
+  decoded widths). Same trust class as a zip CD, in BOTH modes: the stdlib
+  has no snappy codec, so deep verify cannot stream the pages, every
+  `parquet-*` method is terminal, and coverage classes them "trusted"
+  forever (`parquet-tiny` excepted). Methods: `parquet-footer`, and floored
+  fallbacks `parquet-tiny`/`parquet-encrypted`/`parquet-bad-magic`/
+  `parquet-bad-footer`;
 - everything else ("stored"): nothing — uncompressed = `Content-Length`.
 
 So cost scales with **blob count** (HTTP round trips), not bytes. The two big

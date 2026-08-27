@@ -10,6 +10,7 @@ summary parsing, sizer summary compactness, and fleet_size.py --dry-run.
 """
 from __future__ import annotations
 
+import ast
 import gzip
 import io
 import json
@@ -135,6 +136,39 @@ def main() -> int:
           and "non-corpus" in _exc_note[0])
     check("excluded_prefix_note: empty when nothing excluded",
           reconcile.excluded_prefix_note({}) == [])
+
+    print("\n— reconcile: equivalent_bytes (unit-adjusted declarations) —")
+    _eq_run = {"sources": {"google_bigquery": {"uncompressed_bytes": 3_830,
+                                               "compressed_bytes": 985,
+                                               "blob_count": 7}}}
+    _eq_exp = {"services": {"bigquery": {
+        "bytes": 10_300, "prefix": "google_bigquery",
+        "equivalent_bytes": 9_100, "equivalent_note": "decoded-sample basis"}}}
+    _eq_rows, _ = reconcile.service_rows(_eq_exp, _eq_run)
+    _r = _eq_rows[0]
+    check("equivalent: pct from equivalent, actual stays measured",
+          abs(_r["pct"] - 9_100 / 10_300 * 100) < 0.01
+          and _r["actual_bytes"] == 3_830
+          and _r["equivalent_bytes"] == 9_100, str(_r))
+    check("equivalent: unit-adjusted flagged, no overshoot",
+          _r["flags"] == ["unit-adjusted"], str(_r["flags"]))
+    _eq_notes = reconcile.equivalent_unit_notes(_eq_rows)
+    check("equivalent: note always emitted with basis",
+          len(_eq_notes) == 1 and "bigquery" in _eq_notes[0]
+          and "decoded-sample basis" in _eq_notes[0], str(_eq_notes))
+    _plain_rows, _ = reconcile.service_rows(
+        {"services": {"bigquery": {"bytes": 10_300,
+                                   "prefix": "google_bigquery"}}}, _eq_run)
+    check("equivalent absent: row and notes unchanged",
+          abs(_plain_rows[0]["pct"] - 3_830 / 10_300 * 100) < 0.01
+          and "equivalent_bytes" not in _plain_rows[0]
+          and reconcile.equivalent_unit_notes(_plain_rows) == [])
+    _no_data_rows, _ = reconcile.service_rows(
+        _eq_exp, {"sources": {}})
+    check("equivalent ignored when no data landed (declared-empty wins)",
+          "declared-empty" in _no_data_rows[0]["flags"]
+          and "equivalent_bytes" not in _no_data_rows[0],
+          str(_no_data_rows[0]))
 
     print("\n— reconcile: duplicate-data rollup —")
     dup = reconcile.duplicate_rollup([
@@ -421,6 +455,66 @@ def main() -> int:
     check("report breaks down large unexpected source",
           "Inside dropbox-export" in phtml and "Creative" in phtml)
     check("breakdown includes remainder row", "(everything else)" in phtml)
+
+    print("\n— reconcile: zoho multi-product prefix (one ingest, three "
+          "declared services) —")
+    # The zoho ingest lands zoho-export/{crm,learn,workdrive} from ONE
+    # skill, but the manifest declares three separate services. This is the
+    # test that protects that prefix decision: source_split on the shared
+    # base plus a per-product pin must attribute bytes SEPARATELY.
+    zco = root / "zohoco"
+    (zco / "sizing-runs").mkdir(parents=True)
+    common.write_json(zco / "config.json", {
+        "slug": "zohoco", "subscription": "m1 corpus", "subscription_id": "x",
+        "resource_group": "rg-zohoco", "storage_account": "stzohoco",
+        "container": "zohoco-raw",
+        "vm": {"name": None, "resource_group": "rg-zohoco", "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(zco / "expected-data-sizes.json", {
+        "slug": "zohoco", "manifest_total_bytes": 143_300_000_000,
+        "source_split": ["zoho-export"],
+        "services": {
+            "zoho_crm": {"bytes": 133_000_000_000,
+                         "prefix": "zoho-export/crm"},
+            "zoho_learn": {"bytes": 8_000_000_000,
+                           "prefix": "zoho-export/learn"},
+            "zoho_workdrive": {"bytes": 2_300_000_000,
+                               "prefix": "zoho-export/workdrive"}},
+        "source": "test", "confirmed_by_user": True,
+        "created_at": "2026-08-01T00:00:00Z"})
+    common.write_json(zco / "status.json", {
+        "slug": "zohoco", "stage": "pushing",
+        "last_run": {"timestamp": "2026-08-13T09:00:00Z", "outcome": "sized",
+                     "reason": None},
+        "last_change_detected_at": "2026-08-13T09:00:00Z"})
+    common.write_json(zco / "sizing-runs" / "20260813T100000Z.json", {
+        "slug": "zohoco", "timestamp": "2026-08-13T10:00:00Z",
+        "method": "sized", "copied_from": None,
+        "used_capacity_bytes": 120_000_000_000,
+        "used_capacity_at": "2026-08-13T09:00:00Z", "duration_seconds": 60,
+        "totals": {"blob_count": 900, "compressed_bytes": 120_000_000_000,
+                   "uncompressed_bytes": 141_000_000_000,
+                   "zero_byte_blobs": 0},
+        "sources": {"zoho-export": {"blob_count": 900,
+                                    "compressed_bytes": 120_000_000_000,
+                                    "uncompressed_bytes": 141_000_000_000}},
+        "sources_l2": {
+            "zoho-export/crm": [800, 115_000_000_000, 133_000_000_000],
+            "zoho-export/learn": [100, 5_000_000_000, 8_000_000_000]},
+        "methods": {"stored": 900}, "errors": {"total": 0, "by_type": {}},
+        "notes": []})
+    zs = reconcile.company_summary(root, "zohoco")
+    zrows = {r["service"]: r for r in zs["service_rows"]}
+    check("zoho pins: crm and learn attribute to their own sub-prefixes",
+          zrows["zoho_crm"]["actual_bytes"] == 133_000_000_000
+          and zrows["zoho_learn"]["actual_bytes"] == 8_000_000_000,
+          str({k: v["actual_bytes"] for k, v in zrows.items()}))
+    check("zoho pins: an un-run product reads as declared-empty, not as "
+          "the whole prefix",
+          (zrows["zoho_workdrive"]["actual_bytes"] or 0) == 0,
+          str(zrows["zoho_workdrive"]))
+    check("zoho pins: the shared base is no longer a single source",
+          "zoho-export" not in zs["sources"], str(list(zs["sources"])))
 
     print("\n— reconcile: source_split (services nested in one export folder) —")
     splitco = root / "splitco"
@@ -1093,6 +1187,188 @@ def main() -> int:
     finally:
         sizer.http_get = real_http
         for k in list(sizer_env) + ["CACHE_FILE", "SEED_TSV"]:
+            os.environ.pop(k, None)
+
+    print("\n— sizer: parquet footers (thrift compact, cold/warm/deep) —")
+    # Independent thrift-compact ENCODER (vs the sizer's decoder) building
+    # real footer bytes: PAR1 + data + FileMetaData + <u32 len> + PAR1.
+
+    def tc_varint(n):
+        out = bytearray()
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out.append(b | 0x80 if n else b)
+            if not n:
+                return bytes(out)
+
+    def tc_zz(n):
+        return tc_varint((n << 1) ^ (n >> 63))
+
+    def tc_field(delta, ttype, payload=b""):
+        return bytes([(delta << 4) | ttype]) + payload
+
+    def pq_col(unc, comp):
+        md = (tc_field(1, 5, tc_zz(1))       # 1 type (enum)
+              + tc_field(3, 5, tc_zz(1))     # 4 codec (skips 2,3)
+              + tc_field(1, 6, tc_zz(10))    # 5 num_values
+              + tc_field(1, 6, tc_zz(unc))   # 6 total_uncompressed_size
+              + tc_field(1, 6, tc_zz(comp))  # 7 total_compressed_size
+              + b"\x00")
+        return (tc_field(2, 6, tc_zz(4))     # 2 file_offset (skips 1)
+                + tc_field(1, 12, md)        # 3 meta_data
+                + b"\x00")
+
+    def pq_row_group(cols, total_byte_size, nrows):
+        body = b""
+        if cols:
+            body += tc_field(1, 9, bytes([(len(cols) << 4) | 12])
+                             + b"".join(cols))          # 1 columns
+            body += tc_field(1, 6, tc_zz(total_byte_size))  # 2 total_byte_size
+        else:
+            body += tc_field(2, 6, tc_zz(total_byte_size))  # 2 (skips 1)
+        return body + tc_field(1, 6, tc_zz(nrows)) + b"\x00"  # 3 num_rows
+
+    def pq_file(row_groups, nrows, pad=100):
+        schema_el = tc_field(4, 8, tc_varint(3) + b"col") + b"\x00"
+        footer = (tc_field(1, 5, tc_zz(1))                       # 1 version
+                  + tc_field(1, 9, bytes([(1 << 4) | 12]) + schema_el)  # 2
+                  + tc_field(1, 6, tc_zz(nrows))                 # 3 num_rows
+                  + tc_field(1, 9, bytes([(len(row_groups) << 4) | 12])
+                             + b"".join(row_groups))             # 4 row_groups
+                  + b"\x00")
+        return (b"PAR1" + b"\x00" * pad + footer
+                + struct.pack("<I", len(footer)) + b"PAR1")
+
+    # a.parquet: column-level sizes (7000+3000) + (5000) = 15000 must WIN over
+    # deliberately-wrong RowGroup.total_byte_size values
+    pqc = {
+        "bq/a.parquet": pq_file(
+            [pq_row_group([pq_col(7000, 700), pq_col(3000, 300)], 999_999, 5),
+             pq_row_group([pq_col(5000, 500)], 888_888, 5)], 10),
+        # b.parquet: no column metadata → RowGroup.total_byte_size fallback
+        "bq/b.parquet": pq_file([pq_row_group([], 4321, 7)], 7),
+        "bq/junk.parquet": b"this is not a parquet file at all........",
+        "bq/enc.parquet": b"PAR1" + b"\x00" * 40 + b"\x00\x00\x00\x00PARE",
+        "bq/tiny.parquet": b"PAR1",
+    }
+    pq_unc_expected = {
+        "bq/a.parquet": (15000, "parquet-footer"),
+        "bq/b.parquet": (4321, "parquet-footer"),
+        "bq/junk.parquet": (len(pqc["bq/junk.parquet"]), "parquet-bad-magic"),
+        "bq/enc.parquet": (len(pqc["bq/enc.parquet"]), "parquet-encrypted"),
+        "bq/tiny.parquet": (4, "parquet-tiny"),
+    }
+    pqtags = {n: f"0xPQ{i:02d}" for i, n in enumerate(sorted(pqc))}
+
+    def pq_listing_xml(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        prefix = q.get("prefix", [""])[0]
+        delim = q.get("delimiter", [""])[0]
+        parts, seen = ["<EnumerationResults><Blobs>"], set()
+        for n in sorted(k for k in pqc if k.startswith(prefix)):
+            rest = n[len(prefix):]
+            if delim and delim in rest:
+                p = prefix + rest.split(delim)[0] + delim
+                if p not in seen:
+                    seen.add(p)
+                    parts.append(f"<BlobPrefix><Name>{p}</Name></BlobPrefix>")
+                continue
+            parts.append(f"<Blob><Name>{n}</Name><Properties>"
+                         f"<Content-Length>{len(pqc[n])}</Content-Length>"
+                         f"<Etag>{pqtags[n]}</Etag></Properties></Blob>")
+        parts.append("</Blobs><NextMarker/></EnumerationResults>")
+        return "".join(parts).encode()
+
+    pq_counters = {"range_gets": 0}
+
+    def pq_http(url, extra_headers=None):
+        if "comp=list" in url:
+            return pq_listing_xml(url)
+        name = urllib.parse.unquote(url.split("/pq-raw/", 1)[1].split("?", 1)[0])
+        data = pqc[name]
+        rng = (extra_headers or {}).get("Range")
+        if rng:
+            pq_counters["range_gets"] += 1
+            a, bb = rng[len("bytes="):].split("-")
+            return data[int(a):int(bb) + 1]
+        return data
+
+    pq_env = {"SA": "fakesa", "CONTAINER": "pq-raw", "SAS": "sig=x",
+              "TAG": "pqco-sizer", "OUT_DIR": str(swork),
+              "SIZER_WORKERS": "4", "LIST_WORKERS": "2"}
+    os.environ.update(pq_env)
+    for k in ("CACHE_FILE", "SEED_TSV", "EXPECTED_SERVICES", "DEEP_VERIFY"):
+        os.environ.pop(k, None)
+    real_http = sizer.http_get
+    try:
+        sizer.http_get = pq_http
+        sizer.main()
+        sp = json.loads((swork / "pqco-sizer.summary.json").read_text())
+        want_unc = sum(v[0] for v in pq_unc_expected.values())
+        check("parquet cold totals (column sizes win over total_byte_size)",
+              sp["blobs"] == 5 and sp["unc"] == want_unc
+              and sp["errors"] == 0, json.dumps(sp)[:300])
+        check("parquet methods kind counted", sp["methods"].get("parquet") == 5,
+              str(sp["methods"]))
+        rows = {}
+        for line in (swork / "pqco-sizer.sizes.tsv").read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            f = line.split("\t")
+            rows[f[0]] = (int(f[2]), f[4])
+        check("parquet per-blob methods + values",
+              rows == pq_unc_expected, str(rows))
+        check("parquet cold cache stats (all 5 are misses)",
+              sp["cache"] == {"hits": 0, "misses": 5}, str(sp["cache"]))
+
+        # footer bigger than the tail read → exercises the second range GET
+        saved_tail = sizer.PARQUET_TAIL
+        try:
+            sizer.PARQUET_TAIL = 16  # too small to hold any of our footers
+            unc2, meth2 = sizer.parquet_uncompressed("bq/a.parquet",
+                                                     len(pqc["bq/a.parquet"]))
+            check("parquet second-GET path when footer outgrows the tail",
+                  (unc2, meth2) == (15000, "parquet-footer"),
+                  f"{unc2} {meth2}")
+        finally:
+            sizer.PARQUET_TAIL = saved_tail
+
+        # warm shallow run: every parquet row replays from cache, zero HTTP
+        pq_cache = tmp / "pqco-index.tsv.gz"
+        shutil.copy(swork / "pqco-sizer.index.tsv.gz", pq_cache)
+        for f in swork.glob("pqco-sizer.*"):
+            f.unlink()
+        os.environ["CACHE_FILE"] = str(pq_cache)
+        pq_counters["range_gets"] = 0
+        sizer.main()
+        sp2 = json.loads((swork / "pqco-sizer.summary.json").read_text())
+        check("parquet warm run: all hits, zero range reads",
+              sp2["cache"] == {"hits": 5, "misses": 0}
+              and pq_counters["range_gets"] == 0
+              and sp2["unc"] == want_unc,
+              f'{sp2["cache"]} ranges={pq_counters["range_gets"]}')
+
+        # deep run: parquet methods are TERMINAL (no codec for the pages) —
+        # cached rows must replay, not re-measure, and land in "trusted"
+        for f in swork.glob("pqco-sizer.*"):
+            f.unlink()
+        os.environ["DEEP_VERIFY"] = "1"
+        pq_counters["range_gets"] = 0
+        sizer.main()
+        sp3 = json.loads((swork / "pqco-sizer.summary.json").read_text())
+        ver = sp3.get("verification") or {}
+        check("parquet deep run: terminal rows replay (zero range reads)",
+              sp3["cache"] == {"hits": 5, "misses": 0}
+              and pq_counters["range_gets"] == 0, str(sp3["cache"]))
+        check("parquet deep coverage: 4 trusted + tiny measured",
+              ver.get("trusted_blobs") == 4
+              and ver.get("measured_blobs") == 1
+              and ver.get("unmeasurable_blobs") == 0,
+              json.dumps(ver))
+    finally:
+        sizer.http_get = real_http
+        for k in list(pq_env) + ["CACHE_FILE", "SEED_TSV", "DEEP_VERIFY"]:
             os.environ.pop(k, None)
 
     print("\n— sizer: gz streaming end-to-end (trigger, budget, cache) —")
@@ -2313,6 +2589,1404 @@ def main() -> int:
     check("github verify math: failed_repos surfaced verbatim",
           not r["ok"] and r["failed_repos"] == ["b"])
 
+    print("\n— zoho_transfer --dry-run (engine lifecycle, VM-side REST "
+          "puller) —")
+    import zoho_transfer  # noqa: E402
+    import zoho_vm_pull  # noqa: E402
+    zcreds = "com\nZCLIENTIDSENTINEL\nZSECRETSENTINEL\nZREFRESHSENTINEL\n"
+    check("zoho Spec: Self Client flow (no OAuth/rclone), 512 GB disk",
+          zoho_transfer.SPEC.vm_prefix == "xfer-zoho-"
+          and zoho_transfer.SPEC.authorize_target == ""
+          and zoho_transfer.SPEC.remote_type == ""
+          and zoho_transfer.SPEC.default_dest_prefix == "zoho-export"
+          and zoho_transfer.SPEC.default_os_disk_gb == 512)
+    proc = run_script("zoho_transfer.py", "plan", "democo", "--dc", "com",
+                      "--product", "crm", "--root", root, "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("zoho plan: product dest, but the dest_prefix TAG stays the base",
+          plan["vm_name"] == "xfer-zoho-democo"
+          and plan["dest"] == "democo-raw/zoho-export/crm"
+          and plan["dest_prefix_tag"] == "zoho-export"
+          and plan["source"] == "zoho:com")
+    proc = run_script("zoho_transfer.py", "create-vm", "democo", "--dc",
+                      "com", "--product", "crm", "--root", root, "--dry-run")
+    check("zoho create-vm: 512 GB staging disk + dc/product tags",
+          "--os-disk-size-gb 512" in proc.stdout
+          and "purpose=zoho-transfer" in proc.stdout
+          and "zoho_dc=com" in proc.stdout
+          and "zoho_product=crm" in proc.stdout
+          and "dest_prefix=zoho-export" in proc.stdout
+          and "dest_prefix=zoho-export/crm" not in proc.stdout
+          and "-n xfer-zoho-democo" in proc.stdout)
+    proc = run_script("zoho_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("zoho allow-network: vnet path (VM family), never IP rules",
+          "network-rule add" in proc.stdout and "--subnet" in proc.stdout
+          and "--ip-address" not in proc.stdout)
+    proc = run_script("zoho_transfer.py", "write-dest", "democo",
+                      "--product", "crm", "--root", root, "--dry-run")
+    check("zoho write-dest: racwl SAS, product-suffixed dest, redacted",
+          "--permissions racwl" in proc.stdout
+          and "zoho-export/crm" in proc.stdout
+          and "rclone.conf" in proc.stdout
+          and "dest-crm.env" in proc.stdout
+          and "redacted" in proc.stdout)
+    check("zoho write-dest: per-product env, so a second product never "
+          "re-points the first product's resume",
+          "dest-learn.env" not in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input=zcreds, capture_output=True, text=True)
+    check("zoho write-creds: none of the 4 sentinels ever echoed",
+          proc.returncode == 0
+          and "ZCLIENTIDSENTINEL" not in proc.stdout
+          and "ZSECRETSENTINEL" not in proc.stdout
+          and "ZREFRESHSENTINEL" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    check("zoho write-creds: dry-run echo stays brace-free before the JSON",
+          "{" not in proc.stdout[:proc.stdout.index("{")]
+          and json.loads(proc.stdout[proc.stdout.index("{"):])["dc"] == "com")
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="com\nid\nsecret\n", capture_output=True, text=True)
+    check("zoho write-creds: refuses malformed stdin (must be 4 lines)",
+          proc.returncode == 1 and "4 lines" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="com\nid\nse'cret\nrefresh\n", capture_output=True, text=True)
+    check("zoho write-creds: single-quote guard refuses before writing",
+          proc.returncode == 1 and "single quote" in proc.stdout
+          and "nothing was written" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="gov\nid\nsecret\nrefresh\n", capture_output=True, text=True)
+    check("zoho write-creds: unknown data center refused",
+          proc.returncode == 1 and "data center" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "probe",
+         "democo", "--dc", "com", "--product", "crm", "--root", str(root),
+         "--dry-run"], input=zcreds, capture_output=True, text=True)
+    check("zoho probe crm: laptop-side API JSON only — no Azure, no VM",
+          proc.returncode == 0
+          and "accounts.zoho.com/oauth/v2/token" in proc.stdout
+          and "www.zohoapis.com/crm/v8/settings/modules" in proc.stdout
+          and "token-redacted" in proc.stdout
+          and "ZREFRESHSENTINEL" not in proc.stdout
+          and "generate-sas" not in proc.stdout
+          and "network-rule" not in proc.stdout
+          and "az vm" not in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "zoho_transfer.py"), "probe",
+         "democo", "--dc", "eu", "--product", "learn", "--portal", "zylker",
+         "--root", str(root), "--dry-run"],
+        input="eu\nid\nsecret\nrefresh\n", capture_output=True, text=True)
+    check("zoho probe learn: DC-local host + undocumented KB paths tried",
+          proc.returncode == 0
+          and "learn.zoho.eu/learn/api/v1/portal/zylker/course" in proc.stdout
+          and "pageIndex" in proc.stdout
+          and "portal/zylker/manual" in proc.stdout, proc.stdout[-300:])
+    proc = run_script("zoho_transfer.py", "plan", "democo", "--dc", "com",
+                      "--product", "crm", "--dest-exact", "zoho_crm",
+                      "--root", root, "--dry-run")
+    plan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("zoho --dest-exact: literal prefix, product NOT appended",
+          plan["dest"] == "democo-raw/zoho_crm")
+    proc = run_script("zoho_transfer.py", "write-dest", "democo",
+                      "--product", "crm", "--dest-exact", "zoho_crm",
+                      "--root", root, "--dry-run")
+    wd = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("zoho --dest-exact: write-dest points dest.env at it",
+          wd["dest_prefix"] == "zoho_crm")
+    proc = run_script("zoho_transfer.py", "verify", "democo", "--product",
+                      "crm", "--dest-exact", "zoho_crm", "--root", root,
+                      "--dry-run")
+    check("zoho --dest-exact: verify reads the same literal prefix",
+          "zoho_crm/manifest.json" in proc.stdout
+          and "zoho-export" not in proc.stdout)
+    proc = run_script("zoho_transfer.py", "transfer", "democo", "--product",
+                      "crm", "--root", root, "--dry-run")
+    check("zoho transfer: pushes puller into a per-PRODUCT tmux window",
+          "zoho_vm_pull.py" in proc.stdout
+          and "tmux new-session -d -s transfer -n crm" in proc.stdout
+          and "zoho.env" in proc.stdout
+          and "dest-crm.env" in proc.stdout)
+    proc = run_script("zoho_transfer.py", "verify", "democo", "--product",
+                      "crm", "--root", root, "--dry-run")
+    check("zoho verify: laptop path — ip rule + rl SAS + product manifest",
+          "--permissions rl" in proc.stdout
+          and "network-rule add" in proc.stdout
+          and "zoho-export/crm/manifest.json" in proc.stdout
+          and "racwl" not in proc.stdout)
+    proc = run_script("zoho_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", expect_rc=2)
+    check("zoho teardown also gated", '"not-confirmed"' in proc.stdout)
+    proc = run_script("zoho_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", "--confirmed")
+    check("zoho confirmed teardown: engine set + Self Client revocation",
+          "network-rule remove" in proc.stdout
+          and "vnet delete" in proc.stdout
+          and "refresh token" in proc.stdout
+          and "Self Client" in proc.stdout)
+    zsrc = (SCRIPTS / "zoho_vm_pull.py").read_text()
+    check("zoho puller: cursors, markers, bulk pipeline, oauthtoken auth",
+          "page_token" in zsrc and ".cdp-complete" in zsrc
+          and ".cdp-cursor.json" in zsrc and "crm/bulk/v8/read" in zsrc
+          and "Zoho-oauthtoken" in zsrc)
+    check("zoho puller: manifest REPLACES an earlier pass's, corpus never "
+          "does — a no-overwrite manifest would freeze verify on pass 1",
+          "--overwrite=true" in zsrc and "upload_run_metadata" in zsrc
+          and ".cdp-cursor.json;" in zsrc  # control files overwrite too
+          and "--include-pattern" in zsrc
+          and zsrc.count("--overwrite=false") >= 1
+          and "manifest.json" in zsrc)
+    check("zoho puller: --refresh replaces its OWN prior export (Zoho "
+          "mutates viewCount, so a re-pull differs and no-overwrite would "
+          "strand a stale copy as a phantom short_upload)",
+          "overwrite: bool = False" in zsrc
+          and "overwrite=refresh" in zsrc
+          and '"--overwrite=true" if overwrite else "--overwrite=false"'
+          in zsrc)
+    check("zoho puller: honest write invariant + no server-side copy path",
+          "--overwrite=false" in zsrc
+          # the HEADER, not the word: upload()'s docstring names
+          # If-None-Match on purpose, to say what this path does NOT do
+          and '"If-None-Match"' not in zsrc
+          and '"x-ms-copy-source' not in zsrc)
+    check("zoho puller: credentials never reach argv",
+          "--client-secret" not in zsrc and "--refresh-token" not in zsrc)
+    _zmods = set()
+    for _n in ast.walk(ast.parse(zsrc)):
+        if isinstance(_n, ast.Import):
+            for _a in _n.names:
+                _zmods.add((_a.asname or _a.name).split(".")[0])
+        elif isinstance(_n, ast.ImportFrom) and _n.level == 0:
+            _zmods.add((_n.module or "").split(".")[0])
+    check("zoho puller is stdlib-only (nothing to pip install on the VM)",
+          _zmods <= {"argparse", "concurrent", "csv", "hashlib", "io",
+                     "json", "os", "shutil", "subprocess", "sys", "time",
+                     "urllib", "zipfile", "datetime", "pathlib",
+                     "__future__"}, str(sorted(_zmods)))
+
+    print("\n— zoho_transfer / zoho_vm_pull in-process (stubbed transport) —")
+
+    class _ZResp:
+        def __init__(self, payload, status=200):
+            self._b = (payload if isinstance(payload, bytes)
+                       else json.dumps(payload).encode())
+            self.status = status
+
+        def read(self, n=None):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _zhttp_err(code, body=b"{}", headers=None):
+        return urllib.error.HTTPError(
+            "https://x", code, "err", headers or {}, io.BytesIO(body))
+
+    zsaved = (zoho_transfer._http, zoho_transfer._sleep)
+    try:
+        zsleeps = []
+        zoho_transfer._sleep = lambda s: zsleeps.append(s)
+
+        check("zoho DC layer: hosts derive from one validated value",
+              zoho_transfer.validate_dc("EU") == "eu"
+              and zoho_transfer.validate_dc(".com.au") == "com.au"
+              and zoho_transfer.accounts_host("eu") == "accounts.zoho.eu"
+              and zoho_transfer.api_host("com.au") == "www.zohoapis.com.au"
+              and zoho_transfer.learn_hosts("eu") == ["learn.zoho.eu",
+                                                      "learn.zoho.com"])
+        try:
+            zoho_transfer.validate_dc("gov")
+            _ok = False
+        except common.HarnessError:
+            _ok = True
+        check("zoho DC layer: unknown data center rejected", _ok)
+        try:
+            zoho_transfer._dc_guard("eu", {"zoho_dc": "com"})
+            _ok = False
+        except common.HarnessError as e:
+            _ok = "eu" in str(e) and "com" in str(e)
+        check("zoho _dc_guard: stdin-vs-tag mismatch names both DCs", _ok)
+        zoho_transfer._dc_guard("com", {})
+        check("zoho _dc_guard: dry-run VMs have no tags, so absent is a "
+              "no-op", True)
+
+        _mint_calls = {"n": 0}
+
+        def _mint_http(req, timeout=60):
+            _mint_calls["n"] += 1
+            return _ZResp({"access_token": "AT", "expires_in": 3600,
+                           "api_domain": "https://www.zohoapis.com"})
+        zoho_transfer._http = _mint_http
+        box = zoho_transfer.TokenBox("com", "id", "sec", "ref")
+        check("zoho TokenBox: one mint serves repeated get()",
+              box.get() == "AT" and box.get() == "AT"
+              and _mint_calls["n"] == 1
+              and box.api_domain == "https://www.zohoapis.com")
+        box.invalidate()
+        check("zoho TokenBox: invalidate forces exactly one re-mint",
+              box.get() == "AT" and _mint_calls["n"] == 2)
+
+        zoho_transfer._http = lambda req, timeout=60: _ZResp(
+            {"access_token": "AT", "expires_in": 3600,
+             "api_domain": "https://www.zohoapis.eu"})
+        try:
+            zoho_transfer.TokenBox("com", "i", "s", "r").mint()
+            _ok = False
+        except common.HarnessError as e:
+            _ok = ("zohoapis.eu" in str(e) and "zohoapis.com" in str(e)
+                   and "api_domain" in str(e))
+        check("zoho TokenBox: api_domain cross-check catches the wrong DC",
+              _ok)
+
+        zsleeps.clear()
+        zoho_transfer._http = lambda req, timeout=60: _ZResp(
+            {"error": "invalid_code"})
+        try:
+            zoho_transfer.TokenBox("eu", "i", "s", "r").mint()
+            _ok = False
+        except common.HarnessError as e:
+            _ok = ("WRONG DATA CENTER" in str(e) and "revoked" in str(e)
+                   and "'eu'" in str(e))
+        check("zoho TokenBox: invalid_code names BOTH causes, never sleeps",
+              _ok and zsleeps == [])
+        zoho_transfer._http = lambda req, timeout=60: _ZResp(
+            {"error": "invalid_client"})
+        try:
+            zoho_transfer.TokenBox("com", "i", "s", "r").mint()
+            _ok = False
+        except common.HarnessError as e:
+            _ok = "invalid_client" in str(e) and "client_id" in str(e)
+        check("zoho TokenBox: invalid_client is a distinct diagnosis", _ok)
+
+        zsleeps.clear()
+        _seq = [_zhttp_err(429, b"{}", {"Retry-After": "7"}),
+                _ZResp({"data": [{"id": "1"}]})]
+
+        def _seq_http(req, timeout=60):
+            item = _seq.pop(0)
+            if isinstance(item, urllib.error.HTTPError):
+                raise item
+            return item
+        box2 = zoho_transfer.TokenBox("com", "i", "s", "r")
+        box2._value, box2._exp = "AT", time.time() + 9999
+        zoho_transfer._http = _seq_http
+        got = zoho_transfer.zoho_get(box2, "www.zohoapis.com", "/crm/v8/Leads")
+        check("zoho zoho_get: 429 honors Retry-After exactly, then succeeds",
+              zsleeps == [7] and got == {"data": [{"id": "1"}]})
+
+        zsleeps.clear()
+        _scope_body = b'{"code":"OAUTH_SCOPE_MISMATCH"}'
+        _calls = {"n": 0}
+
+        def _scope_http(req, timeout=60):
+            _calls["n"] += 1
+            raise _zhttp_err(401, _scope_body)
+        zoho_transfer._http = _scope_http
+        box3 = zoho_transfer.TokenBox("com", "i", "s", "r")
+        box3._value, box3._exp = "AT", time.time() + 9999
+        try:
+            zoho_transfer.zoho_get(box3, "www.zohoapis.com", "/crm/v8/Leads")
+            _ok = False
+        except common.HarnessError as e:
+            _ok = "OAUTH_SCOPE_MISMATCH" in str(e) and "cannot help" in str(e)
+        check("zoho zoho_get: scope mismatch aborts on the FIRST call",
+              _ok and _calls["n"] == 1 and zsleeps == [])
+
+        check("zoho_error_code tolerates all four body shapes + garbage",
+              zoho_transfer.zoho_error_code('{"code":"X"}') == "X"
+              and zoho_transfer.zoho_error_code('[{"code":"Y"}]') == "Y"
+              and zoho_transfer.zoho_error_code(
+                  '{"data":[{"code":"Z"}]}') == "Z"
+              and zoho_transfer.zoho_error_code(
+                  b'{"error":"invalid_code"}') == "invalid_code"
+              and zoho_transfer.zoho_error_code("<html>nope") == ""
+              and zoho_transfer.zoho_error_code(None) == "")
+    finally:
+        (zoho_transfer._http, zoho_transfer._sleep) = zsaved
+
+    _mods = ["Contacts", "Deals", "Tasks", "Notes"]
+    _src = (SCRIPTS / "zoho_vm_pull.py").read_text()
+    check("zoho unit order: attachments (fast, most of the bytes) run "
+          "BEFORE the multi-hour email sweep",
+          _src.index('units.append(("attachments", None))')
+          < _src.index('units.append(("emails", m))'))
+    check("zoho email_modules: scoping the 1-call-per-record sweep is the "
+          "difference between ~12 h and ~54 h",
+          zoho_vm_pull.email_modules(_mods, False, "Contacts,Deals")
+          == ["Contacts", "Deals"]
+          and zoho_vm_pull.email_modules(_mods, False, None) == _mods
+          and zoho_vm_pull.email_modules(_mods, False, "") == _mods
+          and zoho_vm_pull.email_modules(_mods, True, "Contacts") == []
+          and zoho_vm_pull.email_modules(_mods, False, "Nope") == [])
+    check("zoho classify: body code decides, not the status (github's "
+          "404-vs-403 rule does NOT port)",
+          zoho_vm_pull.classify(401, "OAUTH_SCOPE_MISMATCH", True) == "fatal"
+          and zoho_vm_pull.classify(401, "OAUTH_SCOPE_MISMATCH",
+                                    False) == "skip"
+          and zoho_vm_pull.classify(401, "INVALID_TOKEN",
+                                    True) == "remint-once-then-fatal"
+          and zoho_vm_pull.classify(404, "", True) == "fatal"
+          and zoho_vm_pull.classify(404, "", False) == "skip"
+          and zoho_vm_pull.classify(400, "INVALID_MODULE", True) == "skip"
+          and zoho_vm_pull.classify(429, "", True) == "sleep"
+          and zoho_vm_pull.classify(503, "", True) == "retry")
+    check("zoho REQUIRED_KINDS: only the schema is unconditionally "
+          "required — one inaccessible module must not lose the other 91",
+          zoho_vm_pull.REQUIRED_KINDS == ("settings",)
+          and zoho_vm_pull.classify(401, "OAUTH_SCOPE_MISMATCH",
+                                    "records" in
+                                    zoho_vm_pull.REQUIRED_KINDS) == "skip"
+          and zoho_vm_pull.classify(401, "OAUTH_SCOPE_MISMATCH",
+                                    "settings" in
+                                    zoho_vm_pull.REQUIRED_KINDS) == "fatal")
+    _rc = (SCRIPTS / "zoho_vm_pull.py").read_text()
+    check("zoho wholesale-failure guard: a scope list missing "
+          "ZohoCRM.modules.ALL still aborts loudly",
+          "records_ok == 0" in _rc
+          and "systemic, not a per-module permission quirk" in _rc
+          and "record_modules_inaccessible" in _rc)
+    check("zoho classify: NO_PERMISSION is a per-module skip under ANY "
+          "status — Zoho sends it as 400 on /settings/fields and 403 "
+          "elsewhere; keying it on 403 killed a live run at 21/187 units",
+          zoho_vm_pull.classify(400, "NO_PERMISSION", True) == "skip"
+          and zoho_vm_pull.classify(403, "NO_PERMISSION", True) == "skip"
+          and zoho_vm_pull.classify(500, "NO_PERMISSION", True) == "skip")
+    check("zoho classify: a required unit is still fatal on a bare 400 with "
+          "no recognised code (no silent data loss)",
+          zoho_vm_pull.classify(400, "", True) == "fatal"
+          and zoho_vm_pull.classify(400, "", False) == "skip")
+    _chunks = zoho_vm_pull.fields_param(
+        [f"f{i}" for i in range(450)], chunk=100)
+    check("zoho fields_param: chunks a wide module, every chunk carries id",
+          len(_chunks) == 5
+          and all(c.startswith("id,") for c in _chunks)
+          and sum(len(c.split(",")) - 1 for c in _chunks) == 450)
+    check("zoho fields_param: a module with no fields still selects id",
+          zoho_vm_pull.fields_param([]) == ["id"])
+    check("zoho fields_param: default chunk respects v8's HARD 50-field cap "
+          "(400 LIMIT_EXCEEDED above it)",
+          zoho_vm_pull.FIELD_CHUNK <= 50
+          and all(len(c.split(",")) <= 50 for c in
+                  zoho_vm_pull.fields_param([f"f{i}" for i in range(500)])))
+    _merged = zoho_vm_pull.merge_chunks([
+        [{"id": "1", "a": 1}, {"id": "2", "a": 2}],
+        [{"id": "1", "b": 9}, {"id": "2", "b": 8}],
+        [{"id": "3", "c": 7}]])
+    check("zoho merge_chunks: merges by id, keeps order, drops nothing",
+          [r["id"] for r in _merged] == ["1", "2", "3"]
+          and _merged[0] == {"id": "1", "a": 1, "b": 9}
+          and _merged[2] == {"id": "3", "c": 7})
+    _zt = Path(tempfile.mkdtemp(prefix="zoho-test-"))
+    _jl = _zt / "records.jsonl"
+    _l1 = json.dumps({"id": "1"}) + "\n"
+    _l2 = json.dumps({"id": "2"}) + "\n"
+    _jl.write_text(_l1 + _l2 + json.dumps({"id": "3"}) + "\n")
+    check("zoho resume_truncate: rewinds to the last whole page",
+          zoho_vm_pull.resume_truncate(
+              _jl, {"bytes": len(_l1 + _l2)}) == 2
+          and _jl.read_text() == _l1 + _l2)
+    _jl.write_text(_l1 + _l2 + '{"id": "3', )
+    check("zoho resume_truncate: a torn trailing line is discarded",
+          zoho_vm_pull.resume_truncate(
+              _jl, {"bytes": len(_l1 + _l2)}) == 2
+          and "3" not in _jl.read_text())
+    check("zoho resume_truncate: absent cursor means start over",
+          zoho_vm_pull.resume_truncate(_jl, {}) == 0)
+    _zip = _zt / "job.zip"
+    with zipfile.ZipFile(_zip, "w") as zf:
+        zf.writestr("job.csv", "id,name\n1,a\n2,b\n3,c\n")
+    _jl.write_text(_l1 + _l2 + json.dumps({"id": "3"}) + "\n")
+    _cc = zoho_vm_pull.bulk_crosscheck(_zip, _jl)
+    check("zoho bulk_crosscheck: CSV rows vs ledger lines, delta 0",
+          _cc["csv_rows"] == 3 and _cc["json_records"] == 3
+          and _cc["delta"] == 0 and "delta_note" not in _cc)
+    _jl.write_text(_l1 + _l2 + json.dumps({"id": "3"}) + "\n"
+                   + json.dumps({"id": "4"}) + "\n")
+    _cc = zoho_vm_pull.bulk_crosscheck(_zip, _jl)
+    check("zoho bulk_crosscheck: a delta is informational snapshot skew",
+          _cc["delta"] == 1 and "informational" in _cc["delta_note"]
+          and "authority" in _cc["delta_note"])
+    check("zoho safe_component: deterministic, separator-free, id-first "
+          "keeps same-named attachments apart",
+          zoho_vm_pull.safe_component("réport (v2).pdf")
+          == zoho_vm_pull.safe_component("réport (v2).pdf")
+          and "/" not in zoho_vm_pull.safe_component("a/b/c")
+          and len(zoho_vm_pull.safe_component("x" * 400)) == 120
+          and (f"111__{zoho_vm_pull.safe_component('f.pdf')}"
+               != f"222__{zoho_vm_pull.safe_component('f.pdf')}"))
+    _man = zoho_vm_pull.build_manifest(
+        "crm", "com", "https://www.zohoapis.com", {"modules_selected": 2},
+        "T0", "T1", 4242, [
+            {"unit": "settings", "kind": "settings", "status": "ok",
+             "bytes": 10},
+            {"unit": "records/Leads", "kind": "records", "status": "ok",
+             "bytes": 100, "records": 5},
+            {"unit": "attachments/Deals", "kind": "attachments",
+             "status": "failed", "detail": "boom"},
+            {"unit": "emails/Contacts", "kind": "emails",
+             "status": "skipped", "reason": "endpoint-absent"}])
+    check("zoho build_manifest: skipped is NEVER counted as failed",
+          _man["failed_units"] == ["attachments/Deals"]
+          and _man["skipped_units"] == [
+              {"unit": "emails/Contacts", "reason": "endpoint-absent",
+               "detail": None}]
+          and _man["total_staged_bytes"] == 110
+          and _man["api_calls"] == 4242)
+    _p = "zoho-export/crm"
+    _clean = {
+        f"{_p}/settings/.cdp-complete": {"size": 0},
+        f"{_p}/settings/modules.json": {"size": 10},
+        f"{_p}/records/Leads/.cdp-complete": {"size": 0},
+        f"{_p}/records/Leads/records.jsonl": {"size": 100},
+        f"{_p}/manifest.json": {"size": 5},
+    }
+    _zman = {"product": "crm", "unit_count": 2, "total_staged_bytes": 110,
+             "failed_units": [], "skipped_units": [],
+             "results": [
+                 {"unit": "settings", "kind": "settings", "status": "ok",
+                  "bytes": 10},
+                 {"unit": "records/Leads", "kind": "records", "status": "ok",
+                  "bytes": 100, "records": 5}]}
+    r = zoho_transfer.compare_manifest_to_blobs(_zman, _clean, _p)
+    check("zoho verify math: clean pass reports the record census",
+          r["ok"] and not r["short_uploads"] and not r["missing_markers"]
+          and r["record_census"] == {"records/Leads": 5})
+    _short = dict(_clean)
+    _short[f"{_p}/records/Leads/records.jsonl"] = {"size": 40}
+    r = zoho_transfer.compare_manifest_to_blobs(_zman, _short, _p)
+    check("zoho verify math: short upload fails",
+          not r["ok"] and r["short_uploads"])
+    _nomark = dict(_clean)
+    del _nomark[f"{_p}/settings/.cdp-complete"]
+    r = zoho_transfer.compare_manifest_to_blobs(_zman, _nomark, _p)
+    check("zoho verify math: missing marker fails",
+          not r["ok"] and r["missing_markers"] == [f"{_p}/settings/"])
+    _extra = dict(_clean)
+    _extra[f"{_p}/records/Leads/records.jsonl.old"] = {"size": 60}
+    r = zoho_transfer.compare_manifest_to_blobs(_zman, _extra, _p)
+    check("zoho verify math: stale extra is informational, not a failure",
+          r["ok"] and r["stale_extra"] == [f"{_p}/records/Leads/"])
+    _fman = dict(_zman)
+    _fman["failed_units"] = ["attachments/Deals"]
+    r = zoho_transfer.compare_manifest_to_blobs(_fman, _clean, _p)
+    check("zoho verify math: failed_units surfaced verbatim",
+          not r["ok"] and r["failed_units"] == ["attachments/Deals"])
+    _sman = dict(_zman)
+    _sman["skipped_units"] = [{"unit": "kb", "reason": "endpoint-absent"}]
+    r = zoho_transfer.compare_manifest_to_blobs(_sman, _clean, _p)
+    check("zoho verify math: a deliberate skip never fails the verify",
+          r["ok"] and r["skipped_units"][0]["reason"] == "endpoint-absent")
+
+    class _FakeAPI:
+        """Minimal ZohoAPI stand-in: the pullers only ever call get_json."""
+
+        def __init__(self, fields, pages, empty=False, count=3):
+            self.fields = fields
+            self.pages = list(pages)
+            self.empty = empty
+            self.count = count
+            self.seen = []
+
+        def get_json(self, path, params=None, host=None):
+            self.seen.append((path, dict(params or {})))
+            if path == "/crm/v8/settings/fields":
+                return {"fields": [{"api_name": f} for f in self.fields]}
+            if path.endswith("/actions/count"):
+                return {"count": self.count}
+            if self.empty:
+                return None          # HTTP 204 — an EMPTY module
+            return self.pages.pop(0) if self.pages else {"data": []}
+
+    _dest = _zt / "crm"
+    _api = _FakeAPI(["Company", "Email"], [
+        {"data": [{"id": "1"}, {"id": "2"}],
+         "info": {"more_records": True, "next_page_token": "TK"}},
+        {"data": [{"id": "3"}], "info": {"more_records": False}}])
+    _res = zoho_vm_pull.pull_module_records(_api, "Leads", _dest, False,
+                                            None, 200)
+    _ledger = _dest / "records" / "Leads" / "records.jsonl"
+    check("zoho pull_module_records: paginates to exhaustion, writes ledger",
+          _res["status"] == "ok" and _res["records"] == 3
+          and _res["pages"] == 2
+          and len(_ledger.read_text().strip().splitlines()) == 3
+          and (_dest / "records" / "Leads" / ".cdp-complete").exists())
+    check("zoho pull_module_records: v8's mandatory fields param is sent",
+          any(p == "/crm/v8/Leads" and "fields" in q and "id" in q["fields"]
+              for p, q in _api.seen))
+    _res2 = zoho_vm_pull.pull_module_records(_api, "Leads", _dest, False,
+                                             None, 200)
+    check("zoho pull_module_records: a complete unit is skipped on re-run",
+          _res2["status"] == "skipped-complete")
+    _edest = _zt / "crm-empty"
+    _eres = zoho_vm_pull.pull_module_records(
+        _FakeAPI(["A"], [], empty=True), "Empty", _edest, False, None, 200)
+    check("zoho pull_module_records: HTTP 204 is an EMPTY module, not an "
+          "error", _eres["status"] == "ok" and _eres["records"] == 0
+          and (_edest / "records" / "Empty" / ".cdp-complete").exists())
+
+    check("zoho is_pagination_cap: the 100k ceiling is NOT a stale token",
+          zoho_vm_pull.is_pagination_cap(
+              zoho_vm_pull.ZohoAPIError(400, "PAGINATION_LIMIT_EXCEEDED", "x"))
+          and not zoho_vm_pull.is_pagination_cap(
+              zoho_vm_pull.ZohoAPIError(400, "INVALID_TOKEN", "x")))
+    _dj = _zt / "dedupe.jsonl"
+    _dj.write_text("".join(json.dumps({"id": i}) + "\n"
+                           for i in ["1", "2", "3", "2", "1"]))
+    check("zoho dedupe_jsonl_by_id: keeps first per id (two-ended walks "
+          "overlap in the middle)",
+          zoho_vm_pull.dedupe_jsonl_by_id(_dj) == (3, 2)
+          and [json.loads(x)["id"] for x in
+               _dj.read_text().strip().splitlines()] == ["1", "2", "3"])
+
+    class _CapAPI:
+        """Zoho's real behaviour: page_token dies at the cap. A blind
+        re-walk on that 400 is an infinite loop — this pins that it cannot
+        happen again, and that the other end is walked instead."""
+
+        def __init__(self, per_dir=3, total=1000):
+            self.calls, self.dirs, self.total = 0, [], total
+
+        def get_json(self, path, params=None, host=None):
+            p = params or {}
+            if path == "/crm/v8/settings/fields":
+                return {"fields": [{"api_name": "A"}]}
+            if path.endswith("/actions/count"):
+                return {"count": self.total}
+            self.calls += 1
+            if self.calls > 60:
+                raise AssertionError("INFINITE LOOP: blind page_token re-walk")
+            d = p.get("sort_order")
+            self.dirs.append(d)
+            n = sum(1 for x in self.dirs if x == d)
+            if n > 3:
+                raise zoho_vm_pull.ZohoAPIError(
+                    400, "PAGINATION_LIMIT_EXCEEDED", "cap")
+            base = 0 if d == "asc" else 500
+            return {"data": [{"id": str(base + n * 10 + i)} for i in range(2)],
+                    "info": {"more_records": True, "next_page_token": f"T{n}"}}
+    _cd = _zt / "cap"
+    _capi = _CapAPI(total=1000)
+    _cres = zoho_vm_pull.pull_module_records(_capi, "Tasks", _cd, False,
+                                             None, 200)
+    check("zoho pagination cap: no infinite re-walk, BOTH ends walked, "
+          "result flagged when the ledger is short of the source",
+          _capi.calls <= 60
+          and "asc" in _capi.dirs and "desc" in _capi.dirs
+          and _cres["hit_pagination_cap"] is True
+          and _cres["complete"] is False
+          and _cres["status"] == "partial"
+          and _cres["source_count"] == 1000
+          and any("INCOMPLETE" in n for n in (_cres.get("notes") or [])))
+    _capi2 = _CapAPI(total=12)
+    _cres2 = zoho_vm_pull.pull_module_records(_capi2, "Small", _zt / "cap2",
+                                              False, None, 200)
+    check("zoho pagination cap: a module the two ends DO cover reads as "
+          "complete", _cres2["complete"] is True
+          and _cres2["status"] == "ok")
+    _pman = zoho_vm_pull.build_manifest(
+        "crm", "com", None, {}, "T0", "T1", 1,
+        [{"unit": "records/Tasks", "kind": "records", "status": "partial",
+          "bytes": 5, "records": 100000, "source_count": 114999}])
+    check("zoho manifest: a partial unit is neither failed nor skipped, and "
+          "its bytes still count",
+          _pman["partial_units"] == [
+              {"unit": "records/Tasks", "records": 100000,
+               "source_count": 114999,
+               "reason": "zoho pagination ceiling"}]
+          and _pman["failed_units"] == [] and _pman["skipped_units"] == []
+          and _pman["total_staged_bytes"] == 5)
+    _pv = zoho_transfer.compare_manifest_to_blobs(
+        {"results": [{"unit": "records/Tasks", "status": "partial",
+                      "bytes": 5}],
+         "failed_units": [], "skipped_units": [],
+         "partial_units": [{"unit": "records/Tasks", "records": 100000,
+                            "source_count": 114999}]},
+        {"p/records/Tasks/.cdp-complete": {"size": 0},
+         "p/records/Tasks/records.jsonl": {"size": 9}}, "p")
+    check("zoho verify: a partial unit still certifies staged->container, "
+          "but is surfaced as a source-completeness warning",
+          _pv["ok"] and _pv["partial_units"])
+
+    class _WideAPI(_FakeAPI):
+        def get_json(self, path, params=None, host=None):
+            self.seen.append((path, dict(params or {})))
+            if path == "/crm/v8/settings/fields":
+                return {"fields": [{"api_name": f} for f in self.fields]}
+            if path.endswith("/actions/count"):
+                return {"count": self.count}
+            if "ids" in (params or {}):
+                return {"data": [{"id": "1", "z": 1}, {"id": "2", "z": 2}]}
+            return {"data": [{"id": "1", "a": 1}, {"id": "2", "a": 2}],
+                    "info": {"more_records": False}}
+    _wdest = _zt / "wide"
+    _wapi = _WideAPI([f"f{i}" for i in range(150)], [], count=2)
+    _wres = zoho_vm_pull.pull_module_records(_wapi, "Wide", _wdest, False,
+                                             None, 200)
+    _wrows = [json.loads(x) for x in
+              (_wdest / "records" / "Wide" / "records.jsonl")
+              .read_text().strip().splitlines()]
+    check("zoho wide module: extra field chunks re-fetch by ids and merge — "
+          "a page_token is never reused across different queries",
+          _wres["field_chunks"] > 1
+          and any("ids" in q for _, q in _wapi.seen)
+          and not any("page_token" in q and "ids" in q
+                      for _, q in _wapi.seen)
+          and _wrows[0] == {"id": "1", "a": 1, "z": 1})
+
+    check("zoho body_failure: a 200 with a failure BODY is a refusal, not "
+          "success (Learn's Access Denied arrives this way)",
+          zoho_vm_pull.body_failure(
+              {"result": "failure", "errorCode": "9001"}) == "9001"
+          and zoho_vm_pull.body_failure(
+              {"status": "failure", "errorCode": "INVALID_METHOD"})
+          == "INVALID_METHOD"
+          and zoho_vm_pull.body_failure({"errorCode": "EXTRA_PARAM_FOUND"})
+          == "EXTRA_PARAM_FOUND"
+          # success shapes must NOT trip it
+          and zoho_vm_pull.body_failure({"STATUS": "OK", "DATA": []}) == ""
+          and zoho_vm_pull.body_failure(
+              {"data": [{"id": "1"}], "info": {}}) == ""
+          and zoho_vm_pull.body_failure({"modules": []}) == ""
+          and zoho_vm_pull.body_failure(None) == "")
+
+    class _DeniedAPI:
+        """/course answers; /customportal returns HTTP 200 + Access Denied."""
+
+        def get_json(self, path, params=None, host=None):
+            if path.endswith("/course"):
+                return {"STATUS": "OK", "DATA": []}
+            code = zoho_vm_pull.body_failure(
+                {"result": "failure", "errorCode": "9001"})
+            raise zoho_vm_pull.ZohoAPIError(200, code, "denied")
+    _dd = zoho_vm_pull.learn_discover(_DeniedAPI(), "songdivision", "com")
+    check("zoho learn_discover: an Access-Denied path is NOT reported as "
+          "reachable",
+          _dd["kb_reachable"] == []
+          and all(v["state"].startswith("200-9001")
+                  for v in _dd["kb"].values())
+          and "COURSES ONLY" in _dd["note"])
+
+    class _AttAPI:
+        """Two pages of the Attachments module, then a download per row."""
+
+        def __init__(self):
+            self.listed = 0
+            self.downloads = []
+
+        def get_json(self, path, params=None, host=None):
+            assert path == "/crm/v8/Attachments", path
+            self.listed += 1
+            if self.listed == 1:
+                return {"data": [
+                    {"id": "a1", "File_Name": "p.pdf", "Size": "100",
+                     "Parent_Id": {"module": {"api_name": "Deals"},
+                                   "id": "d1"}},
+                    {"id": "a2", "File_Name": "p.pdf", "Size": "200",
+                     "Parent_Id": {"module": {"api_name": "Deals"},
+                                   "id": "d1"}}],
+                    "info": {"more_records": True, "next_page_token": "T"}}
+            return {"data": [
+                {"id": "a3", "File_Name": "q.pdf", "Size": "50",
+                 "Parent_Id": {"module": {"api_name": "Contacts"},
+                               "id": "c9"}}],
+                "info": {"more_records": False}}
+
+        def download(self, path, out_path):
+            self.downloads.append(path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"x")
+            return 1
+    _adest = _zt / "att"
+    _aapi = _AttAPI()
+    _ares = zoho_vm_pull.pull_attachments(_aapi, _adest, False, 2)
+    check("zoho attachments: ONE module walk, not a per-record sweep",
+          _aapi.listed == 2 and _ares["listed"] == 3 and _ares["files"] == 3
+          and _ares["expected_bytes"] == 350
+          and all(p.startswith("/crm/v8/") and "/Attachments/" in p
+                  for p in _aapi.downloads))
+    check("zoho attachments: id-first names keep same-filename files apart, "
+          "foldered by parent module/record",
+          (_adest / "attachments" / "Deals" / "d1"
+           / "a1__p.pdf").exists()
+          and (_adest / "attachments" / "Deals" / "d1"
+               / "a2__p.pdf").exists()
+          and (_adest / "attachments" / "Contacts" / "c9"
+               / "a3__q.pdf").exists())
+    _aapi2 = _AttAPI()
+    _ares2 = zoho_vm_pull.pull_attachments(_aapi2, _adest, False, 2)
+    check("zoho attachments: complete unit skipped on re-run",
+          _ares2["status"] == "skipped-complete"
+          and _aapi2.downloads == [])
+
+    class _EmAttAPI:
+        """Email attachments: the ledger drives it, detail yields ids, and
+        the DEDICATED download endpoint (not /Attachments/) fetches them."""
+
+        def __init__(self):
+            self.detail_calls = 0
+            self.dl = []
+
+        def get_json(self, path, params=None, host=None):
+            self.detail_calls += 1
+            assert "/Emails/" in path, path
+            return {"Emails": [{"attachments": [
+                {"id": "hex1", "name": "a.pdf", "size": 10},
+                {"id": "hex2", "name": "b.pdf", "size": 20}]}]}
+
+        def download(self, path, out_path, params=None):
+            self.dl.append((path, dict(params or {})))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"x")
+            return 1
+    _ed = _zt / "ematt"
+    (_ed / "emails" / "Contacts").mkdir(parents=True, exist_ok=True)
+    (_ed / "emails" / "Contacts" / "emails.jsonl").write_text(
+        json.dumps({"record_id": "r1", "messages": [
+            {"message_id": "m1", "has_attachment": "true",
+             "owner": {"id": "u1"}},
+            {"message_id": "m2", "has_attachment": "false",
+             "owner": {"id": "u1"}}]}) + "\n")
+    _eapi = _EmAttAPI()
+    _eres = zoho_vm_pull.pull_email_attachments(_eapi, "Contacts", _ed,
+                                                False, 2)
+    check("zoho email attachments: only has_attachment messages are opened, "
+          "and the DEDICATED download endpoint is used (not /Attachments/)",
+          _eapi.detail_calls == 1
+          and _eres["messages_with_attachments"] == 1
+          and _eres["files"] == 2
+          and all(p.endswith("/Emails/actions/download_attachments")
+                  for p, _ in _eapi.dl)
+          and all(q.get("message_id") == "m1" and q.get("user_id") == "u1"
+                  and q.get("id") in ("hex1", "hex2")
+                  for _, q in _eapi.dl))
+    check("zoho email attachments: no email ledger is a recorded skip",
+          zoho_vm_pull.pull_email_attachments(
+              _eapi, "Nope", _ed, False, 2)["reason"] == "no-email-ledger")
+    _asrc = (SCRIPTS / "zoho_vm_pull.py").read_text()
+    check("zoho attachments: Emails-parented rows are DEFERRED, not counted "
+          "as download errors (they need the other endpoint)",
+          'if pmod == "Emails":' in _asrc
+          and "deferred_to_email_unit" in _asrc)
+    check("zoho notes: sends v8's mandatory fields param",
+          '"fields": ",".join(note_fields)' in _asrc)
+
+    class _KBAPI:
+        def __init__(self, ok_paths):
+            self.ok = ok_paths
+
+        def get_json(self, path, params=None, host=None):
+            if any(path.endswith(s) for s in self.ok):
+                return {"data": []}
+            raise zoho_vm_pull.ZohoAPIError(404, "", f"HTTP 404 on {path}")
+    _disc = zoho_vm_pull.learn_discover(_KBAPI(["/course"]), "zylker", "com")
+    check("zoho learn_discover: KB is discovered, never assumed",
+          _disc["course_host"] == "learn.zoho.com"
+          and _disc["kb_reachable"] == []
+          and "COURSES ONLY" in _disc["note"]
+          and all(v["state"].startswith("404")
+                  for v in _disc["kb"].values()))
+    _disc2 = zoho_vm_pull.learn_discover(
+        _KBAPI(["/course", "/tag"]), "zylker", "eu")
+    check("zoho learn_discover: a reachable KB path is recorded and used",
+          _disc2["kb_reachable"] == ["tags"]
+          and "Reachable: tags" in _disc2["note"])
+    check("zoho learn_rows: Learn answers in UPPERCASE keys, unlike CRM",
+          zoho_vm_pull.learn_rows({"STATUS": "OK", "DATA": [1, 2]}) == [1, 2]
+          and zoho_vm_pull.learn_rows({"data": [3]}) == [3]
+          and zoho_vm_pull.learn_rows({"STATUS": "OK", "QUIZ": []}) == []
+          and zoho_vm_pull.learn_rows(None) == [])
+
+    class _ViewAPI:
+        """Mimics Learn's default scoping: view=learn (the API default) sees
+        only the caller's enrolments — zero for a Self Client admin."""
+
+        def __init__(self):
+            self.views = []
+            self.lesson_params = []
+
+        def get_json(self, path, params=None, host=None):
+            p = params or {}
+            if path.endswith("/course"):
+                self.views.append(p.get("view"))
+                if p.get("view") != "all":
+                    return {"STATUS": "OK", "DATA": [],
+                            "DASHBOARD": {"totalCourses": "0"}}
+                return {"STATUS": "OK", "DATA": [{"id": "c1"}, {"id": "c2"}]}
+            if "/lesson/" in path:
+                self.lesson_params.append(params or {})
+                return {"STATUS": "OK", "DATA": {"id": "L1"}}
+            return {"STATUS": "OK",
+                    "COURSE": {"id": "c1", "url": "cslug", "lessonCount": "1",
+                               "lessons": [{"id": "L1", "url": "lslug"}]}}
+    _vapi = _ViewAPI()
+    _vd = _zt / "learn-view"
+    _vdisc = {"course_host": "learn.zoho.com"}
+    _vres = zoho_vm_pull.pull_learn_courses(_vapi, "songdivision", _vdisc,
+                                            _vd, False)
+    check("zoho courses: view=all is REQUIRED — the API default 'learn' "
+          "means only the caller's enrolments and silently reports an "
+          "empty portal",
+          zoho_vm_pull.LEARN_COURSE_VIEW == "all"
+          and all(v == "all" for v in _vapi.views)
+          and _vres["items"] == 2 and _vres["details"] == 2
+          and (_vd / "courses" / "detail" / "c1.json").exists())
+    check("zoho flatten_lessons: CHAPTERs nest their BLOCKs — top-level "
+          "iteration silently drops the real content",
+          [L["id"] for L in zoho_vm_pull.flatten_lessons([
+              {"id": "ch", "lessons": [{"id": "b1"}, {"id": "b2"}]},
+              {"id": "v1"}])] == ["ch", "b1", "b2", "v1"]
+          and zoho_vm_pull.flatten_lessons(None) == []
+          and zoho_vm_pull.flatten_lessons([{"id": "a", "lessons": []}])
+          == [{"id": "a", "lessons": []}])
+    check("zoho lessons: detail route needs BOTH lesson.url and course.url "
+          "(slugs, not ids) and is gated on ZohoLearn.lesson.READ",
+          _vres["lessons"] == 2
+          and all(q.get("lesson.url") == "lslug"
+                  and q.get("course.url") == "cslug"
+                  for q in _vapi.lesson_params)
+          and (_vd / "courses" / "lessons" / "c1" / "L1.json").exists())
+
+    class _NoLimitAPI:
+        """A collection that IGNORES `limit` and returns everything every
+        time — /tag does exactly this (755 rows, verified live)."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_json(self, path, params=None, host=None):
+            self.calls += 1
+            return {"STATUS": "OK",
+                    "DATA": [{"id": str(i)} for i in range(755)]}
+    _nl = _NoLimitAPI()
+    _nld = _zt / "learn-nolimit"
+    _nld.mkdir(parents=True, exist_ok=True)
+    _n = zoho_vm_pull._learn_walk(_nl, "h", "/p", _nld, "tags.jsonl")
+    check("zoho _learn_walk: a limit-ignoring collection terminates, no "
+          "duplicates", _n == 755 and _nl.calls == 2
+          and len((_nld / "tags.jsonl").read_text().strip().splitlines())
+          == 755)
+    _kbres = zoho_vm_pull.pull_learn_kb(
+        _KBAPI(["/course"]), "zylker", _disc, _zt / "learn", False)
+    check("zoho pull_learn_kb: an absent KB is a recorded skip, not a "
+          "failure",
+          len(_kbres) == 1 and _kbres[0]["status"] == "skipped"
+          and _kbres[0]["reason"] == "endpoint-absent"
+          and (_zt / "learn" / "kb" / ".cdp-skipped.json").exists())
+    shutil.rmtree(_zt)
+
+    print("\n— figma_transfer --dry-run (engine lifecycle, VM-side REST "
+          "puller) —")
+    import figma_transfer  # noqa: E402
+    import figma_vm_pull  # noqa: E402
+    ftoken = "FIGDTOKENSENTINEL\n"
+    check("figma Spec: PAT flow (no OAuth/rclone), 512 GB disk",
+          figma_transfer.SPEC.vm_prefix == "xfer-figma-"
+          and figma_transfer.SPEC.authorize_target == ""
+          and figma_transfer.SPEC.remote_type == ""
+          and figma_transfer.SPEC.default_dest_prefix == "figma-export"
+          and figma_transfer.SPEC.default_os_disk_gb == 512)
+    proc = run_script("figma_transfer.py", "plan", "democo", "--team-ids",
+                      "123,456", "--root", root, "--dry-run")
+    fplan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("figma plan: dest + comma-joined team source",
+          fplan["vm_name"] == "xfer-figma-democo"
+          and fplan["dest"] == "democo-raw/figma-export"
+          and fplan["source"] == "figma:123,456")
+    proc = run_script("figma_transfer.py", "create-vm", "democo",
+                      "--team-ids", " 123 ,456", "--plan", "org",
+                      "--root", root, "--dry-run")
+    check("figma create-vm: 512 GB disk + the whole team list as ONE tag "
+          "value (canonicalized), plan tag rides along",
+          "--os-disk-size-gb 512" in proc.stdout
+          and "purpose=figma-transfer" in proc.stdout
+          and "figma_team_ids=123,456" in proc.stdout
+          and "figma_plan=org" in proc.stdout
+          and "dest_prefix=figma-export" in proc.stdout
+          and "-n xfer-figma-democo" in proc.stdout)
+    proc = run_script("figma_transfer.py", "plan", "democo", "--team-ids",
+                      "12a", "--root", root, "--dry-run", expect_rc=1)
+    check("figma team-id validation: a non-numeric id is a mis-paste, "
+          "refused before any az call",
+          "not numeric" in proc.stdout and "az " not in proc.stdout)
+    proc = run_script("figma_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("figma allow-network: vnet path (VM family), never IP rules",
+          "network-rule add" in proc.stdout and "--subnet" in proc.stdout
+          and "--ip-address" not in proc.stdout)
+    proc = run_script("figma_transfer.py", "write-dest", "democo",
+                      "--root", root, "--dry-run")
+    check("figma write-dest: racwl SAS -> rclone.conf + dest-figma.env, "
+          "redacted",
+          "--permissions racwl" in proc.stdout
+          and "figma-export" in proc.stdout
+          and "rclone.conf" in proc.stdout
+          and "dest-figma.env" in proc.stdout
+          and "redacted" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "figma_transfer.py"), "write-creds",
+         "democo", "--team-ids", "123", "--root", str(root), "--dry-run"],
+        input=ftoken, capture_output=True, text=True)
+    check("figma write-creds: the token sentinel is never echoed",
+          proc.returncode == 0
+          and "FIGDTOKENSENTINEL" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    check("figma write-creds: dry-run echo stays brace-free before the "
+          "JSON (VM smoke test uses curl -D -/sed, $VAR never braces)",
+          "{" not in proc.stdout[:proc.stdout.index("{")]
+          and json.loads(proc.stdout[proc.stdout.index("{"):])["ok"] is True)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "figma_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="tok1\ntok2\n", capture_output=True, text=True)
+    check("figma write-creds: refuses malformed stdin (must be 1 line)",
+          proc.returncode == 1 and "1 line" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "figma_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="fig'd\n", capture_output=True, text=True)
+    check("figma write-creds: single-quote guard refuses before writing",
+          proc.returncode == 1 and "single quote" in proc.stdout
+          and "nothing was written" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "figma_transfer.py"), "probe",
+         "democo", "--team-ids", "123,456", "--root", str(root),
+         "--dry-run"], input=ftoken, capture_output=True, text=True)
+    check("figma probe: laptop-side API JSON only — no Azure, no VM, "
+          "token redacted",
+          proc.returncode == 0
+          and "api.figma.com/v1/me" in proc.stdout
+          and "api.figma.com/v2/teams/123/folders" in proc.stdout
+          and "token-redacted" in proc.stdout
+          and "FIGDTOKENSENTINEL" not in proc.stdout
+          and "generate-sas" not in proc.stdout
+          and "network-rule" not in proc.stdout
+          and "az vm" not in proc.stdout, proc.stdout[-300:])
+    proc = run_script("figma_transfer.py", "transfer", "democo",
+                      "--team-ids", "123", "--root", root, "--dry-run")
+    check("figma transfer: pushes the puller fresh into tmux window "
+          "'figma', sourcing both env files",
+          "figma_vm_pull.py" in proc.stdout
+          and "tmux new-session -d -s transfer -n figma" in proc.stdout
+          and "figma.env" in proc.stdout
+          and "dest-figma.env" in proc.stdout)
+    proc = run_script("figma_transfer.py", "verify", "democo", "--root",
+                      root, "--dry-run")
+    check("figma verify: laptop path — ip rule + rl SAS + manifest, "
+          "never the write SAS",
+          "--permissions rl" in proc.stdout
+          and "network-rule add" in proc.stdout
+          and "figma-export/manifest.json" in proc.stdout
+          and "racwl" not in proc.stdout)
+    proc = run_script("figma_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", expect_rc=2)
+    check("figma teardown also gated", '"not-confirmed"' in proc.stdout)
+    proc = run_script("figma_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", "--confirmed")
+    check("figma confirmed teardown: engine set + PAT revocation reminder",
+          "network-rule remove" in proc.stdout
+          and "vnet delete" in proc.stdout
+          and "personal access token" in proc.stdout
+          and "revoke" in proc.stdout.lower())
+    fsrc = (SCRIPTS / "figma_vm_pull.py").read_text()
+    check("figma puller: markers, library cursor, honest write invariant",
+          ".cdp-complete" in fsrc and ".cdp-cursor.json" in fsrc
+          and "--overwrite=false" in fsrc
+          and '"If-None-Match"' not in fsrc
+          and '"x-ms-copy-source' not in fsrc)
+    check("figma puller: manifest REPLACES an earlier pass's, corpus never "
+          "does — the github pilot-poisons-verify fix ships from day one",
+          "--overwrite=true" in fsrc and "upload_run_metadata" in fsrc
+          and ".cdp-cursor.json;" in fsrc
+          and "--include-pattern" in fsrc)
+    check("figma puller: the token header is built in exactly ONE place "
+          "and never rides to the CDN (fills/renders are plain GETs)",
+          fsrc.count('"X-Figma-Token"') == 1
+          and "deliberately header-free" in fsrc)
+    check("figma puller: the token never reaches argv",
+          "--token" not in fsrc and "FIGMA_TOKEN" in fsrc)
+    _fmods = set()
+    for _n in ast.walk(ast.parse(fsrc)):
+        if isinstance(_n, ast.Import):
+            for _a in _n.names:
+                _fmods.add((_a.asname or _a.name).split(".")[0])
+        elif isinstance(_n, ast.ImportFrom) and _n.level == 0:
+            _fmods.add((_n.module or "").split(".")[0])
+    check("figma puller is stdlib-only (nothing to pip install on the VM)",
+          _fmods <= {"argparse", "concurrent", "json", "os", "shutil",
+                     "subprocess", "sys", "time", "urllib", "datetime",
+                     "pathlib", "__future__"}, str(sorted(_fmods)))
+
+    print("\n— figma_transfer / figma_vm_pull in-process (stubbed "
+          "transport) —")
+    check("figma validate_team_ids: canonicalizes, rejects mis-pastes",
+          figma_transfer.validate_team_ids(" 123 , 456 ") == "123,456")
+    for _bad, _frag in (("12a", "not numeric"), ("", "empty"),
+                        (",".join(["9" * 19] * 20), "batch")):
+        try:
+            figma_transfer.validate_team_ids(_bad)
+            _ok = False
+        except common.HarnessError as e:
+            _ok = _frag in str(e)
+        check(f"figma validate_team_ids: refuses {_frag}", _ok)
+    check("figma classify: status+family decide (the INVERSE of zoho's "
+          "body-code rule — Figma has no body codes)",
+          figma_vm_pull.classify(429, "file", True) == "sleep"
+          and figma_vm_pull.classify(403, "file", False) == "skip"
+          and figma_vm_pull.classify(404, "file", False) == "skip"
+          and figma_vm_pull.classify(403, "folders", True) == "fatal"
+          and figma_vm_pull.classify(400, "file", False) == "decompose"
+          and figma_vm_pull.classify(400, "nodes", False) == "decompose"
+          and figma_vm_pull.classify(400, "comments", False) == "skip"
+          and figma_vm_pull.classify(400, "comments", True) == "fatal"
+          and figma_vm_pull.classify(500, "file", False) == "decompose"
+          and figma_vm_pull.classify(503, "comments", False) == "retry")
+    check("figma REQUIRED_KINDS: only the walk is unconditionally "
+          "required — one 403 file must not lose the other 9,999",
+          figma_vm_pull.REQUIRED_KINDS == ("meta",)
+          and figma_vm_pull.classify(
+              403, "file", "file" in figma_vm_pull.REQUIRED_KINDS)
+          == "skip")
+
+    _fclock = {"t": 0.0}
+    _fsleeps: list = []
+
+    def _fnow():
+        return _fclock["t"]
+
+    def _fslp(s):
+        _fsleeps.append(round(s, 2))
+        _fclock["t"] += s
+    _fb = figma_vm_pull.TierBucket("org", now_fn=_fnow, sleep_fn=_fslp)
+    for _ in range(18):  # org tier 1 = 20/min * 0.9 safety = 18 burst
+        _fb.acquire(1)
+    check("figma TierBucket: a burst within the documented cap never "
+          "sleeps", _fsleeps == [])
+    _fb.acquire(1)
+    check("figma TierBucket: past the burst, pacing sleeps at the "
+          "documented rate (1 token / 0.3 per s)",
+          len(_fsleeps) == 1 and abs(_fsleeps[0] - (1 / 0.3)) < 0.1)
+    _fsleeps.clear()
+    _fb.on_429(1, 7)
+    check("figma TierBucket: 429 honors Retry-After EXACTLY and drains "
+          "the bucket", _fsleeps[0] == 7 and _fb._tokens[1] == 0.0)
+    _fb2 = figma_vm_pull.TierBucket("enterprise", now_fn=_fnow,
+                                    sleep_fn=_fslp)
+    _fb2.on_429(1, 5, "starter")
+    _fb3 = figma_vm_pull.TierBucket("starter", now_fn=_fnow,
+                                    sleep_fn=_fslp)
+    _fb3.on_429(1, 5, "enterprise")
+    check("figma TierBucket: the plan header downgrades pacing, never "
+          "upgrades it",
+          _fb2.plan == "starter" and _fb3.plan == "starter")
+
+    _fest = figma_vm_pull.estimate_tier1(10000, 500, render_pages=False)
+    check("figma estimate_tier1: counts + wall-clock per plan, NEVER bytes",
+          _fest["tier1_calls"] == 10500
+          and _fest["hours_by_plan"]["org"] == round(10500 / 18 / 60, 1)
+          and "bytes" not in json.dumps(_fest["hours_by_plan"]))
+    check("figma estimate_tier1: renders add ~one Tier-1 call per file",
+          figma_vm_pull.estimate_tier1(100, 0, True)["tier1_calls"] == 200)
+    check("figma page_node_ids: only top-level CANVAS children are pages",
+          figma_vm_pull.page_node_ids(
+              {"document": {"children": [
+                  {"type": "CANVAS", "id": "1:2"},
+                  {"type": "SECTION", "id": "9"}]}}) == ["1:2"]
+          and figma_vm_pull.page_node_ids({}) == [])
+    check("figma parse_render_map: a 200 with null values is a per-node "
+          "FAILURE, never counted as delivered",
+          figma_vm_pull.parse_render_map(
+              {"images": {"a": "u", "b": None}}) == ({"a": "u"}, ["b"]))
+    check("figma fill_ext: extension from Content-Type; unknown stays bare",
+          figma_vm_pull.fill_ext("image/png") == ".png"
+          and figma_vm_pull.fill_ext("image/jpeg; charset=x") == ".jpg"
+          and figma_vm_pull.fill_ext("application/octet-stream") == "")
+    _frow = {"team_id": "1", "folder_path": "Root", "key": "KEY1",
+             "name": "My Design!", "branches": [{"key": "BR1"}]}
+    check("figma unit_label: file KEY first, mutable name second — a "
+          "rename never orphans the marker",
+          figma_vm_pull.unit_label("file", _frow)
+          == "files/1/KEY1__My_Design")
+    _funits = figma_vm_pull.plan_units(
+        [_frow, {"team_id": "1", "folder_path": "A", "key": "AKEY",
+                 "name": "a"}], ["1"], 0, None)
+    check("figma plan_units: library first, then files in deterministic "
+          "(team, folder, key) order",
+          [figma_vm_pull.unit_label(k, p) for k, p in _funits]
+          == ["library/1", "files/1/AKEY__a", "files/1/KEY1__My_Design"])
+    check("figma plan_units: --only matches a bare file key",
+          [figma_vm_pull.unit_label(k, p) for k, p in
+           figma_vm_pull.plan_units([_frow], ["1"], 0, "KEY1")]
+          == ["files/1/KEY1__My_Design"])
+    check("figma plan_units: --limit pilots the first N file units",
+          len(figma_vm_pull.plan_units(
+              [_frow, {"team_id": "1", "folder_path": "A", "key": "AKEY",
+                       "name": "a"}], ["1"], 1, None,
+              include_library=False)) == 1)
+
+    _ft = Path(tempfile.mkdtemp(prefix="figma-test-"))
+    _fjl = _ft / "lib.jsonl"
+    _fl1 = json.dumps({"key": "1"}) + "\n"
+    _fjl.write_text(_fl1 + '{"key": "2')
+    check("figma resume_truncate: a torn trailing line is discarded",
+          figma_vm_pull.resume_truncate(_fjl, {"bytes": len(_fl1)}) == 1
+          and _fjl.read_text() == _fl1)
+
+    _fman = figma_vm_pull.build_manifest(
+        ["1"], "org", {"files_in_ledger": 2}, "T0", "T1", 99, [
+            {"unit": "meta", "kind": "meta", "status": "ok", "bytes": 10},
+            {"unit": "files/1/K__a", "kind": "file", "status": "ok",
+             "bytes": 100, "decomposed": True, "fill_errors": 2,
+             "render_nulls": 1},
+            {"unit": "files/1/K2__b", "kind": "file", "status": "failed",
+             "detail": "boom"},
+            {"unit": "files/1/K3__c", "kind": "file", "status": "skipped",
+             "reason": "no-access-or-missing"}])
+    check("figma build_manifest: skipped is NEVER failed; decomposed and "
+          "quality rollups surfaced",
+          _fman["failed_units"] == ["files/1/K2__b"]
+          and _fman["skipped_units"][0]["reason"] == "no-access-or-missing"
+          and _fman["decomposed_files"] == ["files/1/K__a"]
+          and _fman["total_staged_bytes"] == 110
+          and _fman["fill_errors"] == 2 and _fman["render_nulls"] == 1)
+    _fp = "figma-export"
+    _fclean = {
+        f"{_fp}/meta/.cdp-complete": {"size": 0},
+        f"{_fp}/meta/files.jsonl": {"size": 10},
+        f"{_fp}/files/1/K__a/.cdp-complete": {"size": 0},
+        f"{_fp}/files/1/K__a/document.json": {"size": 100},
+        f"{_fp}/manifest.json": {"size": 5},
+    }
+    _fvman = {"source": "figma", "unit_count": 2, "total_staged_bytes": 110,
+              "failed_units": [], "skipped_units": [],
+              "decomposed_files": [], "results": [
+                  {"unit": "meta", "kind": "meta", "status": "ok",
+                   "bytes": 10},
+                  {"unit": "files/1/K__a", "kind": "file", "status": "ok",
+                   "bytes": 100}]}
+    r = figma_transfer.compare_manifest_to_blobs(_fvman, _fclean, _fp)
+    check("figma verify math: clean pass",
+          r["ok"] and not r["short_uploads"] and not r["missing_markers"])
+    _fshort = dict(_fclean)
+    _fshort[f"{_fp}/files/1/K__a/document.json"] = {"size": 40}
+    r = figma_transfer.compare_manifest_to_blobs(_fvman, _fshort, _fp)
+    check("figma verify math: short upload fails",
+          not r["ok"] and r["short_uploads"])
+    _fnomark = dict(_fclean)
+    del _fnomark[f"{_fp}/meta/.cdp-complete"]
+    r = figma_transfer.compare_manifest_to_blobs(_fvman, _fnomark, _fp)
+    check("figma verify math: missing marker fails",
+          not r["ok"] and r["missing_markers"] == [f"{_fp}/meta/"])
+    _fextra = dict(_fclean)
+    _fextra[f"{_fp}/files/1/K__a/old.json"] = {"size": 60}
+    r = figma_transfer.compare_manifest_to_blobs(_fvman, _fextra, _fp)
+    check("figma verify math: stale extra is informational, not a failure",
+          r["ok"] and r["stale_extra"] == [f"{_fp}/files/1/K__a/"])
+    _ffman = dict(_fvman)
+    _ffman["failed_units"] = ["files/1/K2__b"]
+    r = figma_transfer.compare_manifest_to_blobs(_ffman, _fclean, _fp)
+    check("figma verify math: failed_units surfaced verbatim",
+          not r["ok"] and r["failed_units"] == ["files/1/K2__b"])
+    _fsman = dict(_fvman)
+    _fsman["skipped_units"] = [{"unit": "files/1/K3__c",
+                                "reason": "no-access-or-missing"}]
+    r = figma_transfer.compare_manifest_to_blobs(_fsman, _fclean, _fp)
+    check("figma verify math: a deliberate skip never fails the verify",
+          r["ok"] and r["skipped_units"][0]["reason"]
+          == "no-access-or-missing")
+
+    class _FigAPI:
+        """Minimal FigmaAPI stand-in: the pullers only call get_json."""
+
+        def __init__(self, fail_full=False, null_once=None):
+            self.seen = []
+            self.fail_full = fail_full
+            self.null_once = null_once
+            self.render_calls = 0
+
+        def get_json(self, family, path, params=None, absolute_url=None):
+            self.seen.append((family, path or absolute_url,
+                              dict(params or {})))
+            p = params or {}
+            if path.startswith("/v2/teams/"):
+                return {"folders": [{"id": "f1", "name": "Root"}]}
+            if path == "/v2/folders/f1/folders":
+                return {"folders": [{"id": "f2", "name": "Sub"}]}
+            if path == "/v2/folders/f2/folders":
+                return {"folders": []}
+            if path == "/v2/folders/f1/files":
+                return {"files": [
+                    {"key": "KEY1", "name": "My Design!",
+                     "last_modified": "2026-01-01",
+                     "branches": [{"key": "BR1", "name": "b"}]}]}
+            if path == "/v2/folders/f2/files":
+                return {"files": []}
+            if path in ("/v1/files/KEY1", "/v1/files/BR1"):
+                if self.fail_full and "depth" not in p \
+                        and path == "/v1/files/KEY1":
+                    raise figma_vm_pull.FigmaAPIError(
+                        400, "file", "Request timeout, try smaller")
+                return {"editorType": "figma", "version": "7",
+                        "document": {"children": [
+                            {"type": "CANVAS", "id": "1:2"},
+                            {"type": "CANVAS", "id": "1:3"}]}}
+            if path == "/v1/files/KEY1/nodes":
+                return {"nodes": {i: {"document": {}}
+                                  for i in p.get("ids", "").split(",")}}
+            if path == "/v1/files/KEY1/comments":
+                return {"comments": []}
+            if path == "/v1/files/KEY1/versions" and not absolute_url:
+                return {"versions": [{"id": "v1"}],
+                        "pagination": {"next_page":
+                                       "https://api.figma.com/x?page=2"}}
+            if absolute_url:
+                return {"versions": [{"id": "v2"}], "pagination": {}}
+            if path == "/v1/files/KEY1/images":
+                return {"meta": {"images": {"ref1": "https://cdn/x",
+                                            "ref2": None}}}
+            if path == "/v1/images/KEY1":
+                self.render_calls += 1
+                ids = p.get("ids", "").split(",")
+                out = {i: f"https://cdn/{i}" for i in ids}
+                if self.null_once and self.render_calls == 1 \
+                        and self.null_once in out:
+                    out[self.null_once] = None
+                return {"images": out}
+            raise figma_vm_pull.FigmaAPIError(404, family,
+                                              f"unexpected {path}")
+
+    _fcdn: list = []
+
+    def _fake_cdn(url, out_base):
+        _fcdn.append(url)
+        out_path = out_base.with_name(out_base.name + ".png")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"x")
+        return 1, out_path
+    _saved_cdn = figma_vm_pull.cdn_download
+    figma_vm_pull.cdn_download = _fake_cdn
+    try:
+        _fdest = _ft / "dest"
+        _fapi = _FigAPI()
+        _mres, _mrows = figma_vm_pull.pull_meta(_fapi, _fdest, ["9"], False)
+        check("figma pull_meta: recursive v2 walk writes the ledger, "
+              "nested subfolder found, branches counted",
+              _mres["status"] == "ok" and len(_mrows) == 1
+              and _mrows[0]["key"] == "KEY1"
+              and _mres["branches"] == 1
+              and (_fdest / "meta" / ".cdp-complete").exists()
+              and any(f == "folders" and "/v2/folders/f2/folders" in p
+                      for f, p, _ in _fapi.seen))
+        from types import SimpleNamespace as _NS
+        _fargs = _NS(refresh=False, no_comments=False, no_versions=False,
+                     no_fills=False, fill_workers=1, render_pages=True)
+        _fres = figma_vm_pull.pull_file(_fapi, _mrows[0], _fdest, _fargs)
+        _fudir = _fdest / "files" / "9" / "KEY1__My_Design"
+        _fmeta = json.loads((_fudir / "file.json").read_text())
+        check("figma pull_file: document + comments + paginated versions "
+              "+ fills + per-page renders + branch tree, one marker",
+              _fres["status"] == "ok"
+              and (_fudir / "document.json").exists()
+              and (_fudir / ".cdp-complete").exists()
+              and _fmeta["editor_type"] == "figma"
+              and len(json.loads((_fudir / "versions.json").read_text())
+                      ["versions"]) == 2
+              and (_fudir / "fills" / "ref1.png").exists()
+              and (_fudir / "renders" / "1_2.png").exists()
+              and (_fudir / "renders" / "1_3.png").exists()
+              and (_fudir / "branches" / "BR1"
+                   / "document.json").exists())
+        check("figma pull_file: a null-URL fill is listed but never "
+              "fetched (a 200 is not per-item success)",
+              _fmeta["fills"]["listed"] == 2
+              and _fmeta["fills"]["downloaded"] == 1
+              and not any("ref2" in u for u in _fcdn))
+        _fres2 = figma_vm_pull.pull_file(_fapi, _mrows[0], _fdest, _fargs)
+        check("figma pull_file: a complete unit is skipped on re-run",
+              _fres2["status"] == "skipped-complete")
+        _fapi3 = _FigAPI(fail_full=True)
+        _fdec = figma_vm_pull.pull_file(
+            _fapi3, {"team_id": "9", "folder_path": "Root", "key": "KEY1",
+                     "name": "big", "branches": []},
+            _ft / "dest2", _fargs)
+        check("figma decompose: an oversized file re-pulls as depth-1 + "
+              "per-node JSON — complete, recorded, not failed",
+              _fdec["status"] == "ok" and _fdec["decomposed"] is True
+              and (_ft / "dest2" / "files" / "9" / "KEY1__big"
+                   / "nodes" / "1_2.json").exists()
+              and any(f == "file" and p == "/v1/files/KEY1"
+                      and q.get("depth") == 1
+                      for f, p, q in _fapi3.seen))
+        _fapi4 = _FigAPI(null_once="1:2")
+        _fnull = figma_vm_pull.pull_file(
+            _fapi4, {"team_id": "9", "folder_path": "Root", "key": "KEY1",
+                     "name": "nul", "branches": []},
+            _ft / "dest3", _fargs)
+        check("figma renders: a null node is retried once, then delivered "
+              "or recorded — never silently dropped",
+              _fnull["status"] == "ok" and _fapi4.render_calls >= 2
+              and _fnull["render_nulls"] == 0
+              and (_ft / "dest3" / "files" / "9" / "KEY1__nul"
+                   / "renders" / "1_2.png").exists())
+    finally:
+        figma_vm_pull.cdn_download = _saved_cdn
+    shutil.rmtree(_ft)
+
+    print("\n— reconcile: figma plain prefix pin (single-prefix ingest) —")
+    figco = root / "figmaco"
+    (figco / "sizing-runs").mkdir(parents=True)
+    common.write_json(figco / "config.json", {
+        "slug": "figmaco", "subscription": "m1 corpus",
+        "subscription_id": "x", "resource_group": "rg-figmaco",
+        "storage_account": "stfigmaco", "container": "figmaco-raw",
+        "vm": {"name": None, "resource_group": "rg-figmaco",
+               "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(figco / "expected-data-sizes.json", {
+        "slug": "figmaco", "manifest_total_bytes": 50_000_000_000,
+        "services": {
+            "figma": {"bytes": 50_000_000_000, "prefix": "figma-export"}},
+        "source": "test", "confirmed_by_user": True,
+        "created_at": "2026-08-01T00:00:00Z"})
+    common.write_json(figco / "status.json", {
+        "slug": "figmaco", "stage": "pushing",
+        "last_run": {"timestamp": "2026-08-13T09:00:00Z",
+                     "outcome": "sized", "reason": None},
+        "last_change_detected_at": "2026-08-13T09:00:00Z"})
+    common.write_json(figco / "sizing-runs" / "20260813T100000Z.json", {
+        "slug": "figmaco", "timestamp": "2026-08-13T10:00:00Z",
+        "method": "sized", "copied_from": None,
+        "used_capacity_bytes": 40_000_000_000,
+        "used_capacity_at": "2026-08-13T09:00:00Z", "duration_seconds": 60,
+        "totals": {"blob_count": 500,
+                   "compressed_bytes": 40_000_000_000,
+                   "uncompressed_bytes": 42_000_000_000,
+                   "zero_byte_blobs": 0},
+        "sources": {"figma-export": {"blob_count": 500,
+                                     "compressed_bytes": 40_000_000_000,
+                                     "uncompressed_bytes":
+                                         42_000_000_000}},
+        "methods": {"stored": 500}, "errors": {"total": 0, "by_type": {}},
+        "notes": []})
+    figs = reconcile.company_summary(root, "figmaco")
+    figrows = {r["service"]: r for r in figs["service_rows"]}
+    check("figma pin: the plain prefix pin attributes the whole export "
+          "(no source_split needed — single prefix, unlike zoho)",
+          figrows["figma"]["actual_bytes"] == 42_000_000_000,
+          str(figrows["figma"]))
+    check("figma pin: the pinned prefix is not an unexpected source",
+          "figma-export" not in figs["unexpected_sources"],
+          str(figs["unexpected_sources"]))
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
@@ -2626,6 +4300,195 @@ def main() -> int:
          qwilr_transfer._sleep, common.run_az,
          phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
          phases.mint_sas) = saved
+
+    print("\n— qwilr_csv_pull (support-CSV fallback, no API) —")
+    import qwilr_csv_pull as qcp  # noqa: E402
+
+    csv_cols = ("Page name,Page ID,Status,Password protected,"
+                "Public/shareable URL,Collaborator URL,PDF download URL\n")
+    (root / "democo" / "qwilr-pages.csv").write_text(
+        csv_cols
+        + "Landed,aaa111,Live,false,https://pages.qwilr.com/Landed-TOKAAA,"
+          "https://pages.qwilr.com/collaborate/TOKAAA/secA,"
+          "https://pages.qwilr.com/pdf/TOKAAA\n"
+        + "Fresh,bbb222,Accepted,false,https://pages.qwilr.com/Fresh-TOKBBB,"
+          "https://pages.qwilr.com/collaborate/TOKBBB/secB,"
+          "https://pages.qwilr.com/pdf/TOKBBB\n"
+        + "Secret,ccc333,Draft,false,https://pages.qwilr.com/Secret-TOKCCC,"
+          "https://pages.qwilr.com/collaborate/TOKCCC/secC,"
+          "https://pages.qwilr.com/pdf/TOKCCC\n")
+
+    # pure helpers
+    check("csv: pdf_token from the PDF URL; is_public gates on status",
+          qcp.pdf_token({"PDF download URL":
+                         "https://pages.qwilr.com/pdf/AbC123 "}) == "AbC123"
+          and qcp.is_public({"Status": "Live", "Password protected": "false"})
+          and not qcp.is_public({"Status": "Draft",
+                                 "Password protected": "false"})
+          and not qcp.is_public({"Status": "Live",
+                                 "Password protected": "true"}))
+    loader = ('ng-init="initialData = {&quot;downloadPdfPath&quot;:&quot;'
+              'https://download.qwilr.com/u-u-i-d.pdf&quot;,&quot;pdfPath')
+    m = qcp.PDF_LOADER_RE.search(loader)
+    check("csv: loader-page regex finds the fresh render URL",
+          m and m.group(1) == "https://download.qwilr.com/u-u-i-d.pdf")
+    got_assets = qcp.extract_asset_urls(
+        b'<img src="https://qwilr.imgix.net/raster/x?w=1"> '
+        b'{&quot;v&quot;:&quot;https://example.com/clip.mp4&quot;} '
+        b'<a href="https://app.qwilr.com/some-page">')
+    check("csv: asset extraction by CDN host and media ext, pages excluded",
+          got_assets == ["https://example.com/clip.mp4",
+                         "https://qwilr.imgix.net/raster/x?w=1"])
+
+    # plan + pull --dry-run via the CLI
+    proc = run_script("qwilr_csv_pull.py", "plan", "democo", "--root", root)
+    cplan = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("csv plan: counts public vs restricted, dest from config, no token",
+          cplan["pages"] == 3 and cplan["public_pages (html+pdf)"] == 2
+          and cplan["restricted_pages (collaborator html only)"] == 1
+          and cplan["dest"] == "democo-raw/qwilr-export"
+          and "no API token" in cplan["mode"])
+    proc = run_script("qwilr_csv_pull.py", "pull", "democo", "--root", root,
+                      "--dry-run")
+    out = proc.stdout
+    check("csv pull dry-run: rc 0, racwl SAS, laptop IP rule, create-only",
+          proc.returncode == 0 and "racwl" in out
+          and "network-rule add" in out and "allow-network" not in out
+          and "If-None-Match: *" in out, out[-300:])
+    check("csv pull dry-run: ledger CSV + html + pdf render planned",
+          "_meta/qwilr-pages.csv" in out and "text/csv" in out
+          and "page.html" in out and "trigger render" in out
+          and "application/pdf" in out)
+
+    # in-process pull: resume skips, draft via collaborator, pdf pipeline
+    saved_csv = (qcp.http_get, qcp.azure_put_bytes, qcp.azure_list_sizes,
+                 qcp.trigger_render, qcp.poll_pdf, qcp._sleep, qcp._now,
+                 qwilr_transfer.azure_put_json, qwilr_transfer.mint_write_sas,
+                 common.run_az, phases.ip_rule_ensure,
+                 phases.ip_rule_remove_if_ours, phases.mint_sas)
+    try:
+        fetched, put_names, triggered = [], [], []
+
+        def fake_http_get(url, retries=4, timeout=120, ok_statuses=()):
+            fetched.append(url)
+            return 200, (b'<html><img src='
+                         b'"https://qwilr.imgix.net/pic"></html>')
+
+        def fake_put_bytes(cfg, sas, name, body, ctype, dry_run):
+            put_names.append((name, ctype))
+            return len(body)
+
+        qcp.http_get = fake_http_get
+        qcp.azure_put_bytes = fake_put_bytes
+        qcp.azure_list_sizes = lambda cfg, sas, prefix, dry: {
+            "qwilr-export/_meta/qwilr-pages.csv": 100,
+            "qwilr-export/pages/aaa111/metadata.json": 5,
+            "qwilr-export/pages/aaa111/page.html": 10,
+            "qwilr-export/pages/aaa111/page.pdf": 20}
+        qcp.trigger_render = lambda tok: (triggered.append(tok)
+                                          or f"https://dl/{tok}.pdf")
+        qcp.poll_pdf = lambda url: b"%PDF-1.7 fake"
+        qcp._sleep = lambda s: None
+        qwilr_transfer.azure_put_json = (
+            lambda cfg, sas, name, obj, dry: put_names.append(
+                (name, "application/json")) or 10)
+        qwilr_transfer.mint_write_sas = (
+            lambda cfg, days, dry: ("sig=fake", "2026-08-28T00:00:00Z"))
+        common.run_az = lambda *a, **k: types.SimpleNamespace(stdout="")
+        phases.ip_rule_ensure = lambda cfg, dry_run=False: (True, "1.2.3.4")
+        removed_csv = []
+        phases.ip_rule_remove_if_ours = (
+            lambda cfg, ip, we, dry_run=False: removed_csv.append((ip, we)))
+
+        cargs = types.SimpleNamespace(
+            slug="democo", csv=None, dest_prefix="qwilr-export", sas_days=1,
+            limit=None, pdf_concurrency=2, pdf_timeout=60,
+            pdf_poll_seconds=0, dry_run=False)
+        cres = qcp.cmd_pull(root, cargs)
+        names = [n for n, _ in put_names]
+        check("csv pull: landed page + ledger skipped, never re-fetched",
+              cres["html_skipped_existing"] == 1
+              and cres["pdf_skipped_existing"] == 1
+              and "qwilr-export/_meta/qwilr-pages.csv" not in names
+              and not any("TOKAAA" in u for u in fetched))
+        check("csv pull: draft fetched via its collaborator URL, no render",
+              any("/collaborate/TOKCCC/" in u for u in fetched)
+              and "TOKCCC" not in triggered)
+        check("csv pull: fresh public page gets html + pdf, draft html only",
+              ("qwilr-export/pages/bbb222/page.pdf", "application/pdf")
+              in put_names
+              and ("qwilr-export/pages/bbb222/page.html", "text/html")
+              in put_names
+              and ("qwilr-export/pages/ccc333/page.html", "text/html")
+              in put_names
+              and triggered == ["TOKBBB"]
+              and not any(n.endswith("ccc333/page.pdf") for n in names))
+        check("csv pull: index + assets manifest written, clean run, IP rule "
+              "removed",
+              cres["ok"] is True and cres["errors"]["count"] == 0
+              and any(n.startswith("qwilr-export/_meta/pull-index-")
+                      for n in names)
+              and any(n.startswith("qwilr-export/_meta/assets-manifest-")
+                      for n in names)
+              and removed_csv == [("1.2.3.4", True)])
+
+        # 429 on a render trigger: requeued with backoff, never burned
+        clock = {"t": 0.0}
+        qcp._now = lambda: clock["t"]
+
+        def fake_sleep(s):
+            clock["t"] += max(s, 1)
+
+        qcp._sleep = fake_sleep
+        trig = {"n": 0}
+
+        def flaky_trigger(tok):
+            trig["n"] += 1
+            if trig["n"] <= 2:
+                raise qcp.RateLimited(tok)
+            return f"https://dl/{tok}.pdf"
+
+        qcp.trigger_render = flaky_trigger
+        up, _, perrs = qcp.run_pdf_pipeline(
+            {"storage_account": "st", "container": "c"}, "sas",
+            [("pX", "TOKX", "qwilr-export/pages/pX/page.pdf")],
+            2, 600, 1, False)
+        check("csv pdf pipeline: 429 requeues with backoff, then lands",
+              up == 1 and perrs == {} and trig["n"] == 3)
+
+        def always_429(tok):
+            raise qcp.RateLimited(tok)
+
+        qcp.trigger_render = always_429
+        up, _, perrs = qcp.run_pdf_pipeline(
+            {"storage_account": "st", "container": "c"}, "sas",
+            [("pY", "TOKY", "qwilr-export/pages/pY/page.pdf")],
+            2, 600, 1, False)
+        check("csv pdf pipeline: endless 429 gives up the pass, run ends",
+              up == 0 and "gave up" in perrs.get("pY", ""))
+
+        # verify math: missing pdf on a public page; drafts never owe one
+        qcp.azure_list_sizes = lambda cfg, sas, prefix, dry: {
+            "qwilr-export/pages/aaa111/page.html": 10,
+            "qwilr-export/pages/aaa111/page.pdf": 20,
+            "qwilr-export/pages/bbb222/page.html": 10,
+            "qwilr-export/pages/ccc333/page.html": 0}
+        phases.mint_sas = lambda cfg, dry_run=False: "sig=fake"
+        cver = qcp.cmd_verify(root, cargs)
+        check("csv verify: missing pdf flagged, drafts exempt, zero-byte "
+              "caught",
+              cver["ok"] is False and cver["missing_pdf"] == ["bbb222"]
+              and cver["missing_html"] == []
+              and cver["zero_byte_blobs"] == [
+                  "qwilr-export/pages/ccc333/page.html"]
+              and cver["ledger_csv_landed"] is False)
+    finally:
+        (qcp.http_get, qcp.azure_put_bytes, qcp.azure_list_sizes,
+         qcp.trigger_render, qcp.poll_pdf, qcp._sleep, qcp._now,
+         qwilr_transfer.azure_put_json, qwilr_transfer.mint_write_sas,
+         common.run_az, phases.ip_rule_ensure,
+         phases.ip_rule_remove_if_ours, phases.mint_sas) = saved_csv
+        (root / "democo" / "qwilr-pages.csv").unlink()
 
 
     print("\n— vimeo_transfer --dry-run (server-side-copy ingest) —")

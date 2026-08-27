@@ -71,8 +71,18 @@ worker() {
                     "$conc" 2>&1)"
                 rc=$?
             elif [ "$jtype" = "R" ]; then
-                out="$(azcopy copy "$S3_SRC_URL/$jprefix/" \
-                    "$AZURE_DEST_URL/$jprefix?$AZURE_DEST_SAS" \
+                # azcopy copies a directory source INTO the dest — the
+                # source dir's NAME is appended at the destination (found
+                # live on checkmate/amplitude: dest .../p produced .../p/p).
+                # So the dest is the job's PARENT: $AZURE_DEST_URL for a
+                # depth-1 job, $AZURE_DEST_URL/<parents> for deeper ones.
+                # S3_SRC_PREFIX (optional, may be absent in older aws.env)
+                # scopes the SOURCE only; jobs are relative to it.
+                local jparent=""
+                [[ "$jprefix" == */* ]] && jparent="/${jprefix%/*}"
+                out="$(azcopy copy \
+                    "$S3_SRC_URL/${S3_SRC_PREFIX:+${S3_SRC_PREFIX}/}$jprefix/" \
+                    "$AZURE_DEST_URL$jparent?$AZURE_DEST_SAS" \
                     --recursive --overwrite=false --log-level ERROR 2>&1)"
                 rc=$?
             else
@@ -113,7 +123,7 @@ worker() {
             # whole destination prefix to build its check list — 2h+ and
             # still going for 21 files against a 242M-blob dest (measured
             # live). With it, rclone stats only the named objects.
-            rclone copy "s3:$S3_BUCKET" \
+            rclone copy "s3:$S3_BUCKET${S3_SRC_PREFIX:+/$S3_SRC_PREFIX}" \
                 "azure:$AZURE_DEST_CONTAINER/$AZURE_DEST_PREFIX" \
                 --files-from "$BASE/chunks/$jprefix" --no-traverse \
                 --transfers 16 --checkers 16 --retries 5 \
@@ -121,8 +131,9 @@ worker() {
             rc=$?
             jobid="rclone"; comp=""; fail=""; skip=""; bytes=""
         else
-            # S job: loose files at exactly this level; empty prefix = root
-            local src="s3:$S3_BUCKET${jprefix:+/$jprefix}"
+            # S job: loose files at exactly this level; empty prefix = the
+            # scope root (S3_SRC_PREFIX if set, else the bucket root)
+            local src="s3:$S3_BUCKET${S3_SRC_PREFIX:+/$S3_SRC_PREFIX}${jprefix:+/$jprefix}"
             local dst="azure:$AZURE_DEST_CONTAINER/$AZURE_DEST_PREFIX${jprefix:+/$jprefix}"
             rclone copy "$src" "$dst" --max-depth 1 \
                 --transfers 16 --checkers 16 --retries 5 \
@@ -202,6 +213,8 @@ deep = sys.argv[1] == "deep"
 base = os.path.expanduser("~/xfer-jobs")
 env = os.environ
 bucket = env["S3_BUCKET"]
+src_prefix = env.get("S3_SRC_PREFIX", "").strip("/")
+s3_root = f"{bucket}/{src_prefix}" if src_prefix else bucket
 dest = f"{env['AZURE_DEST_CONTAINER']}/{env['AZURE_DEST_PREFIX']}"
 
 def size(remote, shallow):
@@ -223,7 +236,7 @@ for ln in open(os.path.join(base, "jobs.txt")):
     jtype, _, prefix = ln.partition("\t")
     shallow = jtype == "S"
     sub = f"/{prefix}" if prefix else ""
-    s3 = size(f"s3:{bucket}{sub}", shallow)
+    s3 = size(f"s3:{s3_root}{sub}", shallow)
     az = size(f"azure:{dest}{sub}", shallow)
     if s3 is None or az is None:
         status, row = "LIST-ERROR", ("?", "?", "?", "?")
@@ -232,7 +245,7 @@ for ln in open(os.path.join(base, "jobs.txt")):
         status = "ok" if (s3[0] == az[0] and s3[1] == az[1]) else "MISMATCH"
     diffs = ""
     if deep and status == "ok" and not shallow:
-        p = subprocess.run(["rclone", "check", f"s3:{bucket}{sub}",
+        p = subprocess.run(["rclone", "check", f"s3:{s3_root}{sub}",
                            f"azure:{dest}{sub}", "--one-way", "--size-only"],
                           capture_output=True, text=True)
         if p.returncode != 0:

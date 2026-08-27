@@ -66,6 +66,14 @@ reads only indexes/trailers):
                      bz2-stored/xz-stored (untouched), bz2-exact/xz-exact
                      (streamed), bz2-truncated/xz-truncated (ends mid-stream;
                      exact partial count).
+  .parquet        -> footer FileMetaData (thrift compact) via 1–2 Range GETs;
+                     sum column chunks' total_uncompressed_size (decompressed
+                     PAGE bytes — codecs undone, dict/RLE encodings intact).
+                     Same trust class as a zip CD, in BOTH modes: no stdlib
+                     codec for the pages, so deep verify can't stream them.
+                     Methods: parquet-footer, parquet-tiny, parquet-encrypted,
+                     parquet-bad-magic, parquet-bad-footer (last three floored
+                     to stored size).
   .7z/.rar/.zst   -> stored size (no stdlib codec); deep verify counts them
                      as an "unmeasurable format" residual, never silently.
   everything else -> uncompressed = content-length (accurate for loose files).
@@ -180,6 +188,8 @@ def blob_kind(name):
         return "bz2"
     if lname.endswith((".tar.xz", ".txz", ".xz")):
         return "xz"
+    if lname.endswith(".parquet"):
+        return "parquet"
     return "stored"
 
 
@@ -203,7 +213,7 @@ def unmeasurable_ext(name):
 # so transient failures retry next run. A cache can only cost time, never
 # correctness: any doubt → miss. bz2/xz rows exist so a deep run's exact
 # measurements replay on later shallow runs.
-CACHEABLE_KINDS = ("zip", "gz", "bz2", "xz")
+CACHEABLE_KINDS = ("zip", "gz", "bz2", "xz", "parquet")
 
 
 def _check_header(line, fingerprint):
@@ -634,6 +644,188 @@ def gz_uncompressed(name, clen):
     return isize, "gz-trailer"
 
 
+# ── Parquet footer parsing (thrift compact protocol) ─────────────────────────
+# A parquet file ends [FileMetaData thrift blob][4-byte LE footer length]
+# ["PAR1"]. The footer's ColumnMetaData records carry total_uncompressed_size —
+# the decompressed size of every column chunk's pages. Structurally this is
+# the zip-CD play: metadata read via ranged GETs, trusted rather than
+# measured. Unlike zip there is no stdlib codec for the data pages (snappy),
+# so deep verify cannot upgrade these rows into measurements in ANY mode —
+# they are terminal on first read and permanently "trusted" in coverage.
+# Semantics caveat (matters for declared-vs-actual): the total is decompressed
+# PAGE bytes — compression codecs undone, but dictionary/RLE encodings intact.
+# A warehouse's logical size (e.g. the BigQuery console, which prices decoded
+# in-memory widths) is generally HIGHER for the same tables.
+PARQUET_TAIL = 65536  # one tail GET usually covers len+magic AND the footer
+
+
+class _ThriftError(ValueError):
+    pass
+
+
+def _tc_varint(buf, p):
+    out = shift = 0
+    while True:
+        if p >= len(buf) or shift > 63:
+            raise _ThriftError("bad varint")
+        b = buf[p]
+        p += 1
+        out |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return out, p
+        shift += 7
+
+
+def _tc_zigzag(buf, p):
+    n, p = _tc_varint(buf, p)
+    return (n >> 1) ^ -(n & 1), p
+
+
+def _tc_value(buf, p, ttype, depth):
+    """Decode one thrift-compact value of wire type ttype at buf[p]."""
+    if ttype == 3:  # i8: one signed byte
+        if p >= len(buf):
+            raise _ThriftError("i8 past end")
+        v = buf[p]
+        return (v - 256 if v > 127 else v), p + 1
+    if ttype in (4, 5, 6):  # i16/i32/i64: zigzag varint
+        return _tc_zigzag(buf, p)
+    if ttype == 7:  # double: 8 raw bytes (endianness irrelevant here)
+        if p + 8 > len(buf):
+            raise _ThriftError("double past end")
+        return struct.unpack("<d", buf[p:p + 8])[0], p + 8
+    if ttype == 8:  # binary/string: varint length + bytes
+        ln, p = _tc_varint(buf, p)
+        if p + ln > len(buf):
+            raise _ThriftError("binary past end")
+        return buf[p:p + ln], p + ln
+    if ttype in (9, 10):  # list/set: (size<<4|etype), size 15 → varint
+        if p >= len(buf):
+            raise _ThriftError("list header past end")
+        hdr = buf[p]
+        p += 1
+        size, etype = hdr >> 4, hdr & 0x0F
+        if size == 15:
+            size, p = _tc_varint(buf, p)
+        if size > len(buf):  # each element costs ≥1 byte — cheap sanity bound
+            raise _ThriftError("list size implausible")
+        vals = []
+        for _ in range(size):
+            if etype in (1, 2):  # bool elements: one byte each
+                if p >= len(buf):
+                    raise _ThriftError("bool past end")
+                vals.append(buf[p] == 1)
+                p += 1
+            else:
+                v, p = _tc_value(buf, p, etype, depth)
+                vals.append(v)
+        return vals, p
+    if ttype == 11:  # map: varint size, then (ktype<<4|vtype), then pairs
+        size, p = _tc_varint(buf, p)
+        if size == 0:
+            return {}, p
+        if p >= len(buf) or size > len(buf):
+            raise _ThriftError("map header past end")
+        kt, vt = buf[p] >> 4, buf[p] & 0x0F
+        p += 1
+        out = {}
+        for _ in range(size):
+            k, p = _tc_value(buf, p, kt, depth)
+            v, p = _tc_value(buf, p, vt, depth)
+            out[k if not isinstance(k, (bytes, dict, list)) else str(k)] = v
+        return out, p
+    if ttype == 12:  # struct
+        return _tc_struct(buf, p, depth + 1)
+    raise _ThriftError(f"wire type {ttype}")
+
+
+def _tc_struct(buf, p, depth=0):
+    """Parse a thrift-compact struct into {field_id: value}. Field header
+    byte: (id delta << 4) | type; delta 0 → long form (zigzag id follows);
+    type 0 = STOP. Bool field values live in the type nibble itself."""
+    if depth > 16:
+        raise _ThriftError("nesting too deep")
+    out = {}
+    fid = 0
+    while True:
+        if p >= len(buf):
+            raise _ThriftError("struct past end")
+        byte = buf[p]
+        p += 1
+        if byte == 0:
+            return out, p
+        delta, ttype = byte >> 4, byte & 0x0F
+        if delta:
+            fid += delta
+        else:
+            fid, p = _tc_zigzag(buf, p)
+        if ttype == 1:
+            out[fid] = True
+        elif ttype == 2:
+            out[fid] = False
+        else:
+            out[fid], p = _tc_value(buf, p, ttype, depth)
+
+
+def parquet_uncompressed(name, clen):
+    """Return (uncompressed_bytes, method). Reads the footer only: one tail
+    range GET; a second exact GET only when the footer outgrows the tail.
+    Sums ColumnMetaData.total_uncompressed_size (field 6) across every row
+    group's column chunks, falling back to RowGroup.total_byte_size (field 2)
+    for a row group whose column metadata is absent or malformed. Methods:
+      parquet-footer     footer parsed — decompressed page bytes
+      parquet-tiny       clen < 12: can't be a parquet file — stored size
+      parquet-encrypted  encrypted footer (PARE magic) — stored size
+      parquet-bad-magic  tail magic isn't PAR1: misnamed file — stored size
+      parquet-bad-footer footer length insane or thrift unparseable — stored"""
+    if clen < 12:  # magic + len + magic minimum
+        return clen, "parquet-tiny"
+    tail = fetch_range(name, max(0, clen - PARQUET_TAIL), clen - 1)
+    magic = tail[-4:]
+    if magic == b"PARE":
+        return clen, "parquet-encrypted"
+    if magic != b"PAR1":
+        return clen, "parquet-bad-magic"
+    flen = struct.unpack("<I", tail[-8:-4])[0]
+    if not flen or flen + 8 > clen:
+        return clen, "parquet-bad-footer"
+    if flen + 8 <= len(tail):
+        footer = tail[-(flen + 8):-8]
+    else:
+        footer = fetch_range(name, clen - 8 - flen, clen - 9)
+    try:
+        meta, _ = _tc_struct(footer, 0)
+        row_groups = meta.get(4, [])
+        if not isinstance(row_groups, list):
+            raise _ThriftError("row_groups not a list")
+        total = 0
+        for rg in row_groups:
+            if not isinstance(rg, dict):
+                raise _ThriftError("row group not a struct")
+            cols = rg.get(1)
+            col_total, cols_ok = 0, isinstance(cols, list) and bool(cols)
+            if cols_ok:
+                for col in cols:
+                    md = col.get(3) if isinstance(col, dict) else None
+                    sz = md.get(6) if isinstance(md, dict) else None
+                    if type(sz) is not int or sz < 0:
+                        cols_ok = False
+                        break
+                    col_total += sz
+            if cols_ok:
+                total += col_total
+            else:
+                tbs = rg.get(2)
+                if type(tbs) is not int or tbs < 0:
+                    raise _ThriftError("row group has no usable size")
+                total += tbs
+        return total, "parquet-footer"
+    except (ValueError, struct.error, IndexError, OverflowError) as exc:
+        logmsg(f"parquet footer unparseable {name}: "
+               f"{type(exc).__name__}: {str(exc)[:80]}")
+        return clen, "parquet-bad-footer"
+
+
 def stream_blob_chunks(name, chunk=1 << 20):
     """Chunked GET of a whole blob. Deliberately separate from http_get
     (which buffers entire bodies) — streaming holds one chunk in memory."""
@@ -895,7 +1087,11 @@ def _method_terminal(method):
     return (method in ("gz-exact", "gz-truncated", "bz2-exact", "bz2-truncated",
                        "xz-exact", "xz-truncated", "zip-exact",
                        "gz-tiny", "zip-tiny", "zip:0entries")
-            or method.startswith("zip-exact-mismatch"))
+            or method.startswith("zip-exact-mismatch")
+            # every parquet outcome is terminal: the footer is the best any
+            # mode can do (no stdlib codec for the data pages), and the
+            # fallbacks are deterministic parses of the same bytes
+            or method.startswith("parquet"))
 
 
 def cached_row_stale(kind, method, clen, uncomp):
@@ -1028,6 +1224,10 @@ def size_blob(name, clen, etag, kind, matcher, budget=None):
                 except Exception as exc:  # noqa: BLE001 — keep trailer value
                     logmsg(f"stream fallback {name}: {type(exc).__name__}: "
                            f"{str(exc)[:120]}")
+        elif kind == "parquet":
+            # footer metadata in BOTH modes — no stdlib codec for the data
+            # pages, so deep verify has nothing better to stream
+            uncomp, method = parquet_uncompressed(name, clen)
         elif kind in ("bz2", "xz"):
             # only reached in deep mode — shallow enqueues these directly
             # (content-length, no HTTP) without a pool submission
@@ -1078,6 +1278,10 @@ def coverage_class(kind, method, name):
     if kind == "gz":
         return ("measured" if method in ("gz-exact", "gz-truncated", "gz-tiny")
                 else "trusted")
+    if kind == "parquet":
+        # footer totals are metadata we cannot stream-verify (no snappy
+        # codec in the stdlib) — permanently trusted, even in deep mode
+        return "measured" if method == "parquet-tiny" else "trusted"
     # bz2 / xz
     return ("measured" if method.endswith(("-exact", "-truncated"))
             else "trusted")

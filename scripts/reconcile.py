@@ -99,7 +99,17 @@ def service_rows(expected: dict | None, run: dict | None,
 
     Row: {service, declared_bytes, declared_records, actual_bytes,
           actual_compressed, blob_count, pct, flags[]}
-    Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded | deduplicated
+    Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded | deduplicated | unit-adjusted
+
+    A declaration may carry "equivalent_bytes" (+ mandatory
+    "equivalent_note"): the ACTUAL data re-expressed in the manifest's own
+    unit, for services where the two are known to differ (healthtap's
+    bigquery: the sizer measures parquet decompressed PAGE bytes, the client
+    declared BigQuery console LOGICAL bytes; a decoded-sample measurement
+    bridges them). pct then compares like for like (equivalent vs declared),
+    actual_bytes stays the sizer's truth, the row is flagged unit-adjusted,
+    and equivalent_unit_notes() always surfaces the basis — never silent,
+    the duplicate_prefixes discipline.
     """
     services = (expected or {}).get("services", {})
     if sources is None:
@@ -136,7 +146,14 @@ def service_rows(expected: dict | None, run: dict | None,
             if row["actual_bytes"] > 0:
                 row["flags"].append("zero-declared-has-data")
         elif row["declared_bytes"]:
-            row["pct"] = row["actual_bytes"] / row["declared_bytes"] * 100
+            eq = decl.get("equivalent_bytes")
+            if eq and row["actual_bytes"] > 0:
+                row["equivalent_bytes"] = eq
+                row["equivalent_note"] = decl.get("equivalent_note", "")
+                row["flags"].append("unit-adjusted")
+                row["pct"] = eq / row["declared_bytes"] * 100
+            else:
+                row["pct"] = row["actual_bytes"] / row["declared_bytes"] * 100
             if row["actual_bytes"] == 0:
                 d = _find_detected(svc, detected)
                 if d and d.get("bytes", 0) > 0:
@@ -218,6 +235,16 @@ def lore_notes(run: dict | None) -> list[str]:
             ".tar.gz files are sized from the gzip trailer: exact below 4 GiB, "
             "floored at stored size above — multi-GB tarballs are a small, "
             "known undercount (the price of not streaming them for hours).")
+    pq = run.get("methods", {}).get("parquet", 0)
+    if pq:
+        notes.append(
+            f"{pq:,} parquet file(s) sized from their footers: the "
+            f"uncompressed total is decompressed page bytes (compression "
+            f"codecs undone; dictionary/run-length encodings intact). A "
+            f"warehouse's logical size for the same tables — e.g. the "
+            f"BigQuery console, which the client likely declared from — is "
+            f"generally higher, so compare like for like before calling a "
+            f"shortfall.")
     badzip = run.get("errors", {}).get("by_type", {}).get("BadZipFile", 0)
     if badzip:
         notes.append(
@@ -256,6 +283,20 @@ def detection_notes(rows: list[dict], expected: dict | None,
             notes.append(
                 f"Detected ~{d['bytes'] / 1e9:.1f} GB of {svc} data under "
                 f"{hosts}; {svc} is not declared in the manifest.")
+    return notes
+
+
+def equivalent_unit_notes(rows: list[dict]) -> list[str]:
+    """A unit-adjusted % must never appear without its basis on the page."""
+    notes = []
+    for r in rows:
+        if "equivalent_bytes" in r:
+            notes.append(
+                f"{r['service']}: the {r['equivalent_bytes'] / 1e12:.1f} TB "
+                f"used for %-complete is the actual data re-expressed in the "
+                f"manifest's own unit (measured "
+                f"{r['actual_bytes'] / 1e12:.2f} TB as stored/page bytes). "
+                + (r.get("equivalent_note") or ""))
     return notes
 
 
@@ -549,6 +590,7 @@ def company_summary(root: Path, slug: str) -> dict:
                  + excluded_prefix_note(excluded)
                  + lore_notes(latest) + detection_notes(rows, expected, latest,
                                                         sources)
+                 + equivalent_unit_notes(rows)
                  + duplicate_notes(root, slug),
         "expected_confirmed": bool((expected or {}).get("confirmed_by_user")),
     }

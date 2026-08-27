@@ -14,3 +14,9 @@ __pycache__/
 .DS_Store
 .preview/
 .idea/
+
+# sas-mint needs the Azure SDK (the rest of the harness is stdlib-only); local venv
+scripts/sas-mint/.venv/
+
+# minted credential zips never belong in git
+*-sas.zip

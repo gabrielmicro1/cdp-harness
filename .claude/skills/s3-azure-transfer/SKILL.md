@@ -283,6 +283,22 @@ remediation conversation).
   whose errors say `InvalidObjectState` are the cold tail the probe
   sample missed — quantify from failed.txt, tell the client what needs
   restoring, and re-queue after the restore lands.
+- **`--src-prefix <p>` scopes the whole engagement to one subtree of the
+  bucket** (checkmate/amplitude, 2026-08: the client's IAM policy
+  conditioned `s3:ListBucket` on `amplitude/*`, so root listings 403'd).
+  Every listing, job, and verify covers only that subtree; jobs are
+  enumerated RELATIVE to it, so the dest stays `{dest-prefix}/{job}`
+  with no source-prefix doubling — `--src-prefix amplitude
+  --dest-prefix amplitude` mirrors `bucket/amplitude/` to
+  `container/amplitude/`. Sticky via the `s3_src_prefix` VM tag (set it
+  at retag/create time). Foldered subtrees only — flat chunked mode is
+  not wired for it. A root listing that 403s while a prefixed one works
+  is the tell for a prefix-conditioned policy.
+- **azcopy dir-copy appends the source folder name at the dest** (found
+  live on checkmate/amplitude: dest `.../p` produced `.../p/p/...`).
+  The runner therefore targets the job's PARENT. If dest paths ever
+  look doubled, kill the workers first — the racwl SAS cannot delete,
+  so every misplaced blob needs a user-approved cleanup conversation.
 - Bucket names containing dots break virtual-host TLS
   (`<bucket.with.dots>.s3.amazonaws.com`) — surface it; the runner's URL
   style would need path-style addressing. A client conversation, not a

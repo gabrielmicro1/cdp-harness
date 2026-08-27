@@ -1,0 +1,16 @@
+{
+  "Name": "Corpus Blob Pusher",
+  "IsCustom": true,
+  "Description": "Blob data-plane read/write/add WITHOUT delete. The minimum needed to sign a racwl user-delegation SAS (a user-delegation SAS is capped by the signer's RBAC at request time, so the signer must hold every action the SAS grants -- and no more). Deliberately omits blobs/delete and blobs/move/action so the holder can never destroy client corpus data.",
+  "Actions": [],
+  "NotActions": [],
+  "DataActions": [
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
+  ],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/600b01d1-fe30-46df-b332-ec8bdccdd40d"
+  ]
+}

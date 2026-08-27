@@ -82,6 +82,23 @@ def _dest_prefix(vm: dict, args) -> str:
             or vm["tags"].get("dest_prefix") or SPEC.default_dest_prefix)
 
 
+def _src_prefix(vm: dict, args) -> str:
+    """Optional source scope INSIDE the bucket (e.g. an IAM policy that
+    conditions s3:ListBucket on one prefix — checkmate's amplitude/ export).
+    Empty = whole bucket (the original behavior). Jobs are enumerated
+    RELATIVE to this scope, so the dest stays {dest_prefix}/{job} with no
+    source-prefix doubling. Flag --src-prefix, else the s3_src_prefix VM
+    tag; normalized to no leading/trailing slash."""
+    raw = (getattr(args, "src_prefix", None)
+           or vm["tags"].get("s3_src_prefix") or "")
+    return raw.strip("/")
+
+
+def _src_root(bucket: str, src: str) -> str:
+    """rclone path for the scope root: s3:bucket[/src]."""
+    return f"s3:{bucket}/{src}" if src else f"s3:{bucket}"
+
+
 def _bucket_region(ip: str, bucket: str, dry_run: bool) -> str:
     """x-amz-bucket-region via an unauthenticated HEAD (works even on 403)."""
     proc = eng.run_ssh(
@@ -144,6 +161,7 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
             "stdin must be exactly 2 lines: the AWS Access Key ID, then "
             "the Secret Access Key")
     key_id, secret = lines
+    src = _src_prefix(vm, args)
     region = _bucket_region(vm["public_ip"], bucket, args.dry_run)
     if not region and not args.dry_run:
         return {"ok": False, "stage": "region-detect",
@@ -156,6 +174,7 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
            f"AWS_SECRET_ACCESS_KEY='{secret}'\n"
            f"AWS_REGION='{region}'\n"
            f"S3_BUCKET='{bucket}'\n"
+           f"S3_SRC_PREFIX='{src}'\n"
            f"S3_SRC_URL='https://{bucket}.s3.{region}.amazonaws.com'\n")
     _write_env(vm["public_ip"], AWS_ENV, env, args.dry_run)
     section = (f"[s3]\ntype = s3\nprovider = AWS\nenv_auth = true\n"
@@ -168,13 +187,14 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
     # emits nothing at all; only -R streams per page, so head fills after
     # the first page. Success = at least one key listed (this bucket is
     # never legitimately empty at setup time).
+    root_path = _src_root(bucket, src)
     ls = _s3_ssh(vm["public_ip"],
-                 f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                 f"timeout 60 rclone lsf --files-only -R '{root_path}' "
                  "2>/dev/null | head -5",
                  dry_run=args.dry_run, check=False, timeout=90)
     if not (ls.stdout or "").strip() and not args.dry_run:
         err = _s3_ssh(vm["public_ip"],
-                      f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+                      f"timeout 60 rclone lsf --files-only -R '{root_path}' "
                       "2>&1 >/dev/null | head -5",
                       check=False, timeout=90)
         return {"ok": False, "stage": "rclone lsf s3",
@@ -183,6 +203,7 @@ def cmd_write_s3_creds(root: Path, args) -> dict:
                         "missing s3:ListBucket, or a requester-pays bucket. "
                         "Run probe for the requester-pays check."}
     return {"ok": True, "bucket": bucket, "region": region,
+            "src_prefix": src or None,
             "written_to": [f"{vm['name']}:{AWS_ENV}",
                            f"{vm['name']}:{eng.RCLONE_CONF}"],
             "listing_head": ls.stdout.strip()[:600]
@@ -196,13 +217,19 @@ def cmd_probe(root: Path, args) -> dict:
     vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
     bucket, _ = eng.loc_and_prefix(SPEC, vm, args)
     ip = vm["public_ip"]
+    src = _src_prefix(vm, args)
+    sroot = _src_root(bucket, src)
     region = _bucket_region(ip, bucket, args.dry_run)
     notes: list[str] = []
+    if src:
+        notes.append(f"scoped to source prefix {src}/ — every listing, "
+                     "job and verify in this engagement covers only that "
+                     "subtree of the bucket")
     # recursive lsf, never lsd/--max-depth 1: only -R streams per page;
     # non-recursive listings buffer the whole directory (300M entries on a
     # flat bucket) before printing, so head never fills and the ssh
     # timeout turns into a crash
-    ls = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+    ls = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R '{sroot}' "
                      "2>/dev/null | head -5",
                  dry_run=args.dry_run, check=False, timeout=90)
     listing_ok = bool((ls.stdout or "").strip()) or (
@@ -210,7 +237,7 @@ def cmd_probe(root: Path, args) -> dict:
     requester_pays = False
     if not listing_ok and not args.dry_run:
         rp = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
-                         f"s3:{bucket} --s3-requester-pays 2>/dev/null "
+                         f"{sroot} --s3-requester-pays 2>/dev/null "
                          "| head -5",
                      check=False, timeout=90)
         if (rp.stdout or "").strip():
@@ -223,7 +250,7 @@ def cmd_probe(root: Path, args) -> dict:
                 "for the engagement.")
     if not listing_ok and not args.dry_run:
         err = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
-                          f"s3:{bucket} 2>&1 >/dev/null | head -5",
+                          f"{sroot} 2>&1 >/dev/null | head -5",
                       check=False, timeout=90)
         return {"ok": False, "bucket": bucket, "region": region,
                 "stage": "listing",
@@ -235,7 +262,7 @@ def cmd_probe(root: Path, args) -> dict:
     # flat bucket's sample is all bare root keys. The --dirs-only survey
     # below must be gated on this, or it pages the whole bucket without
     # ever emitting a line.
-    rs = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R s3:{bucket} "
+    rs = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R {sroot} "
                      "2>/dev/null | head -1000",
                  dry_run=args.dry_run, check=False, timeout=90)
     sample = [ln for ln in (rs.stdout or "").splitlines() if ln.strip()]
@@ -253,7 +280,7 @@ def cmd_probe(root: Path, args) -> dict:
     # census; a cold tail beyond it would surface as job failures + verify
     tiers: dict[str, int] = {}
     tp = _s3_ssh(ip, f"rclone lsf --format \"T\" --files-only -R "
-                     f"s3:{bucket} 2>/dev/null | head -20000 "
+                     f"{sroot} 2>/dev/null | head -20000 "
                      "| sort | uniq -c | sort -rn",
                  dry_run=args.dry_run, check=False, timeout=300)
     for ln in (tp.stdout or "").splitlines():
@@ -272,7 +299,7 @@ def cmd_probe(root: Path, args) -> dict:
         # every key until the ssh timeout kills it — skip the survey
         prefixes: list[str] = []
     else:
-        pf = _s3_ssh(ip, f"rclone lsf --dirs-only s3:{bucket} 2>/dev/null "
+        pf = _s3_ssh(ip, f"rclone lsf --dirs-only {sroot} 2>/dev/null "
                          "| head -200", dry_run=args.dry_run, check=False,
                      timeout=300)
         prefixes = [p.rstrip("/") for p in (pf.stdout or "").splitlines()
@@ -313,6 +340,14 @@ def cmd_plan_jobs(root: Path, args) -> dict:
     vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
     bucket, _ = eng.loc_and_prefix(SPEC, vm, args)
     ip = vm["public_ip"]
+    src = _src_prefix(vm, args)
+    sroot = _src_root(bucket, src)
+    if src and args.flat is True:
+        return {"ok": False, "cause": "flat-src-prefix-unsupported",
+                "hint": "flat (chunked list-of-files) mode is not wired for "
+                        "--src-prefix — s3_flat.py lists and presigns "
+                        "bucket-rooted keys. Scoped engagements need a "
+                        "foldered subtree."}
     windows = _tmux_windows(ip, args.dry_run)
     if any(w.startswith("w") and w[1:].isdigit() for w in windows):
         return {"ok": False, "cause": "transfer-running",
@@ -383,11 +418,17 @@ def cmd_plan_jobs(root: Path, args) -> dict:
         # buffers the whole dir), SIGPIPE-terminated after ~one page. Keys
         # containing "/" prove folder structure.
         rs = _s3_ssh(ip, f"timeout 60 rclone lsf --files-only -R "
-                         f"s3:{bucket} 2>/dev/null | head -1000",
+                         f"{sroot} 2>/dev/null | head -1000",
                      dry_run=args.dry_run, check=False, timeout=90)
         sample = [ln for ln in (rs.stdout or "").splitlines() if ln.strip()]
         dirs_n = sum(1 for ln in sample if "/" in ln)
         flat = len(sample) > 0 and dirs_n == 0
+    if flat and src:
+        return {"ok": False, "cause": "flat-src-prefix-unsupported",
+                "hint": f"the {src}/ subtree looks flat (no second-level "
+                        "folders in the sample) — chunked flat mode is not "
+                        "wired for --src-prefix. Force --no-flat only if "
+                        "the sample was unlucky."}
     if flat:
         # launch state: start the detached range-sharded listing
         _push_runner(ip, args.dry_run)
@@ -405,7 +446,7 @@ def cmd_plan_jobs(root: Path, args) -> dict:
                         "keys, hours if it falls back to sequential) — "
                         "re-run plan-jobs to poll, then it splits into "
                         "chunk jobs automatically"}
-    ls = _s3_ssh(ip, f"rclone lsf --dirs-only --max-depth 2 -R s3:{bucket} "
+    ls = _s3_ssh(ip, f"rclone lsf --dirs-only --max-depth 2 -R {sroot} "
                      "2>/dev/null", dry_run=args.dry_run, check=False,
                  timeout=3600)
     dirs = [d.rstrip("/") for d in (ls.stdout or "").splitlines()
@@ -442,7 +483,8 @@ def cmd_plan_jobs(root: Path, args) -> dict:
                     f"&& rm -f {XFER_DIR}/done.txt {XFER_DIR}/failed.txt "
                     f"{XFER_DIR}/verify.tsv",
                 stdin_data=content, dry_run=args.dry_run)
-    return {"ok": True, "bucket": bucket, "jobs": len(jobs),
+    return {"ok": True, "bucket": bucket, "src_prefix": src or None,
+            "jobs": len(jobs),
             "recursive_jobs": sum(1 for t, _ in jobs if t == "R"),
             "shallow_jobs": sum(1 for t, _ in jobs if t == "S"),
             "split_depth_used": depth_used if not args.dry_run else None,
@@ -623,8 +665,9 @@ def cmd_verify(root: Path, args) -> dict:
     if args.prefix is not None:
         bucket, _ = eng.loc_and_prefix(SPEC, vm, args)
         prefix = _dest_prefix(vm, args)
+        sroot = _src_root(bucket, _src_prefix(vm, args))
         sub = f"/{args.prefix}" if args.prefix else ""
-        s3 = _s3_ssh(ip, f"rclone size --json 's3:{bucket}{sub}'",
+        s3 = _s3_ssh(ip, f"rclone size --json '{sroot}{sub}'",
                      dry_run=args.dry_run, check=False, timeout=1800)
         az = _s3_ssh(ip, f"rclone size --json "
                          f"'azure:{cfg['container']}/{prefix}{sub}'",
@@ -826,6 +869,14 @@ def main() -> int:
                    help=f"prefix inside <slug>-raw "
                         f"(default {SPEC.default_dest_prefix})")
     p.add_argument("--sas-days", type=int, default=21)
+    p.add_argument("--src-prefix", dest="src_prefix", default=None,
+                   help="scope the engagement to ONE prefix inside the "
+                        "bucket (listing, jobs, verify all cover only that "
+                        "subtree; jobs are relative to it, so dest is "
+                        "{dest-prefix}/{job}). Sticky via the s3_src_prefix "
+                        "VM tag; needed when the IAM policy conditions "
+                        "s3:ListBucket on a prefix. Foldered subtrees only "
+                        "(flat chunked mode is not wired for it)")
     p.add_argument("--split-depth", type=int, choices=(0, 1, 2), default=0,
                    help="plan-jobs: prefix depth for job splitting "
                         "(0 = auto: deepen to 2 when depth 1 yields fewer "

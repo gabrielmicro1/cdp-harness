@@ -105,6 +105,7 @@ FLAG_BADGES = {
     "overshoot": ("over 100%", "warn"),
     "found-embedded": ("embedded in another source", "info"),
     "deduplicated": ("duplicate share excluded", "info"),
+    "unit-adjusted": ("measured in declared units", "info"),
 }
 
 
@@ -114,7 +115,10 @@ def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
     for r in rows:
         if r["declared_records"] is not None:
             continue  # record-count services: listed in the table, not the chart
-        entries.append((r["service"], r["declared_bytes"] or 0, r["actual_bytes"]))
+        eq = r.get("equivalent_bytes")
+        entries.append((r["service"] + (" †" if eq else ""),
+                        r["declared_bytes"] or 0, eq or r["actual_bytes"]))
+    adjusted = any(n.endswith(" †") for n, _, _ in entries)
     for s in unexpected:
         entries.append((s + " *", 0, sources[s]["uncompressed_bytes"]))
     entries.sort(key=lambda e: -e[2])
@@ -160,10 +164,12 @@ def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
     parts.append("</svg>")
     scale_note = (" · log scale (sources span orders of magnitude)"
                   if log_scale else "")
+    adj_note = (" · † actual re-expressed in the manifest's declared unit"
+                if adjusted else "")
     legend = (f'<div class="legend"><span><i style="background:{DECLARED_COLOR}">'
               f'</i>declared</span><span><i style="background:{ACTUAL_COLOR}"></i>'
               f'uncompressed (actual)</span><span class="meta">'
-              f'* not in manifest{scale_note}</span></div>')
+              f'* not in manifest{adj_note}{scale_note}</span></div>')
     return f'<div class="chart">{legend}{"".join(parts)}</div>'
 
 
@@ -177,9 +183,14 @@ def service_table(rows: list[dict], unexpected: list[str], sources: dict) -> str
                 else common.human_bytes(r["declared_bytes"]))
         pct = f'{r["pct"]:.1f}%' if r["pct"] is not None else "—"
         flags = " ".join(badge(*FLAG_BADGES[f]) for f in r["flags"]) or ""
+        actual = common.human_bytes(r["actual_bytes"])
+        if r.get("equivalent_bytes"):
+            actual += (f' <span class="meta">(≈ '
+                       f'{common.human_bytes(r["equivalent_bytes"])} in '
+                       f'declared units)</span>')
         out.append(f'<tr><td>{esc(r["service"])}</td>'
                    f'<td class="num">{esc(decl)}</td>'
-                   f'<td class="num">{common.human_bytes(r["actual_bytes"])}</td>'
+                   f'<td class="num">{actual}</td>'
                    f'<td class="num">{pct}</td><td>{flags}</td></tr>')
     for s in unexpected:
         out.append(f'<tr><td>{esc(s)}</td><td class="num">—</td>'
@@ -252,19 +263,15 @@ def build_html(s: dict) -> str:
            f'</div></div>' if pct is not None else "")
     kpis.append(f'<div class="card"><div class="label">Complete vs manifest'
                 f'</div><div class="value">{pct_txt}</div>{bar}</div>')
-    excl_bits = ([f'{common.human_bytes(s["duplicate_bytes"])} duplicate data']
-                 if s.get("duplicate_bytes") else []) + \
-                ([f'{common.human_bytes(s["excluded_bytes"])} non-corpus data']
-                 if s.get("excluded_bytes") else [])
+    # The dedup/exclusion arithmetic is disclosed in the "Reading these numbers"
+    # notes (reconcile.duplicate_prefix_note / excluded_prefix_note), so the KPI
+    # card carries only the headline and the compressed figure.
     kpis.append(f'<div class="card"><div class="label">Received (uncompressed)'
                 f'</div><div class="value">'
                 f'{common.human_bytes(s["uncompressed_total"])}</div>'
                 f'<div class="sub">compressed in storage: '
                 f'{common.human_bytes(run["totals"]["compressed_bytes"]) if run else "—"}'
-                + (f'<br>{" + ".join(excl_bits)} excluded (raw '
-                   f'{common.human_bytes(s["uncompressed_total_raw"])})'
-                   if excl_bits else "")
-                + f'</div></div>')
+                f'</div></div>')
     kpis.append(f'<div class="card"><div class="label">Declared total (manifest)'
                 f'</div><div class="value">'
                 f'{common.human_bytes(s["manifest_total_bytes"])}</div></div>')

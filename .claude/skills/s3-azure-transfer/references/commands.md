@@ -36,7 +36,10 @@ $S teardown <slug> --confirmed        # delete everything (gated)
 
 Common flags: `--dry-run` (print commands, redact secrets), `--root`
 (fixtures for tests), `--rg`, `--vm-size`, `--os-disk-gb`,
-`--dest-prefix`, `--sas-days`, `--split-depth`/`--min-jobs`/`--max-jobs`
+`--dest-prefix`, `--sas-days`, `--src-prefix` (scope the engagement to
+one subtree of the bucket — jobs/verify relative to it; sticky via the
+`s3_src_prefix` VM tag; foldered subtrees only, not flat mode),
+`--split-depth`/`--min-jobs`/`--max-jobs`
 (plan-jobs), `--flat`/`--no-flat`/`--chunk-objects`/`--relist`
 (plan-jobs, flat buckets), `--windows`/`--concurrency`/`--requeue-failed`
 (transfer).

@@ -152,3 +152,44 @@ own within a day; the IP rule is already gone.
   prefixes).
 - `--dry-run` on every subcommand prints the az commands and REST calls
   (secrets redacted).
+
+## API unavailable? The support-CSV fallback
+
+Some accounts have no working API (plan-gated, or token creation broken).
+Qwilr support can instead export a back-office **pages CSV** — one row per
+page with metadata the API cannot give (view analytics, engagement,
+acceptance status/accepter, CRM record ids) plus three links per page:
+public/shareable URL, collaborator URL (secret-token — answers 200 even for
+Drafts, which 401 publicly), and a PDF download URL. Save it as
+`companies/<slug>/qwilr-pages.csv` (gitignored — the collaborator links
+embed secrets; treat the file as sensitive) and drive
+`scripts/qwilr_csv_pull.py`, which needs **no token at all**:
+
+```bash
+python3 scripts/qwilr_csv_pull.py plan <slug>            # parse + gate
+python3 scripts/qwilr_csv_pull.py pull <slug> --limit 3  # live smoke
+python3 scripts/qwilr_csv_pull.py pull <slug>            # the real pull
+python3 scripts/qwilr_csv_pull.py verify <slug>          # CSV vs container
+```
+
+Same shape as the API path (ip_rule_ensure firewall, racwl SAS,
+create-only writes, resume = re-run, GATE before the first pull, pull in
+the background): per page it lands `pages/<pageId>/{page.html,
+metadata.json}` and, for published pages, `page.pdf` via Qwilr's async
+render — `GET /pdf/<token>` starts a **fresh** server-side render every
+call (never re-trigger to poll); the loader page embeds a
+`download.qwilr.com/<uuid>.pdf` URL that 403s (S3 AccessDenied) until the
+render lands ~3–5 min later. Budget hours of wall clock for hundreds of
+pages (`--pdf-concurrency`, default 6, is politeness toward Qwilr's render
+farm). **The /pdf/ endpoint rate-limits hard** (learned live: ~5 renders,
+then a wall of 429s): the pipeline paces triggers (one per sweep, 20s
+apart) and a 429 requeues the job with exponential backoff (60s → 15 min
+cap) instead of counting an error; 12 consecutive rate-limits end the
+pass — re-run pull later, resume mops up. A pass that ends with a pile of
+"rate-limited, gave up" errors is a CLOCK, not a fault. The CSV itself lands as `_meta/qwilr-pages.csv` — it IS part of the
+corpus (the analytics/acceptance ledger). Unlike the API path this
+fallback delivers PDF renders but NOT raw block JSON; the rendered HTML
+embeds the page's content JSON, and CDN assets are still manifested, not
+downloaded. Drafts get HTML only (no render endpoint accepts the
+collaborator secret) — verify knows this and only requires PDFs of
+published pages.

@@ -43,7 +43,7 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, s3, github, qwilr, vimeo, zoom) *populate* `<slug>-raw`
+   skills (gcs, dropbox, gdrive, s3, github, zoho, qwilr, vimeo, zoom) *populate* `<slug>-raw`
    from a cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on
    the local qwilr/vimeo/zoom pulls, whose writes are additionally create-only
    via `If-None-Match: *`) — they are the ingest path, not an audit path. They
@@ -96,6 +96,10 @@ companies/                   # ALL runtime state; gitignored (local only)
   s3-azure-transfer/references/commands.md
   github-azure-transfer/SKILL.md           # GitHub org → <slug>-raw (engine VM lifecycle, VM-side git+API puller)
   github-azure-transfer/references/commands.md
+  zoho-azure-transfer/SKILL.md             # Zoho CRM/Learn/WorkDrive → <slug>-raw (engine VM lifecycle, VM-side REST puller)
+  zoho-azure-transfer/references/commands.md
+  figma-azure-transfer/SKILL.md            # Figma workspace → <slug>-raw (engine VM lifecycle, VM-side REST puller)
+  figma-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
@@ -121,7 +125,18 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   azcopy-runner.sh           # VM-side azcopy job-queue worker (ssh-piped by s3_transfer.py)
   github_transfer.py         # GitHub → blob via VM mirror-clone + azcopy; engine lifecycle + own pull layer
   github_vm_pull.py          # VM-side puller: mirror+wiki clones, 4 JSONL exports, LFS, stage-then-azcopy (pushed like s3_flat.py)
+  zoho_transfer.py           # Zoho (CRM/Learn/WorkDrive behind one --product dimension) → blob
+                             #   via VM REST puller + azcopy; engine lifecycle + own pull layer
+  zoho_vm_pull.py            # VM-side puller: CRM JSON ledger + Bulk Read ZIPs + attachments,
+                             #   Learn courses/KB, WorkDrive (pushed like github_vm_pull.py)
+  figma_transfer.py          # Figma workspace → blob via VM REST puller + azcopy;
+                             #   engine lifecycle + own pull layer
+  figma_vm_pull.py           # VM-side puller: file JSON + comments/versions + image
+                             #   fills + page renders + team libraries (pushed like zoho_vm_pull.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
+  qwilr_csv_pull.py          # Qwilr support-CSV → blob ingest (API-less fallback):
+                             #   fetches each page's public/collaborator HTML +
+                             #   triggers Qwilr's async PDF renders; local, standalone
   vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
   zoom_transfer.py           # Zoom recordings → blob via Put-Block-From-URL server-side copy; local, standalone
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+azcopy+tmux), ssh-piped
@@ -183,13 +198,32 @@ Cached so daily runs skip discovery entirely.
     "slack":   {"records": 1500000},     // record-count declaration: EXCLUDED from byte
                                          // reconciliation, but listed + flagged in reports
     "zendesk": {"bytes": 0},             // declared 0 B: flagged if data actually appears
-    "workspace": {"bytes": 1, "prefix": "workspace-export"}
+    "workspace": {"bytes": 1, "prefix": "workspace-export"},
                                          // optional "prefix" (string or list) pins a
                                          // declaration to actual top-level prefix(es) when
                                          // the manifest name doesn't match what the client
                                          // pushed (e.g. a merged Workspace export). Without
                                          // it, matching is by normalized name and sums ALL
                                          // case/punctuation variants (zoom/ + Zoom/).
+    "bigquery": {"bytes": 10300000000000, "prefix": "google_bigquery",
+                 "equivalent_bytes": 9100000000000,
+                 "equivalent_note": "decoded-sample basis ..."}
+                                         // optional "equivalent_bytes" (+ mandatory
+                                         // "equivalent_note" naming the measurement basis):
+                                         // the ACTUAL data re-expressed in the manifest's
+                                         // own unit when the two are known to differ —
+                                         // healthtap's bigquery: the sizer counts parquet
+                                         // decompressed PAGE bytes (dict/RLE encodings
+                                         // intact) but the client declared BigQuery console
+                                         // LOGICAL bytes (fully decoded); a decoded-sample
+                                         // measurement bridges them. The service's % then
+                                         // compares like for like, the row keeps the
+                                         // measured actual_bytes, gets flagged
+                                         // "unit-adjusted", and the note ALWAYS renders
+                                         // (reconcile.equivalent_unit_notes — the
+                                         // duplicate_prefixes never-silent discipline).
+                                         // Headline % is unaffected (run totals). ONLY set
+                                         // from a real measurement, never a client assertion.
   },
   "source_split": ["gdrive-export2"],    // optional: top-level prefixes whose SECOND level
                                          // holds the real services (swiftlaw pushed every
@@ -203,6 +237,14 @@ Cached so daily runs skip discovery entirely.
                                          // — sources_l2 is a top-40 rollup, so a wide export
                                          // can be truncated and must not vanish silently.
                                          // Headline % is unaffected: it uses run totals.
+                                         // ALSO the shape when ONE ingest writes several
+                                         // declared services under one prefix: the zoho
+                                         // ingest lands zoho-export/{crm,learn,workdrive},
+                                         // so source_split ["zoho-export"] plus a
+                                         // "prefix": "zoho-export/crm" pin per service is
+                                         // what makes the three declarations reconcile
+                                         // separately (a product never run reads as
+                                         // declared-empty, which is expected, not a fault).
   "duplicate_prefixes": ["MarketingTeam", {"prefix": "onedrive",
                         "redundant_bytes": 134100000000}],
                                          // optional: top-level prefixes that are
@@ -270,9 +312,13 @@ Cached so daily runs skip discovery entirely.
     "gdrive": {"blob_count": 400, "compressed_bytes": 1, "uncompressed_bytes": 2}
   },
   "methods": {"zip": 500, "gz": 6, "stored": 300}, // per sizing KIND blob counts (zip/gz/
-                                         // bz2/xz/stored — bz2 and xz are kinds in BOTH modes so
+                                         // bz2/xz/parquet/stored — bz2 and xz are kinds in BOTH modes so
                                          // deep-verify cache rows replay on shallow runs; shallow
-                                         // sizes them at content-length, zero HTTP) —
+                                         // sizes them at content-length, zero HTTP; parquet is
+                                         // footer-sized in both modes — thrift FileMetaData via
+                                         // ranged GETs, the zip-CD play: decompressed PAGE bytes,
+                                         // permanently "trusted" in deep coverage since the stdlib
+                                         // has no snappy codec to stream the pages) —
                                          // gz>0 triggers the gz-accuracy notes; the per-blob gz
                                          // method taxonomy (gz-trailer/gz-floor/gz-bad-trailer/
                                          // gz-tiny/gz-exact/gz-truncated) lives in the
@@ -489,12 +535,14 @@ reuse the engine's VM lifecycle but swap the copy layer (azcopy
 server-side copy for S3, a VM-side git+API puller for GitHub — see
 below) — all driven by the matching `*-azure-transfer` skills. The
 workflow: VM `xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive:
-`xfer-gdr-<slug>`, S3: `xfer-s3-<slug>`, GitHub: `xfer-gh-<slug>`, so
+`xfer-gdr-<slug>`, S3: `xfer-s3-<slug>`, GitHub: `xfer-gh-<slug>`,
+Zoho: `xfer-zoho-<slug>`, Figma: `xfer-figma-<slug>`, so
 they can run concurrently) in the company's RG and
 the SA's region, static Standard-SKU public IP (never deallocated before
 teardown), the copy in a tmux session into `<slug>-raw/workspace-export/`
 (Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`,
-GitHub: `github-export/`).
+GitHub: `github-export/`, Zoho: `zoho-export/<product>/`, Figma:
+`figma-export/`).
 Rules that differ from the sizing path — do not cross-contaminate:
 
 - **Network rules are engine-run via `allow-network`** (policy change,
@@ -598,6 +646,150 @@ github-export/<org-login>` (the zoom multi-account convention); pin
 `"prefix": "github-export"` on the github service in
 `expected-data-sizes.json`. Driven by the `github-azure-transfer` skill.
 
+**Zoho rides the engine's VM with its own REST pull layer.** Zoho's
+download endpoints need `Authorization: Zoho-oauthtoken <tok>` and Azure's
+`x-ms-copy-source-authorization` only speaks `Bearer` — so the vimeo/zoom
+server-side-copy transport is STRUCTURALLY unavailable and CRM attachment
+bytes must be staged. `scripts/zoho_transfer.py` therefore reuses the
+engine's VM lifecycle (like s3/github) on `xfer-zoho-<slug>` and pushes
+`scripts/zoho_vm_pull.py`, the first **multi-product** ingest: one skill,
+one script, three products behind `--product crm|learn|workdrive` landing
+in `zoho-export/{crm,learn,workdrive}/`, one tmux window each (CRM and
+Learn hit disjoint APIs and may run concurrently). The `dest_prefix` VM tag
+stays the BASE (`zoho-export`) — tagging it `zoho-export/crm` at create
+time would silently poison the other two. Auth is a client-made **Self
+Client** app: FOUR values on stdin in order — data center (`com`/`eu`/`in`/
+`com.au`/`jp`/`ca`/`sa`/`com.cn`), `client_id`, `client_secret`, long-lived
+`refresh_token`. **No grant-token exchange on our side** (Zoho grant tokens
+expire in 3–10 minutes, so any flow where we do the exchange is a race); a
+`TokenBox` on BOTH sides (laptop probe, VM puller — deliberately duplicated,
+the github_transfer/github_vm_pull precedent) mints the 1 h access token and
+cross-checks the response's `api_domain` against the declared DC. **A wrong
+data center is the day-one stall here — the zoho analogue of github's
+unapproved PAT** — caught three independent ways: the mint error body, the
+`api_domain` cross-check, and a stdin-vs-VM-tag guard at `write-creds`;
+Zoho answers OAuth failures with HTTP 200 and an error body, so the error
+branch lives in the token acceptor, not an except. CRM's authority is a
+**REST JSON ledger per module**: v8's `GET /crm/v8/<Module>` requires an
+explicit `fields` param, so `/settings/fields?module=X` is fetched first and
+every api_name is requested, paginated by `page_token` at 200/page into
+`records.jsonl`; a module too wide for one request has its extra field
+chunks re-fetched **per page by record id and merged** — a `page_token` is
+never reused across different queries, which is undefined and would silently
+drop columns. **Plus** a per-module Bulk Read job whose `{job_id}.zip` lands
+as an archival blob and whose CSV row count is a recorded cross-check —
+Bulk Read excludes Notes, Attachments, Emails and related/cross modules, so
+the JSON is the ledger and the ZIP is the check, never the reverse; its
+results expire after a day and downloads cap at 10/min, so an expired result
+is re-submitted, not resumed. Also pulled: `/settings/{modules,fields,
+layouts}`, users/roles/profiles, Notes, Emails where reachable, and record
+Attachments. **Attachments are ONE unit driven by a direct walk of the
+`Attachments` MODULE**, not a per-record sweep: the obvious
+`/crm/v8/<M>/<id>/Attachments` loop is one call per record (~2.2 calls/s ⇒
+~32 h on a 251k-record org, and on song-division 80 sampled records across
+the four biggest modules had none at all), whereas `/crm/v8/Attachments`
+is directly listable at ~300 rows/s — the whole tenant censused in ~28 s —
+and every row carries `Parent_Id.module.api_name` + `Parent_Id.id`, which
+is exactly what the per-attachment download URL needs. That endpoint's
+`Size` is an **EXACT byte integer** (the docs' "rounded string" describes a
+different field), so the attachments unit records `expected_bytes` and
+`probe` can give a REAL size census — the one honest pre-run size number
+Zoho offers. Files stream to disk in chunks, never `resp.read()`. **Zoho Learn** is
+documented only for courses (`learn.zoho.<dc>/learn/api/v1/portal/
+<networkurl>/course`, scope `ZohoLearn.course.READ`, `pageIndex` 0-based +
+`limit` ≤ 99); the knowledge-base half has **no documented endpoints**, so
+the run ATTEMPTS the undocumented sibling paths and records what answered in
+`_meta/discovery.json` — Learn KB is discovered, never assumed. **WorkDrive**
+is "whatever the token can see": the reachable boundary AND what was
+explicitly unreachable go to `_meta/boundary.json`. Pacing: CRM meters on
+API credits plus a concurrency ceiling, so pages are always 200 (credits
+scale with CALLS), record calls are single-threaded, attachments use ≤5
+workers, and every 429 is slept through, never fatal — a retry horizon past
+`--rate-sleep-max` is read as the daily credit budget, which is a clock, not
+a bug (the pass ends at rc 2 with a manifest naming the wall and cursors make
+tomorrow a resumption). **Fatal vs counted keys on the BODY error code, not
+the status** — github's 404-vs-403 rule does not port: 401
+`OAUTH_SCOPE_MISMATCH` on a required unit (settings, records) is fatal, on an
+optional one a recorded skip; 401 `INVALID_TOKEN` re-mints once then dies;
+403 `NO_PERMISSION` is the API user's CRM PROFILE, not a scope, and is always
+a per-module skip; 404 on an optional related list is "feature not enabled";
+HTTP **204 is an empty module, not an error**. Resume is per-unit
+`.cdp-complete` markers **plus cursors** — a CRM module is millions of
+records, so github's delete-and-re-clone is unacceptable:
+`.cdp-cursor.json` carries `{page_token, bytes, records, fields_sha}`, a
+resume truncates the JSONL to the last whole page, and a `fields_sha` change
+invalidates the cursor and re-walks (a ledger with different schemas per
+range is worse than one re-walk); attachments cursor on an index into the
+STAGED ledger so their order is deterministic. Units upload **as they
+complete** (`--overwrite=false`, client-side no-overwrite — the s3/github
+honesty, NOT `If-None-Match`), so a mid-run VM loss costs one unit rather
+than the pass, and **verify runs on the LAPTOP** against the uploaded
+per-product `manifest.json` via `phases.ip_rule_ensure` + an `rl` SAS,
+certifying staged→container only. No source-size claim is made for the
+RECORD ledger (Zoho publishes no record byte size, so `probe` gives counts,
+never record bytes) — but attachment bytes ARE exact and are reported. The
+pre-run census comes from `GET /crm/v8/<Module>/actions/count`, **not
+COQL**: COQL makes `where` mandatory and additionally demands a `group by`
+for `count(id)`, so a plain per-module count is impossible through it. All three products share
+one dest prefix, so `expected-data-sizes.json` needs
+`"source_split": ["zoho-export"]` plus a `"prefix": "zoho-export/<product>"`
+pin per declared service. Out of scope: Books, Desk, People, Mail, Projects,
+Campaigns, Analytics (separate products, separate APIs), and CRM sandboxes,
+recycle bin, audit log and territory/portal config. Driven by the
+`zoho-azure-transfer` skill.
+
+**Figma rides the engine's VM with its own REST pull layer.** Figma has no
+rclone backend and **no bulk export**: the REST API serves file JSON,
+comments, versions, presigned asset URLs and published library metadata one
+file at a time, behind the post-Nov-2025 per-user rate tiers whose
+**Tier-1 bucket (file JSON, node JSON and image renders SHARE it) caps at
+20/min even on Enterprise** — a real workspace is a multi-hour-to-multi-day
+metered walk, which is what forces the VM+tmux shape (and there is **no
+`.fig` source-file endpoint at all**, so the corpus is a *derivative*, not
+a restorable backup — said out loud in the skill). `scripts/figma_transfer.py`
+reuses the engine's VM lifecycle on `xfer-figma-<slug>` and pushes
+`scripts/figma_vm_pull.py`, which stages under `figma-export/`: a `meta`
+discovery ledger (the one REQUIRED unit — `/v2/teams/:id/folders` recursed
+through nested subfolders to `files?branch_data=true`, with the deprecated
+v1 projects pair as a recorded fallback), one cursored `library/<team>`
+unit per team (published components/styles, Tier-3, `page_size` 1000), and
+**one unit per FILE** — document JSON (an oversized file that 400s "try a
+smaller request" is auto-**decomposed** into depth-1 + per-node JSON,
+recorded, informational), comments, the versions LIST (pagination followed
+by `next_page` URL, host-checked), the embedded **image fills** (presigned
+CDN URLs that expire in **≤14 days**, so the URL map is always re-fetched
+fresh and never cursored; downloads are a separate CDN pool that NEVER
+carries the token), one **PNG render per page** (batched ids per Tier-1
+call; a 200 can carry null per-node values — retried once, then recorded),
+and branch node-trees inside the parent unit. The file KEY leads the unit
+path and folder paths stay out of it (names and folders are mutable;
+renames must not orphan markers). Pacing is **proactive** — a TierBucket
+paces to 0.9× the documented per-plan caps and 429's Retry-After is the
+backstop — because Figma publishes the numbers; there is no daily credit
+clock, the per-minute limit IS the wall clock. `classify()` keys on
+**status + endpoint family, the inverse of zoho's body-code-first rule**
+(Figma has no body codes); 403 and 404 are deliberately identical
+(`no-access-or-missing` — Figma does not disambiguate), and a dead PAT is
+**403, not 401**. Auth is a client-made **personal access token** from a
+**Full/Dev seat** (1 stdin line → 600 env file; a View/Collab seat's token
+gets 6 Tier-1 calls per MONTH — the wrong-seat day-one stall, caught by
+`probe` via `X-Figma-Rate-Limit-Type: low`); the second day-one stall is
+**team visibility**: there is NO team-listing API, the client supplies
+every team id from `figma.com/files/team/<ID>/...`, and a forgotten team
+is silently invisible — probe's census is read back to the client.
+`probe` reports counts and a Tier-1 wall-clock estimate, **never bytes**
+(Figma publishes no sizes anywhere; the manifest's `total_staged_bytes` is
+the engagement's first real byte number). Per-unit upload as units
+complete (`--overwrite=false`, run metadata `--overwrite=true` — the
+github pilot-poisons-verify fix shipped from day one), **verify on the
+LAPTOP** via `phases.ip_rule_ensure` + `rl` SAS against the uploaded
+manifest, staged→container only. `expected-data-sizes.json` takes a plain
+`"figma": {"bytes": N, "prefix": "figma-export"}` pin — no `source_split`.
+Out of scope: `.fig` files, comment reactions (one Tier-2 call per
+comment), per-version file JSON, variables (Enterprise-full-seat-gated),
+Dev Mode resources, webhooks, analytics. Driven by the
+`figma-azure-transfer` skill.
+
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
 read-only scope exists; client revokes it after the engagement), so
@@ -611,7 +803,20 @@ create-only (`If-None-Match: *`), resume = re-run (one dest-prefix listing
 skips landed blobs), no state file, token via stdin only. The API has no
 PDF/HTML export and no bulk audit-trail/analytics export; embedded CDN
 assets are manifested (`_meta/assets-manifest-*.json`), not downloaded.
-Driven by the `qwilr-azure-transfer` skill.
+Driven by the `qwilr-azure-transfer` skill. **When the account's API is
+unavailable**, Qwilr support can export a back-office CSV of every page
+(metadata + analytics + acceptance columns the API cannot give, plus
+per-page public / collaborator / PDF-download links).
+`scripts/qwilr_csv_pull.py` (same laptop-local shape: ip_rule_ensure,
+racwl SAS, create-only writes, resume = re-run) drives that CSV instead:
+rendered HTML per page (the collaborator link covers Drafts, which 401
+publicly), plus Qwilr's async PDF render per published page —
+`GET /pdf/<token>` starts a FRESH server-side render each call (never
+re-trigger to poll) and the PDF appears at the loader-embedded
+`download.qwilr.com/<uuid>.pdf` minutes later (S3 403 = not ready yet).
+The CSV itself lands as the ledger blob; its collaborator links embed
+secrets, so the CSV is sensitive — it lives under `companies/<slug>/`
+(gitignored), never in version control.
 
 **Vimeo** has no rclone backend either, but its corpus is hundreds of GB of
 video — too big to proxy through the laptop. `scripts/vimeo_transfer.py`
