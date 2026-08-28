@@ -107,6 +107,8 @@ companies/                   # ALL runtime state; gitignored (local only)
   zoho-azure-transfer/references/commands.md
   figma-azure-transfer/SKILL.md            # Figma workspace → <slug>-raw (engine VM lifecycle, VM-side REST puller)
   figma-azure-transfer/references/commands.md
+  teams-azure-transfer/SKILL.md            # Microsoft Teams messages/metadata → <slug>-raw (engine VM lifecycle, VM-side REST puller)
+  teams-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
@@ -144,6 +146,10 @@ scripts/                     # the deterministic layer (python3, stdlib only)
                              #   engine lifecycle + own pull layer
   figma_vm_pull.py           # VM-side puller: file JSON + comments/versions + image
                              #   fills + page renders + team libraries (pushed like zoho_vm_pull.py)
+  teams_transfer.py          # Microsoft Teams → blob via VM REST puller + azcopy;
+                             #   engine lifecycle + own pull layer
+  teams_vm_pull.py           # VM-side puller: team/channel/user/membership JSONL,
+                             #   per-channel messages+replies+hostedContents (pushed like figma_vm_pull.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   qwilr_csv_pull.py          # Qwilr support-CSV → blob ingest (API-less fallback):
                              #   fetches each page's public/collaborator HTML +
@@ -552,13 +558,14 @@ server-side copy for S3, a VM-side git+API puller for GitHub — see
 below) — all driven by the matching `*-azure-transfer` skills. The
 workflow: VM `xfer-<slug>` (Dropbox: `xfer-dbx-<slug>`, Drive:
 `xfer-gdr-<slug>`, S3: `xfer-s3-<slug>`, GitHub: `xfer-gh-<slug>`,
-Zoho: `xfer-zoho-<slug>`, Figma: `xfer-figma-<slug>`, so
+Zoho: `xfer-zoho-<slug>`, Figma: `xfer-figma-<slug>`, Teams:
+`xfer-teams-<slug>`, so
 they can run concurrently) in the company's RG and
 the SA's region, static Standard-SKU public IP (never deallocated before
 teardown), the copy in a tmux session into `<slug>-raw/workspace-export/`
 (Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`,
 GitHub: `github-export/`, Zoho: `zoho-export/<product>/`, Figma:
-`figma-export/`).
+`figma-export/`, Teams: `teams-export/`).
 Rules that differ from the sizing path — do not cross-contaminate:
 
 - **Network rules are engine-run via `allow-network`** (policy change,
@@ -805,6 +812,77 @@ Out of scope: `.fig` files, comment reactions (one Tier-2 call per
 comment), per-version file JSON, variables (Enterprise-full-seat-gated),
 Dev Mode resources, webhooks, analytics. Driven by the
 `figma-azure-transfer` skill.
+
+**Teams rides the engine's VM with its own REST pull layer.** Microsoft
+Teams has no rclone backend and **no bulk export**: the corpus is every
+team's every channel's every message thread plus replies, walked page by
+page against Graph, an app-only client-credentials pull (no signed-in user,
+no delegated/browser flow anywhere) that is genuinely a multi-hour-to-
+multi-day job for a real tenant — the github/zoho/figma precedent.
+`scripts/teams_transfer.py` reuses the engine's VM lifecycle on
+`xfer-teams-<slug>` and pushes `scripts/teams_vm_pull.py`, which stages
+under `teams-export/`: a guid-led layout with a `_meta/` discovery ledger
+(teams/channels/users/membership JSONL + `name-map.json` + the run
+`manifest.json` — the one REQUIRED unit) and one unit per channel at
+`teams/<team-guid>/<channel-id>/messages.jsonl` + a `hosted/` dir. **The
+sharepoint boundary is the point of this design:** a channel's file tab,
+and any attachment object referenced from a message, is backed by that
+team's SharePoint document library, not Teams storage, so those bytes
+belong to a future sharepoint pull, never this one — the boundary that
+kills saxon-style per-account Teams duplication. Only `hostedContents`
+(inline images/files embedded in a message's HTML body, fetched
+Bearer-only on the VM) are staged as bytes; attachment objects stay
+references in the message JSON, never fetched. A `messages.jsonl` line is
+ALWAYS a complete thread — replies are paged to completion before a root
+message is ever written. The day-one stall is Microsoft's own
+message-content gate, not a bad token or wrong seat: `probe` mints a token
+and tries exactly one message page before any VM exists, classifying the
+answer as `open` (200), `metered-model-required` (402 — the tenant needs
+an Azure subscription linked for Teams' metered API billing) or
+`protected-api-approval-missing` (403 — the tenant hasn't been approved
+for Microsoft's protected Teams messaging APIs,
+aka.ms/GraphTeamsProtectedApis, a days-to-weeks client process, not a
+retry); a second stall is missing admin consent on the app registration's
+application permissions, caught as an immediate `/groups` 403. Auth is a
+client-made Entra ID (Azure AD) app registration, application (not
+delegated) permissions, admin-consented — THREE secrets on stdin, in
+order: tenant id, client id, client secret; a `TokenBox` on both sides
+(laptop probe, VM puller — the github/zoho deliberate duplication) mints
+the app-only token, and `write-creds` refuses a stdin tenant that
+disagrees with `--tenant-id` (or the VM's `teams_tenant_id` tag) — the
+zoho wrong-DC guard adapted to Teams. `classify()` keys on status +
+endpoint family (figma's rule): the `_meta` (required) unit is fatal on
+any refusal, the `messages` family is fatal on 402/403 (the day-one stall,
+not a per-unit quirk), a single team/channel's 403/404 is a recorded skip
+(archived team, deleted channel), 429 always sleeps, 401 always re-mints.
+Pacing is proactive (`PaceBucket`, default ~4 req/s for the messages
+family, ~10 req/s for directory reads) with the 429 Retry-After as
+backstop — there is no daily credit clock the way Zoho has one; the
+per-minute pace IS the wall clock. `probe` reports team/channel/user
+counts and a sampled wall-clock estimate, **never bytes** — Graph
+publishes no message or attachment byte size anywhere, so the manifest's
+`total_staged_bytes` is the engagement's first real byte number. Resume is
+per-channel `.cdp-complete` markers plus `.cdp-cursor.json` cursors
+(`next_link` + line count): a torn trailing JSONL line is truncated back
+to the last whole page, and a cursor whose `next_link` now refuses is not
+trusted forward — that channel is cleared and re-walked from scratch
+(cheap; channels are small, unlike a CRM module). Units upload as they
+complete (`--overwrite=false`, the s3/github/zoho/figma honesty), and
+`_meta/manifest.json` rides `--overwrite=true` so a `--limit-teams` pilot
+can never poison verify (the github pilot-poisons-verify fix, inherited
+from day one). **DEST_URL is the bare container URL, not pre-prefixed**
+like figma/zoho's — `teams_vm_pull.py` appends `DEST_PREFIX` itself, so
+the prefix rides the env file as a real, consumed setting instead of being
+baked into the URL. Verify runs on the **LAPTOP** via
+`phases.ip_rule_ensure` + a 1-day `rl` account SAS against the uploaded
+`_meta/manifest.json`, certifying staged→container only; no source-size
+claim is made. `expected-data-sizes.json` takes a plain `"microsoft_teams":
+{"prefix": "teams-export"}` pin — no `source_split`. Out of scope: 1:1,
+group and meeting chats (no `Chat.Read.All`; a `TeamsMessagesData`
+export-mailbox fallback is a recorded future option, not built here),
+calendars, mail, tabs/apps, Planner, Wiki, meeting recordings
+(doc-library files), document-library files generally, and attachment
+bytes. Driven by the `teams-azure-transfer` skill.
 
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no

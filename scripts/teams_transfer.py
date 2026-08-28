@@ -49,14 +49,14 @@ wrong-DC-guard analogue — a secret minted for the wrong tenant is silently
 useless until it fails loudly, so a stdin/flag disagreement is refused
 outright rather than written.
 
-Verify (Task 5) runs on the LAPTOP, same as figma/zoho: the completeness
-authority is the manifest.json the pull uploads to
-<dest-prefix>/_meta/manifest.json, so no Graph access is needed at verify
-time — just a blob listing over phases.ip_rule_ensure + an rl account SAS.
+Verify runs on the LAPTOP, same as figma/zoho: the completeness authority is
+the manifest.json the pull uploads to <dest-prefix>/_meta/manifest.json, so
+no Graph access is needed at verify time — just a blob listing over
+phases.ip_rule_ensure + an rl account SAS.
 
-This task (4) builds the Spec, the 3-line credential plumbing (read_secrets,
-cmd_write_creds with its tenant guard) and the laptop-side probe gate.
-transfer/status/verify/teardown are Task 5.
+This CLI covers the full lifecycle: the Spec, the 3-line credential plumbing
+(read_secrets, cmd_write_creds with its tenant guard), the laptop-side probe
+gate, and transfer/status/verify/teardown.
 """
 from __future__ import annotations
 
@@ -791,9 +791,8 @@ def cmd_status(root: Path, args) -> dict:
             "staged_bytes_human": common.human_bytes(
                 (manifest or {}).get("total_staged_bytes") or 0),
             "hint": hint,
-            "note": "a 'rate-limited; sleeping Ns' line in the log tail is "
-                    "normal metering against Graph's per-app throttle, not "
-                    "a hang",
+            "note": "a nonzero api_sleeps in the manifest is normal metering "
+                    "against Graph's per-app throttle, not a hang",
             **detail}
 
 
