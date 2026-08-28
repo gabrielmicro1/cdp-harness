@@ -68,10 +68,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
+import phases  # noqa: E402
 import transfer_engine as eng  # noqa: E402
 import teams_vm_pull as puller  # noqa: E402  (import-safe; pure helpers)
 
@@ -99,6 +101,7 @@ DEST_ENV = f"{ENV_DIR}/dest-teams.env"
 GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+X_MS_VERSION = "2021-08-06"
 
 _sleep = time.sleep  # seam so tests can record/skip waits
 
@@ -173,6 +176,142 @@ def _tenant_guard(stdin_tenant: str, expected: str | None) -> None:
             "for the tenant it was issued in — either re-run with the "
             f"right --tenant-id, or tear down and re-create the VM with "
             f"--tenant-id {stdin_tenant}. Nothing was written.")
+
+
+# ── azure listing (verify only; laptop path) ─────────────────────────────────
+# Local copies of the established laptop-side blob-listing pair — kept here
+# rather than imported so the VM-family CLIs stay import-independent of the
+# local-pull family. Same signatures as figma_transfer.py's.
+
+def _container_url(cfg: dict) -> str:
+    return (f"https://{cfg['storage_account']}.blob.core.windows.net/"
+            f"{cfg['container']}")
+
+
+def azure_get(url: str) -> bytes:
+    """GET with retries. A 403 early in a run is usually IP-rule
+    propagation (CLAUDE.md lore) -- wait and retry, never re-mint the
+    SAS for it."""
+    last: Exception | None = None
+    for attempt in range(4):
+        req = urllib.request.Request(url,
+                                     headers={"x-ms-version": X_MS_VERSION})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 403:
+                _sleep(15 * (attempt + 1))  # propagation, not a bad SAS
+                continue
+            if e.code >= 500:
+                _sleep(1 + attempt)
+                continue
+            raise common.HarnessError(f"blob GET failed: HTTP {e.code}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            _sleep(1 + attempt)
+    raise common.HarnessError(f"blob GET failed after retries: {last}")
+
+
+def azure_list_blobs(cfg: dict, sas: str, prefix: str,
+                     dry_run: bool) -> dict[str, dict]:
+    """One marker-paginated listing of the dest prefix -> {name: {size}}.
+    Content-Length is what Azure actually committed — verify's ground
+    truth."""
+    if dry_run:
+        print(f"DRY-RUN: GET {_container_url(cfg)}"
+              f"?restype=container&comp=list&prefix={prefix}/&<sas-redacted>")
+        return {}
+    blobs: dict[str, dict] = {}
+    marker = ""
+    while True:
+        url = (f"{_container_url(cfg)}?restype=container&comp=list"
+               f"&maxresults=5000"
+               f"&prefix={urllib.parse.quote(prefix + '/', safe='')}")
+        if marker:
+            url += f"&marker={urllib.parse.quote(marker, safe='')}"
+        url += "&" + sas
+        root = ET.fromstring(azure_get(url))
+        for blob in root.iter("Blob"):
+            name = blob.findtext("Name")
+            props = blob.find("Properties")
+            if name:
+                blobs[name] = {
+                    "size": int((props.findtext("Content-Length") or 0)
+                                if props is not None else 0),
+                }
+        marker = root.findtext("NextMarker") or ""
+        if not marker:
+            return blobs
+
+
+def compare_manifest_to_blobs(manifest: dict, blobs: dict,
+                              prefix: str) -> dict:
+    """Pure. Certifies STAGED -> CONTAINER completeness against the
+    uploaded manifest (Teams -> staged completeness is the puller's own
+    exit code + failed_units — verify surfaces that list verbatim).
+
+    Per successful unit (status ok or skipped-complete): the
+    .cdp-complete marker blob must exist, and the per-unit container byte
+    sum must be >= the staged bytes. LESS than staged = a partial upload
+    = failure. MORE happens legitimately when a re-pull wrote a shorter
+    file and --overwrite=false kept the older sibling — reported as
+    stale_extra, informational.
+
+    NO source-size claim is made: Graph publishes no message or
+    attachment byte size anywhere, so the manifest's total_staged_bytes
+    is the first honest byte number in this engagement's life.
+    """
+    results = manifest.get("results", [])
+    missing_markers: list[str] = []
+    short_uploads: list[dict] = []
+    stale_extra: list[str] = []
+
+    def rollup(sub: str) -> int:
+        return sum(b["size"] for n, b in blobs.items() if n.startswith(sub))
+
+    for r in results:
+        if r.get("status") not in ("ok", "skipped-complete"):
+            continue
+        sub = f"{prefix}/{r['unit']}/"
+        staged = r.get("bytes") or 0
+        if f"{sub}.cdp-complete" not in blobs:
+            missing_markers.append(sub)
+            continue
+        landed = rollup(sub)
+        if staged and landed < staged:
+            short_uploads.append({"prefix": sub, "staged": staged,
+                                  "landed": landed})
+        elif staged and landed > staged:
+            stale_extra.append(sub)
+
+    failed = manifest.get("failed_units", [])
+    skipped = manifest.get("skipped_units", [])
+    ok = not failed and not missing_markers and not short_uploads
+    return {
+        "ok": ok,
+        "source": manifest.get("source"),
+        "context": manifest.get("context"),
+        "unit_count": manifest.get("unit_count"),
+        "total_staged_bytes": manifest.get("total_staged_bytes"),
+        "api_calls": manifest.get("api_calls"),
+        "api_sleeps": manifest.get("api_sleeps"),
+        "hosted_errors": manifest.get("hosted_errors"),
+        "failed_units": failed,
+        "skipped_units": skipped,
+        "missing_markers": missing_markers,
+        "short_uploads": short_uploads,
+        "stale_extra": stale_extra,
+        "hint": None if ok else
+        "failed_units / missing markers / short uploads: re-run transfer "
+        "(per-unit .cdp-complete markers and .cdp-cursor.json resume, "
+        "azcopy --overwrite=false skips landed blobs), then re-verify. "
+        "stale_extra alone is informational: no-overwrite kept an "
+        "earlier pass's longer file. skipped_units are deliberate and "
+        "never a failure — read their reasons (a channel that 404s on "
+        "its first page is a fresh-start skip, not a corpus gap).",
+    }
 
 
 # ── laptop-side token mint (probe + write-creds smoke test) ──────────────────
@@ -518,12 +657,259 @@ def cmd_probe(root: Path, args) -> dict:
     }
 
 
+# ── transfer / status / verify / teardown / discover ─────────────────────────
+
+def cmd_write_dest(root: Path, args) -> dict:
+    """racwl SAS -> rclone [azure] section (so check-azure has something to
+    test against) AND DEST_ENV, both on-VM. DEST_URL is deliberately the
+    BARE container URL — unlike figma/zoho, teams_vm_pull.py appends
+    DEST_PREFIX itself (controller ruling, 2026-08-28), so DEST_PREFIX
+    rides the env file as a real, consumed setting instead of being baked
+    into the URL."""
+    cfg = eng.load_cfg(root, args.slug)
+    eng.set_subscription(cfg, args.dry_run)
+    vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
+    prefix = _dest_prefix(vm, args)
+    sas, expiry = eng.mint_container_sas(cfg, args.sas_days, args.dry_run)
+    base = _container_url(cfg)
+    eng.write_conf_section(vm["public_ip"], "azure",
+                           f"[azure]\ntype = azureblob\n"
+                           f"sas_url = {base}?{sas}\n",
+                           dry_run=args.dry_run)
+    # values are SINGLE-QUOTED: the SAS contains '&', and sourcing an
+    # unquoted VAR=a&b line backgrounds the assignment at the '&' — the
+    # var lands empty and the puller hits Azure with no SAS at all (401,
+    # found live on checkmate). az SAS/URLs never contain single quotes.
+    env = (f"DEST_URL='{base}'\n"
+           f"DEST_SAS='{sas}'\n"
+           f"DEST_PREFIX='{prefix}'\n")
+    _write_env(vm["public_ip"], DEST_ENV, env, args.dry_run)
+    return {"remote": "azure", "container": cfg["container"],
+            "dest_prefix": prefix, "sas_expiry": expiry,
+            "written_to": [f"{vm['name']}:{eng.RCLONE_CONF}",
+                           f"{vm['name']}:{DEST_ENV}"]}
+
+
+def cmd_transfer(root: Path, args) -> dict:
+    """Fresh puller push -> tmux window 'teams', sourcing both env files.
+    teams_vm_pull.py is fully env-driven (no argv at all — it is launched
+    with zero arguments), so an optional pilot (--rps-messages /
+    --limit-teams) rides `export` lines ahead of `set +a`, not CLI flags."""
+    cfg = eng.load_cfg(root, args.slug)
+    vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
+    ip = vm["public_ip"]
+    if eng._tmux_alive(ip, args.dry_run):
+        return {"ok": False, "cause": "already-running",
+                "hint": "tmux session 'transfer' is alive — use status."}
+    _push_puller(ip, args.dry_run)
+    env_extra = ""
+    if args.rps_messages:
+        env_extra += f"export RPS_MESSAGES={args.rps_messages}; "
+    if args.limit_teams:
+        env_extra += f"export LIMIT_TEAMS={args.limit_teams}; "
+    inner = (f"set -a; . {TEAMS_ENV}; . {DEST_ENV}; set +a; "
+             f"{env_extra}python3 {XFER_DIR}/teams_vm_pull.py "
+             f"2>&1 | tee -a {LOG_FILE}")
+    eng.run_ssh(ip, f'tmux new-session -d -s {eng.TMUX_SESSION} -n teams '
+                    f'"{inner}"',
+                dry_run=args.dry_run)
+    if args.dry_run:
+        return {"ok": True, "dry_run": True,
+                "rps_messages": args.rps_messages or None,
+                "limit_teams": args.limit_teams or None}
+    eng.run_ssh(ip, "sleep 5", check=False)
+    alive = eng._tmux_alive(ip, False)
+    tail = eng.run_ssh(ip, f"tail -3 {LOG_FILE} 2>/dev/null", check=False)
+    return {"ok": alive, "session": eng.TMUX_SESSION, "window": "teams",
+            "rps_messages": args.rps_messages or None,
+            "limit_teams": args.limit_teams or None,
+            "log_tail": (tail.stdout or "").strip().splitlines(),
+            "note": ("re-running transfer is safe — per-unit .cdp-complete "
+                     "markers and .cdp-cursor.json resume, and uploads are "
+                     "--overwrite=false" if alive else None),
+            "hint": None if alive else
+            f"the puller died immediately — tail {LOG_FILE} on the VM "
+            "(bad env files? expired secret? tenant not approved for the "
+            "protected Teams messaging APIs?)"}
+
+
+_STATUS_PY = r"""
+import json, os, shutil
+base = os.path.expanduser("~/xfer-teams")
+dest = os.path.join(base, "dest")
+out = {}
+try:
+    out["progress"] = json.load(open(os.path.join(dest, "progress.json")))
+except (OSError, ValueError):
+    out["progress"] = None
+try:
+    m = json.load(open(os.path.join(dest, "_meta", "manifest.json")))
+    out["manifest"] = dict(unit_count=m.get("unit_count"),
+                           total_staged_bytes=m.get("total_staged_bytes"),
+                           api_calls=m.get("api_calls"),
+                           api_sleeps=m.get("api_sleeps"),
+                           failed_units=m.get("failed_units"),
+                           skipped_units=m.get("skipped_units"),
+                           hosted_errors=m.get("hosted_errors"),
+                           finished_utc=m.get("finished_utc"))
+except (OSError, ValueError):
+    out["manifest"] = None
+try:
+    lines = open(os.path.join(base, "pull-teams.log")).read().splitlines()
+    out["log_tail"] = lines[-5:]
+except OSError:
+    out["log_tail"] = []
+try:
+    du = shutil.disk_usage(base)
+    out["disk_free_gb"] = round(du.free / 1e9, 1)
+except OSError:
+    pass
+print(json.dumps(out))
+"""
+
+
+def cmd_status(root: Path, args) -> dict:
+    cfg = eng.load_cfg(root, args.slug)
+    vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
+    alive = eng._tmux_alive(vm["public_ip"], args.dry_run)
+    proc = eng.run_ssh(vm["public_ip"], "python3 -", stdin_data=_STATUS_PY,
+                       dry_run=args.dry_run, check=False, timeout=120)
+    if args.dry_run:
+        return {"ok": True, "dry_run": True}
+    try:
+        detail = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        detail = {"aggregator_error": (proc.stdout or proc.stderr)[-300:]}
+    manifest = detail.get("manifest")
+    hint = None
+    if not alive:
+        hint = ("a pass finished — run verify" if manifest else
+                "not running and no manifest — it never finished a pass; "
+                f"tail {LOG_FILE} on the VM, then re-run transfer")
+    return {"vm": vm["name"], "power_state": vm["power_state"],
+            "transfer_running": alive,
+            "staged_bytes_human": common.human_bytes(
+                (manifest or {}).get("total_staged_bytes") or 0),
+            "hint": hint,
+            "note": "a 'rate-limited; sleeping Ns' line in the log tail is "
+                    "normal metering against Graph's per-app throttle, not "
+                    "a hang",
+            **detail}
+
+
+def cmd_verify(root: Path, args) -> dict:
+    """Laptop-side; the VM may already be torn down. Lists the dest prefix
+    and compares against the uploaded _meta/manifest.json — see
+    compare_manifest_to_blobs for exactly what is (and is not) asserted.
+    Takes NO Graph credentials, and mints only the READ (rl) account SAS —
+    never the racwl write SAS."""
+    cfg = eng.load_cfg(root, args.slug)
+    common.run_az(["account", "set", "-s", cfg["subscription"]],
+                  dry_run=args.dry_run)
+    prefix = (args.dest_prefix or SPEC.default_dest_prefix).strip("/")
+    we_added, ip = phases.ip_rule_ensure(cfg, args.dry_run)
+    try:
+        sas = phases.mint_sas(cfg, args.dry_run)  # rl -- the READ path
+        blobs = azure_list_blobs(cfg, sas, prefix, args.dry_run)
+        if args.dry_run:
+            print(f"DRY-RUN: GET {_container_url(cfg)}/{prefix}/_meta/"
+                  "manifest.json?<sas-redacted>")
+            return {"ok": True, "dry_run": True, "prefix": prefix}
+        mname = f"{prefix}/_meta/manifest.json"
+        if mname not in blobs:
+            return {"ok": False, "cause": "no-manifest", "prefix": prefix,
+                    "blobs_under_prefix": len(blobs),
+                    "hint": "no _meta/manifest.json under the prefix — the "
+                            "pull never finished a pass. Run status/"
+                            "transfer on the VM first."}
+        manifest = json.loads(azure_get(
+            f"{_container_url(cfg)}/{urllib.parse.quote(mname, safe='/')}"
+            f"?{sas}"))
+    finally:
+        phases.ip_rule_remove_if_ours(cfg, ip, we_added, args.dry_run)
+    result = compare_manifest_to_blobs(manifest, blobs, prefix)
+    result.update({"prefix": prefix, "blobs_under_prefix": len(blobs),
+                   "finished_utc": manifest.get("finished_utc")})
+    if result["ok"]:
+        result["note"] = (
+            "certifies staged->container completeness against the "
+            "uploaded manifest; Graph->staged completeness is the "
+            "puller's exit code + failed_units (clean here). NO "
+            "source-size claim is made — Graph publishes no message or "
+            "attachment byte size, so the manifest's total_staged_bytes "
+            "is the first honest byte number. Remember the sharepoint "
+            "boundary when reporting: a channel's file tab and any "
+            "message attachment lives in SharePoint, not here. After "
+            f'this, pin the teams service in expected-data-sizes.json '
+            f'with "prefix": "{prefix}", then let size-company pick it up.')
+    return result
+
+
+def cmd_teardown(root: Path, args) -> dict:
+    result = eng.cmd_teardown(SPEC, root, args)
+    if result.get("ok") and "reminders" in result:
+        result["reminders"].append(
+            "Tell the client to rotate (or delete) the Entra app "
+            "registration's client secret now that the pull is torn down "
+            "and verified — it was handed to us in chat as one of the "
+            "three write-creds values, and rotating the client secret is "
+            "the clean end of this engagement.")
+    return result
+
+
+def cmd_discover(root: Path, args) -> dict:
+    cfg = eng.load_cfg(root, args.slug)
+    eng.set_subscription(cfg, args.dry_run)
+    if args.dry_run:
+        eng.get_vm(SPEC, cfg, args.slug, True)
+        return {"phase": "unknown (dry-run)",
+                "note": "dry-run prints the discovery commands only"}
+    vm = eng.get_vm(SPEC, cfg, args.slug, False)
+    if vm is None:
+        return {"phase": "pre-setup", "vm": None,
+                "hint": "no transfer VM — run probe (needs only the 3 "
+                        "stdin credentials + --tenant-id), then setup"}
+    base = {"vm": vm["name"], "public_ip": vm["public_ip"],
+            "power_state": vm["power_state"], "tags": vm["tags"]}
+    if not vm["public_ip"]:
+        return {"phase": "vm-no-public-ip", **base,
+                "hint": "VM exists but has no public IP (deallocated?)"}
+    checks = [f"test -f {TEAMS_ENV} && echo teams-env",
+              f"test -f {DEST_ENV} && echo dest-env",
+              f"test -f {DEST_DIR}/_meta/manifest.json && echo manifest",
+              f"tmux has-session -t {eng.TMUX_SESSION} 2>/dev/null "
+              "&& echo tmux-alive"]
+    probe = eng.run_ssh(vm["public_ip"], "; ".join(checks), check=False)
+    if probe.returncode != 0 and not (probe.stdout or "").strip():
+        return {"phase": "vm-unreachable", **base,
+                "hint": "ssh failed — VM booting, or your key changed. "
+                        f"Try: ssh {eng.ADMIN_USER}@{vm['public_ip']}"}
+    out = probe.stdout or ""
+    if "tmux-alive" in out:
+        return {"phase": "transfer-running", **base,
+                "hint": "use status for progress"}
+    if "manifest" in out:
+        return {"phase": "transfer-stopped", **base,
+                "hint": "a pass finished — run status, then verify "
+                        "(laptop-side); failed units mean re-run transfer"}
+    if not ("teams-env" in out and "dest-env" in out):
+        return {"phase": "mid-setup", **base,
+                "hint": "VM up but creds/dest incomplete — resume setup at "
+                        "the missing write-dest / write-creds step."}
+    return {"phase": "setup-complete", **base,
+            "hint": "creds + dest in place — run transfer --limit-teams 1 "
+                    "(pilot) first"}
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     import argparse
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["plan", "write-creds", "probe"])
+    p.add_argument("command", choices=[
+        "discover", "plan", "create-vm", "allow-network", "write-dest",
+        "check-azure", "write-creds", "probe", "transfer", "status",
+        "verify", "teardown"])
     p.add_argument("slug")
     p.add_argument("--root", default=str(common.DEFAULT_COMPANIES_ROOT))
     p.add_argument("--tenant-id", dest="tenant_id", default=None,
@@ -543,20 +929,42 @@ def main() -> int:
                    help=f"prefix inside <slug>-raw (default "
                         f"{SPEC.default_dest_prefix})")
     p.add_argument("--sas-days", type=int, default=21)
+    p.add_argument("--rps-messages", dest="rps_messages", type=float,
+                   default=0.0,
+                   help="transfer: override the puller's messages-family "
+                        f"pace (default {puller.DEFAULT_RPS_MESSAGES}/s — "
+                        "conservative, Teams messaging is Graph's slow "
+                        "lane)")
+    p.add_argument("--limit-teams", dest="limit_teams", type=int, default=0,
+                   help="transfer: pilot — only the first N teams")
+    p.add_argument("--confirmed", action="store_true",
+                   help="teardown only: user confirmed the deletion plan")
+    p.add_argument("--force", action="store_true",
+                   help="teardown only: skip the running-transfer check")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
-    if args.command in ("plan", "probe") and args.tenant_id is None:
+    if args.command in ("plan", "create-vm", "probe") \
+            and args.tenant_id is None:
         p.error(f"{args.command} requires --tenant-id")
-    if args.dest_prefix is None and args.command == "plan":
+    if args.dest_prefix is None and args.command in ("plan", "create-vm"):
         args.dest_prefix = SPEC.default_dest_prefix
 
     root = Path(args.root)
-    own_cmds = {"plan": cmd_plan, "write-creds": cmd_write_creds,
-                "probe": cmd_probe}
+    engine_cmds = {"create-vm": eng.cmd_create_vm,
+                   "allow-network": eng.cmd_allow_network,
+                   "check-azure": eng.cmd_check_azure}
+    own_cmds = {"discover": cmd_discover, "plan": cmd_plan,
+                "write-dest": cmd_write_dest, "write-creds": cmd_write_creds,
+                "probe": cmd_probe, "transfer": cmd_transfer,
+                "status": cmd_status, "verify": cmd_verify,
+                "teardown": cmd_teardown}
     try:
         if args.tenant_id is not None:
             args.tenant_id = validate_tenant_id(args.tenant_id)
-        result = own_cmds[args.command](root, args)
+        if args.command in engine_cmds:
+            result = engine_cmds[args.command](SPEC, root, args)
+        else:
+            result = own_cmds[args.command](root, args)
     except common.HarnessError as e:
         print(json.dumps({"ok": False, "error": str(e)}, indent=2))
         return 1

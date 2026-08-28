@@ -4630,6 +4630,49 @@ def main() -> int:
         teams_transfer.eng.require_vm = _tw_require_vm
         teams_transfer.read_secrets = _tw_read_secrets
 
+    print("\n— teams_transfer: transfer/status/verify/teardown "
+          "(full CLI over the engine) —")
+    proc = run_script("teams_transfer.py", "allow-network", "democo",
+                      "--root", root, "--dry-run")
+    check("teams allow-network: vnet path (VM family), never IP rules",
+          "network-rule add" in proc.stdout and "--subnet" in proc.stdout
+          and "--ip-address" not in proc.stdout)
+    proc = run_script("teams_transfer.py", "write-dest", "democo",
+                      "--root", root, "--dry-run")
+    check("teams write-dest: racwl SAS -> dest-teams.env, redacted",
+          "--permissions racwl" in proc.stdout
+          and "teams-export" in proc.stdout
+          and "dest-teams.env" in proc.stdout
+          and "redacted" in proc.stdout)
+    proc = run_script("teams_transfer.py", "transfer", "democo",
+                      "--tenant-id",
+                      "505f352c-ec82-4ff9-9191-556112b420f9",
+                      "--root", root, "--dry-run")
+    check("teams transfer: pushes the puller fresh into tmux window "
+          "'teams', sourcing both env files",
+          "teams_vm_pull.py" in proc.stdout
+          and "tmux new-session -d -s transfer -n teams" in proc.stdout
+          and "teams.env" in proc.stdout
+          and "dest-teams.env" in proc.stdout)
+    proc = run_script("teams_transfer.py", "verify", "democo", "--root",
+                      root, "--dry-run")
+    check("teams verify: laptop path — ip rule + rl SAS + manifest, "
+          "never the write SAS",
+          "--permissions rl" in proc.stdout
+          and "network-rule add" in proc.stdout
+          and "teams-export/_meta/manifest.json" in proc.stdout
+          and "racwl" not in proc.stdout)
+    proc = run_script("teams_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", expect_rc=2)
+    check("teams teardown gated", '"not-confirmed"' in proc.stdout)
+    proc = run_script("teams_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", "--confirmed")
+    check("teams confirmed teardown: engine set + secret-rotation "
+          "reminder",
+          "network-rule remove" in proc.stdout
+          and "rotate" in proc.stdout.lower()
+          and "client secret" in proc.stdout.lower())
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
