@@ -619,16 +619,44 @@ def complete_thread(api, gid, cid, msg) -> dict:
     return msg
 
 
+def _count_replies(jsonl: Path) -> int:
+    """Total replies across every ROOT message currently on disk — used to
+    seed a resumed channel's reply count from the retained (post-
+    resume_truncate) lines, so the final result is cumulative rather than
+    a per-invocation delta. Channels are small, so a full re-read is
+    cheap."""
+    if not jsonl.exists():
+        return 0
+    n = 0
+    with open(jsonl, "r", encoding="utf-8") as fh:
+        for ln in fh:
+            if not ln.strip():
+                continue
+            n += len(json.loads(ln).get("replies") or [])
+    return n
+
+
 def pull_channel(api, gid, cid, dest: Path, args) -> dict:
     """One channel = one unit: `teams/<gid>/<cid>/messages.jsonl` (one
     complete thread per line) + a `hosted/` dir of hostedContents blobs.
 
     Resume is `.cdp-cursor.json` ({"next_link", "lines", "bytes"}) plus
     `resume_truncate` discarding a torn trailing line. A cursor whose
-    `next_link` now answers a non-2xx (a channel deleted mid-run, a token
-    scope regression) is NOT trusted forward — the unit is cleared and
-    re-walked from scratch, which is cheap because channels are small
-    (unlike a CRM module's millions of records).
+    `next_link` now answers a non-2xx (most realistically a 404 — the
+    channel was deleted or archived mid-run; a 403 on the "messages"
+    family is NOT a realistic case here since classify() already makes
+    that fatal via api.get_raw before this branch is ever reached) is NOT
+    trusted forward — the unit is cleared and re-walked from scratch,
+    which is cheap because channels are small (unlike a CRM module's
+    millions of records).
+
+    The final result's `messages`/`replies`/`hosted` counts are the
+    CUMULATIVE on-disk truth, not this invocation's delta: `messages` is
+    seeded by `resume_truncate`'s surviving line count, `replies` is
+    seeded by counting replies already present in those retained lines,
+    and `hosted` is the count of files actually present in `hosted/` at
+    completion — so a channel that resumes after a crash reports the
+    whole channel's totals, not just what this pass added.
 
     A terminal skip on the very FIRST page (no cursor at all — cid is 404,
     an archived/deleted channel) is recorded via mark_skipped and returned
@@ -671,7 +699,11 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
             return _result(unit, "channel", "skipped",
                            reason=f"status-{status}")
 
-    n_replies = 0
+    # Seed from the on-disk truth BEFORE adding this pass's pages, so a
+    # resumed channel's final count is cumulative, not a per-invocation
+    # delta (a crash-resumed channel must report the whole channel, not
+    # just what this pass added).
+    n_replies = _count_replies(jsonl)
     while body is not None:
         msgs = body.get("value", [])
         if msgs:
@@ -698,8 +730,11 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
     # resume, so an existing file (any extension) is skipped, never
     # re-fetched. Per-item refusals are counted, never fatal here — a
     # blanket refusal across the whole surface would already have raised
-    # inside api.get_raw via classify()'s messages-family rule.
-    n_hosted = 0
+    # inside api.get_raw via classify()'s messages-family rule. `hosted`
+    # in the final result is derived from files present on disk AFTER
+    # this pass, not an incremental this-pass-only counter, so a resumed
+    # channel reports the whole channel's hosted count, not just what
+    # this pass fetched.
     hosted_errors = 0
     hosted_dir = d / "hosted"
     if jsonl.exists():
@@ -721,7 +756,9 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
                     continue
                 hosted_dir.mkdir(parents=True, exist_ok=True)
                 (hosted_dir / f"{stem}{fill_ext(ctype)}").write_bytes(raw_h)
-                n_hosted += 1
+
+    n_hosted = (sum(1 for p in hosted_dir.iterdir() if p.is_file())
+               if hosted_dir.is_dir() else 0)
 
     mark_complete(d)
     return _result(unit, "channel", "ok", messages=total,
@@ -898,7 +935,19 @@ def main() -> int:
     write_progress(dest, "walk", 0, 0, "_meta")
     log("pulling _meta (teams/channels/users/membership)")
     roster = pull_meta(api, dest)
+    meta_dir = dest / "_meta"
     upload(dest, full_dest_url, dest_sas, "_meta")
+
+    # pull_meta() only raises (never returns) on a genuine failure of its
+    # one REQUIRED walk, so reaching here always means "ok" — but it must
+    # still be RECORDED into results, or its bytes/unit never enter the
+    # manifest's total_staged_bytes/unit_count and verify's authoritative
+    # _meta/manifest.json undercounts the whole uploaded tree (the _meta
+    # prefix is real staged/uploaded bytes, same as any channel unit).
+    results: list = [_result(
+        "_meta", "meta", "ok", bytes=dir_size(meta_dir),
+        teams=roster["counts"].get("teams"),
+        channels=roster["counts"].get("channels"))]
 
     teams = roster["teams"]
     if limit_teams:
@@ -909,7 +958,6 @@ def main() -> int:
     log(f"{len(teams)} team(s), {len(plan)} channel(s) planned"
         + (f" (LIMIT_TEAMS={limit_teams})" if limit_teams else ""))
 
-    results: list = []
     for i, (gid, cid) in enumerate(plan, 1):
         unit = f"teams/{gid}/{cid}"
         write_progress(dest, "pull", i, len(plan), unit)

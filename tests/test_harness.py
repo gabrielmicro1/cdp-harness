@@ -4300,6 +4300,13 @@ def main() -> int:
           "exact path)",
           '"_meta/manifest.json"' in tsrc and "manifest.json" in
           inspect.getsource(teams_vm_pull.upload_run_metadata))
+    check("teams main(): the _meta unit's bytes/counts are recorded into "
+          "results BEFORE the channel loop, so total_staged_bytes/"
+          "unit_count cover the whole uploaded tree, not just channels",
+          '"_meta", "meta", "ok"' in inspect.getsource(teams_vm_pull.main)
+          and inspect.getsource(teams_vm_pull.main).index(
+              '"_meta", "meta", "ok"')
+          < inspect.getsource(teams_vm_pull.main).index("for i, (gid, cid)"))
 
     print("\n— teams_vm_pull pull_channel in-process (stubbed transport) —")
 
@@ -4366,9 +4373,11 @@ def main() -> int:
         check("pull_channel happy path: 3 root messages across 2 pages, "
               "1 reply pulled via pagination-to-completion, 1 hosted ref "
               "fetched fresh, the pre-existing one skipped (never "
-              "re-fetched), unit marked complete",
+              "re-fetched) but still counted (hosted is the cumulative "
+              "on-disk total, not a this-pass-only delta), unit marked "
+              "complete",
               res1["status"] == "ok" and res1["messages"] == 3
-              and res1["replies"] == 1 and res1["hosted"] == 1
+              and res1["replies"] == 1 and res1["hosted"] == 2
               and res1["hosted_errors"] == 0
               and len(lines1) == 3
               and msg3_hosted_url not in fake1.raw_calls
@@ -4413,6 +4422,52 @@ def main() -> int:
               and json.loads(lines2[0])["id"] == "M0"
               and json.loads(lines2[1])["id"] == "M1",
               str(res2))
+
+        # -- resume with prior replies + hosted content: a first pass left
+        # one root message with 2 already-resolved replies and one already-
+        # fetched hosted file; the second (resuming) pass adds one more
+        # root message with 1 reply and 1 fresh hosted ref. The final
+        # result's replies/hosted must be the CUMULATIVE on-disk totals
+        # (2+1=3 replies, 1+1=2 hosted), not just this pass's own delta
+        # (which would wrongly read 1 reply / 1 hosted). --
+        chan5 = teams_vm_pull.unit_dir(tdest, "teams/G5/C5")
+        hosted_url_p1 = (teams_vm_pull.GRAPH +
+                         "/teams/G5/channels/C5/messages/P1/hostedContents/"
+                         "H9/$value")
+        hosted_url_p2 = (teams_vm_pull.GRAPH +
+                         "/teams/G5/channels/C5/messages/P2/hostedContents/"
+                         "H10/$value")
+        msg_p1 = {"id": "P1", "body": {"content": f'<img src="{hosted_url_p1}">'},
+                  "replies": [{"id": "P1-R1", "body": {"content": ""}},
+                             {"id": "P1-R2", "body": {"content": ""}}]}
+        prev_line5 = json.dumps(msg_p1, separators=(",", ":")) + "\n"
+        (chan5 / "messages.jsonl").write_text(prev_line5)
+        (chan5 / "hosted").mkdir(parents=True, exist_ok=True)
+        (chan5 / "hosted" / "P1_H9.png").write_bytes(b"OLDHOSTED")
+        teams_vm_pull.atomic_write_json(chan5 / ".cdp-cursor.json", {
+            "next_link": "URL_RESUME2", "lines": 1,
+            "bytes": (chan5 / "messages.jsonl").stat().st_size})
+        msg_p2 = {"id": "P2", "body": {"content": f'<img src="{hosted_url_p2}">'},
+                  "replies": [{"id": "P2-R1", "body": {"content": ""}}]}
+        fake5 = _FakeChannelAPI(raw_routes={
+            "URL_RESUME2": (200, json.dumps(
+                {"value": [msg_p2], "@odata.nextLink": None}).encode(), ""),
+            hosted_url_p2: (200, b"NEWHOSTED", "image/png"),
+        })
+        res5 = teams_vm_pull.pull_channel(fake5, "G5", "C5", tdest, None)
+        check("pull_channel resume: replies/hosted in the final result "
+              "are the CUMULATIVE on-disk total across both passes "
+              "(2 prior + 1 new = 3 replies; 1 prior + 1 new = 2 hosted), "
+              "not this pass's own delta",
+              fake5.get_calls == [] and res5["status"] == "ok"
+              and res5["messages"] == 2 and res5["replies"] == 3
+              and res5["hosted"] == 2
+              and (chan5 / "hosted" / "P1_H9.png").read_bytes()
+                  == b"OLDHOSTED"
+              and any((chan5 / "hosted").glob("P2_H10*"))
+              and next((chan5 / "hosted").glob("P2_H10*")).read_bytes()
+                  == b"NEWHOSTED",
+              str(res5))
 
         # -- a cursor whose next_link now 4xxs is NOT trusted forward: the
         # unit is cleared and re-walked from scratch (channels are small). --
