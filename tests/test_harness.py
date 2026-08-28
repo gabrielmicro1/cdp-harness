@@ -5560,6 +5560,110 @@ def main() -> int:
     run_script("offboard_company.py", "offboard", "nosuchco", "--root", root,
                expect_rc=1)
 
+    print("\n— mint_push_sas (client push SAS: ledger + tokens page) —")
+    ledger_path = root / ".sas-ledger.json"
+
+    def _tail_json(proc):  # dry-run prints DRY-RUN: az lines before the JSON
+        return json.loads(proc.stdout[proc.stdout.index("{"):])
+
+    proc = run_script("mint_push_sas.py", "mint", "democo", "--root", root,
+                      "--dry-run")
+    m = _tail_json(proc)
+    check("mint dry-run reports dry_run and mints nothing",
+          m.get("dry_run") is True and not ledger_path.exists())
+    check("mint dry-run carries the 14-day default",
+          m.get("days") == 14)
+    check("mint dry-run prints the generate-sas az command",
+          "storage container generate-sas" in proc.stdout
+          and "--permissions racwl" in proc.stdout)
+    proc = run_script("mint_push_sas.py", "mint", "democo", "--root", root,
+                      "--dry-run", "--days", "30")
+    check("mint --days overrides the default",
+          _tail_json(proc).get("days") == 30)
+    run_script("mint_push_sas.py", "mint", "nosuchco", "--root", root,
+               "--dry-run", expect_rc=1)
+
+    # Real mint with az stubbed out: the deliverable is a password-protected
+    # zip (ZipCrypto, like scripts/sas-mint) — the raw SAS never in the summary.
+    import argparse as _argparse
+    import mint_push_sas
+    FAKE_SAS = "se=2026-09-11T00%3A00%3A00Z&sp=racwl&sig=FAKEFAKEFAKE"
+
+    def _fake_run_az(azargs, dry_run=False, timeout=300, check=True):
+        out = FAKE_SAS if "generate-sas" in azargs else ""
+        return subprocess.CompletedProcess(["az"] + azargs, 0,
+                                           stdout=out, stderr="")
+
+    saved_run_az = common.run_az
+    common.run_az = _fake_run_az
+    try:
+        msum = mint_push_sas.cmd_mint(root, _argparse.Namespace(
+            slug="democo", days=14, note="test mint", dry_run=False))
+    finally:
+        common.run_az = saved_run_az
+    zip_path = Path(msum["zip"])
+    check("mint outputs zip + password, never the raw SAS",
+          zip_path.is_file() and msum["password"]
+          and "sas_url" not in msum and FAKE_SAS not in json.dumps(msum))
+    check("ledger entry written with zip path",
+          ledger_path.is_file()
+          and common.read_json(ledger_path)["tokens"][0]["zip"] == str(zip_path)
+          and FAKE_SAS not in ledger_path.read_text())
+    unz = tempfile.mkdtemp(prefix="cdp-sas-unzip-")
+    p_ok = subprocess.run(["unzip", "-P", msum["password"], "-d", unz,
+                           str(zip_path)], capture_output=True, text=True)
+    creds = Path(unz) / "sas-credentials.txt"
+    creds_txt = creds.read_text() if creds.is_file() else ""
+    check("zip opens with the printed password and holds the SAS URL",
+          p_ok.returncode == 0 and FAKE_SAS in creds_txt
+          and "democo-raw" in creds_txt)
+    check("credentials txt warns about the default-deny firewall",
+          "network-rule add" in creds_txt and "403" in creds_txt
+          and "rg-democo" in creds_txt)
+    p_bad = subprocess.run(["unzip", "-o", "-P", "wrong-password", "-d", unz,
+                            str(zip_path)], capture_output=True, text=True)
+    check("zip refuses a wrong password", p_bad.returncode != 0)
+    shutil.rmtree(unz)
+
+    # Ledger/page are offline-testable without az: seed entries directly —
+    # one live token minted "now", one long-expired.
+    common.write_json(ledger_path, {"tokens": [
+        {"id": "democo-20260101T000000Z", "slug": "democo",
+         "storage_account": "stdemoco", "container": "democo-raw",
+         "permissions": "racwl", "signing": "account-key",
+         "created_at": "2026-01-01T00:00:00Z",
+         "expires_at": "2026-01-15T00:00:00Z", "days": 14,
+         "note": "initial push token", "fingerprint": "aaaaaaaaaaaa"},
+        {"id": "democo-" + common.ts_basic(now), "slug": "democo",
+         "storage_account": "stdemoco", "container": "democo-raw",
+         "permissions": "racwl", "signing": "account-key",
+         "created_at": common.iso(now),
+         "expires_at": common.iso(now + timedelta(days=14)), "days": 14,
+         "note": "re-mint", "fingerprint": "bbbbbbbbbbbb"},
+    ]})
+    proc = run_script("mint_push_sas.py", "list", "--root", root)
+    lst = json.loads(proc.stdout)["tokens"]
+    check("list computes status per token",
+          [t["status"] for t in lst] == ["expired", "active"])
+    check("list computes days_remaining",
+          lst[0]["days_remaining"] == 0 and 13 <= lst[1]["days_remaining"] <= 14)
+
+    sas_page = tmp / "sas-tokens.html"
+    proc = run_script("mint_push_sas.py", "page", "--root", root,
+                      "--out", sas_page)
+    psum = json.loads(proc.stdout)
+    page_html = sas_page.read_text()
+    check("page written with both tokens",
+          sas_page.is_file() and psum["tokens"] == 2 and psum["active"] == 1
+          and page_html.count("democo-raw") == 2)
+    check("page badges expired vs active",
+          "expired" in page_html and "active" in page_html)
+    check("page never contains a SAS query string", "sig=" not in page_html)
+    proc = run_script("mint_push_sas.py", "page", "--root", root,
+                      "--out", sas_page)
+    check("page regeneration idempotent",
+          json.loads(proc.stdout)["tokens"] == 2)
+
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]
     print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed")

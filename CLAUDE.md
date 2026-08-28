@@ -75,6 +75,8 @@ companies/                   # ALL runtime state; gitignored (local only)
     blob-index.tsv.gz        # per-blob sizing cache (zip/gz rows, ETag-keyed);
                              # rebuilt by each harvest — the incremental-run seed
   .fleet-state.json          # transient in-flight fleet state; gitignored
+  .sas-ledger.json           # client push-SAS ledger (metadata only, never
+                             # tokens); written by mint_push_sas.py; gitignored
   .sizer-work/               # local sizer work files (<slug>-sizer.*); gitignored
   .archive/<slug>/           # offboarded companies (full state, intact); the dot
                              # prefix hides them from list_companies -> dashboard
@@ -90,6 +92,7 @@ companies/                   # ALL runtime state; gitignored (local only)
   verify-completion/SKILL.md
   deep-verify/SKILL.md                     # stream-measure every archive on an in-region VM
   daily-brief/SKILL.md
+  mint-sas/SKILL.md                        # client push SAS (racwl, 14-day default) + ledger + tokens page
   gcs-azure-transfer/SKILL.md              # GCS export → <slug>-raw via transfer VM
   gcs-azure-transfer/references/commands.md
   dropbox-azure-transfer/SKILL.md          # Dropbox → <slug>-raw (same engine)
@@ -116,6 +119,8 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   reconcile.py               # declared-vs-actual math: %, deltas, ETA, flags, lore notes
   corpus_sizer_rest.py       # portable stdlib+SAS sizer; runs locally, detached
   discover_company.py        # az discovery for onboarding → config.json
+  mint_push_sas.py           # client push SAS: account-key racwl mint (14-day
+                             # default), .sas-ledger.json, reports/sas-tokens.html
   offboard_company.py        # offboard/restore/list: move a company to/from
                              #   companies/.archive/ (local only; Azure untouched)
   size_company.py            # single-company sizing CLI (fleet of one)
@@ -151,6 +156,7 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   verify_completion.py       # completion checklist
 reports/
   index.html                 # generated fleet dashboard (my working view)
+  sas-tokens.html            # generated push-SAS tokens page (mint_push_sas.py page)
 tests/
   fixtures/companies/democo/ # fake company for offline validation
   test_harness.py            # runs all offline validation; python3 tests/test_harness.py

@@ -47,6 +47,17 @@ expected-data-sizes.json, status.json (runtime state — gitignored, local only)
    Schemas are in CLAUDE.md — follow them exactly. Do NOT git-commit any of
    it: `companies/*/` is gitignored runtime state.
 
+5. **Offer the Slack kickoff** (optional — the client-comms side lives in the
+   `corpus-transfer-slack-operator` plugin, not this harness). Ask the user
+   for the company's Slack channel link; declining just skips this step. If
+   they provide one, invoke `corpus-transfer-slack-operator:company-kickoff`
+   with it — that skill registers the channel, records the Company Transfer
+   Setup workflow parents, and populates every service thread with a private
+   draft (never a send) via `service-thread-drafting`. Follow the plugin's
+   SKILL.md as the source of truth for the workflow — do not restate or
+   improvise its steps here. Unless the user asks for channel monitoring,
+   keep it drafts-only: skip the worker/task-workspace bootstrap.
+
 ## Edge cases
 
 - Re-onboarding an existing company: discover_company.py refreshes config
