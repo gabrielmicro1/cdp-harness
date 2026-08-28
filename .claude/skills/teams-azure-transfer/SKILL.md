@@ -98,9 +98,9 @@ Both are caught by `probe`, before any billable VM.
 ## Workflow
 
 ```
-discover → probe → create-vm → allow-network → write-dest → check-azure
-  → write-creds → transfer (--limit-teams 2 pilot first) → status
-  → verify → teardown --confirmed
+discover → probe → plan → create-vm → allow-network → write-dest
+  → check-azure → write-creds → transfer (--limit-teams 2 pilot first)
+  → status → verify → teardown --confirmed
 ```
 
 Each step's exact command (including the two 3-line stdin heredocs) is in

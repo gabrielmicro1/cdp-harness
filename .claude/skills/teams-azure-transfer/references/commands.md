@@ -35,9 +35,17 @@ Common flags: `--root` (companies dir, default `companies/`), `--rg`
 (override VM resource group; default the company's RG), `--vm-size`
 (default `Standard_D8s_v7`), `--os-disk-gb` (default: the Spec's 64 —
 staging is JSONL + inline images, not video/DB dumps), `--dest-prefix`
-(default `teams-export`, resolved for `plan`/`create-vm`; other commands
-read the VM's `dest_prefix` tag when omitted), `--sas-days` (default 21),
-`--dry-run` on everything.
+(default `teams-export`; resolution differs by command — see below),
+`--sas-days` (default 21), `--dry-run` on everything.
+
+**`--dest-prefix` resolution is NOT the same on every command.**
+`write-dest` resolves flag → the VM's `dest_prefix` tag (set at
+`create-vm`) → the `teams-export` default. `verify` resolves flag → the
+`teams-export` default ONLY — it never reads the VM tag, because the VM is
+normally already torn down by the time you verify. **If a company ever runs
+with a non-default `--dest-prefix` (e.g. a multi-org batch), `verify` must
+be passed that same `--dest-prefix` explicitly** — omitting it silently
+verifies the wrong (default) path instead of erroring.
 
 Transfer flags: `--rps-messages` (float, override the puller's messages-
 family pace; default is unset, which lets the puller use its own default of
