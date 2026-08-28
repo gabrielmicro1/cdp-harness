@@ -424,7 +424,9 @@ def pull_meta(api: GraphAPI, dest: Path) -> dict:
         log("_meta: already complete, skipping")
         teams = [json.loads(ln) for ln in
                  (d / "teams.jsonl").read_text().splitlines() if ln.strip()]
-        channels: dict[str, list] = {}
+        # Seed every team (even one with zero channels) so the reconstructed
+        # roster matches the freshly-written one key-for-key.
+        channels: dict[str, list] = {t["id"]: [] for t in teams}
         for ln in (d / "channels.jsonl").read_text().splitlines():
             if not ln.strip():
                 continue

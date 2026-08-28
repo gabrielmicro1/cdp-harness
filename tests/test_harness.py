@@ -4083,6 +4083,177 @@ def main() -> int:
                "team-members.jsonl", "channel-members.jsonl",
                "name-map.json")))
 
+    print("\n— teams_vm_pull GraphAPI / pull_meta in-process "
+          "(stubbed transport) —")
+
+    class _TResp:
+        def __init__(self, payload, status=200):
+            self._b = (payload if isinstance(payload, bytes)
+                       else json.dumps(payload).encode())
+            self.status = status
+            self.headers = {"Content-Type": "application/json"}
+
+        def read(self, n=None):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _thttp_err(code, body=b"{}", headers=None):
+        return urllib.error.HTTPError(
+            "https://x", code, "err", headers or {}, io.BytesIO(body))
+
+    tsaved_urlopen = teams_vm_pull.urllib.request.urlopen
+    tsaved_sleep = teams_vm_pull.time.sleep
+    try:
+        # -- get_raw: a stubbed 429 with Retry-After sleeps (recorded, not
+        # actually slept) and then succeeds on the next attempt, with no
+        # NameError — the exact bug the controller ruling fixed (Retry-After
+        # must be captured INSIDE the except clause, since `e` unbinds once
+        # the except block ends). --
+        tsleeps = []
+        teams_vm_pull.time.sleep = lambda s: tsleeps.append(s)
+        _tseq = [_thttp_err(429, b"{}", {"Retry-After": "7"}),
+                 _TResp({"value": []})]
+
+        def _t429_urlopen(req, timeout=120):
+            item = _tseq.pop(0)
+            if isinstance(item, urllib.error.HTTPError):
+                raise item
+            return item
+        teams_vm_pull.urllib.request.urlopen = _t429_urlopen
+
+        class _FixedBox:
+            def get(self):
+                return "TOK"
+
+            def invalidate(self):
+                pass
+        # rps_directory=0 disables PaceBucket's own proactive throttling
+        # sleep, so tsleeps records ONLY the 429/Retry-After backstop this
+        # check is about.
+        tapi = teams_vm_pull.GraphAPI(_FixedBox(), rps_directory=0)
+        status, body, _ct = tapi.get_raw(
+            teams_vm_pull.GRAPH + "/groups", "directory", required=True)
+        check("teams GraphAPI.get_raw: a stubbed 429 with Retry-After "
+              "sleeps the captured value (no NameError) then succeeds",
+              tsleeps == [7] and status == 200
+              and json.loads(body.decode()) == {"value": []}
+              and tapi.sleeps == 1)
+
+        # -- pull_meta: happy path + the two documented tolerances +
+        # is_complete short-circuit on resume. --
+        class _FakeGraphAPI:
+            """Duck-types GraphAPI's .get/.get_raw for pull_meta. Every
+            stubbed page is single-page (no @odata.nextLink), so get_raw
+            is never exercised here — asserting that keeps this test
+            honestly scoped to pull_meta's own branching, not paged()'s
+            (which has its own coverage in the get_raw check above and in
+            classify()'s pure checks)."""
+
+            def __init__(self, routes):
+                self.routes = routes
+                self.calls = []
+
+            def get(self, path, family, params=None, required=False):
+                self.calls.append(path)
+                if path not in self.routes:
+                    raise AssertionError(f"unstubbed teams path: {path}")
+                return self.routes[path]
+
+            def get_raw(self, url, family, required=False):
+                raise AssertionError(
+                    "get_raw unexpected — a stubbed page carried a "
+                    "nextLink it shouldn't have")
+
+        troutes = {
+            "/groups": (200, {"value": [
+                {"id": "T1", "displayName": "Team One"},
+                {"id": "T2", "displayName": "Team Two"}]}),
+            "/teams/T1": (200, {"id": "T1", "someTeamSetting": True}),
+            "/teams/T2": (404, None),
+            "/teams/T1/channels": (200, {"value": [
+                {"id": "C1", "displayName": "General",
+                 "membershipType": "standard"},
+                {"id": "C2", "displayName": "Private1",
+                 "membershipType": "private"}]}),
+            "/teams/T2/channels": (200, {"value": []}),
+            "/users": (200, {"value": [
+                {"id": "U1", "userPrincipalName": "u1@x.com"}]}),
+            "/groups/T1/members": (200, {"value": [
+                {"id": "U1", "displayName": "User One"}]}),
+            "/groups/T2/members": (403, None),
+            "/teams/T1/channels/C2/members": (200, {"value": [
+                {"id": "U2", "displayName": "User Two"}]}),
+        }
+        with tempfile.TemporaryDirectory() as tdest_s:
+            tdest = Path(tdest_s)
+            fake_api = _FakeGraphAPI(troutes)
+            roster = teams_vm_pull.pull_meta(fake_api, tdest)
+            mdir = tdest / "_meta"
+            tteams = [json.loads(ln) for ln in
+                     (mdir / "teams.jsonl").read_text().splitlines()]
+            tchannels = [json.loads(ln) for ln in
+                        (mdir / "channels.jsonl").read_text().splitlines()]
+            tmembers = [json.loads(ln) for ln in
+                       (mdir / "team-members.jsonl").read_text()
+                       .splitlines()]
+            tchmembers = [json.loads(ln) for ln in
+                         (mdir / "channel-members.jsonl").read_text()
+                         .splitlines()]
+            check("teams pull_meta: happy-path team gets settings merged "
+                  "in, six files written, unit marked complete",
+                  {t["id"] for t in tteams} == {"T1", "T2"}
+                  and any(t.get("someTeamSetting") is True
+                          for t in tteams if t["id"] == "T1")
+                  and (mdir / "users.jsonl").exists()
+                  and (mdir / "name-map.json").exists()
+                  and teams_vm_pull.is_complete(mdir),
+                  str(tteams))
+            check("teams pull_meta: a team whose /teams/{id} fetch 404s "
+                  "gets team_settings_status recorded, not a failure",
+                  any(t.get("id") == "T2" and
+                      t.get("team_settings_status") == 404
+                      for t in tteams),
+                  str(tteams))
+            check("teams pull_meta: a team whose members walk is refused "
+                  "(403) gets a members_status line, not a failure",
+                  any(m.get("team_id") == "T2" and
+                      m.get("members_status") == 403 for m in tmembers)
+                  and any(m.get("team_id") == "T1" and m.get("id") == "U1"
+                          for m in tmembers),
+                  str(tmembers))
+            check("teams pull_meta: only the non-standard channel gets a "
+                  "channel-members walk",
+                  len(tchmembers) == 1
+                  and tchmembers[0]["channel_id"] == "C2"
+                  and tchmembers[0]["id"] == "U2"
+                  and not any(c.get("channel_id") == "C1"
+                              for c in tchmembers),
+                  str(tchmembers))
+            check("teams pull_meta: return value matches the roster "
+                  "written to disk",
+                  roster["counts"] == {"teams": 2, "channels": 2}
+                  and len(roster["channels"]["T1"]) == 2
+                  and roster["channels"]["T2"] == [],
+                  str(roster))
+
+            # is_complete short-circuit: a second call must not touch the
+            # api at all and must reproduce the same roster.
+            calls_before = len(fake_api.calls)
+            roster2 = teams_vm_pull.pull_meta(fake_api, tdest)
+            check("teams pull_meta: is_complete short-circuits resume "
+                  "(no further API calls) and reproduces the roster",
+                  len(fake_api.calls) == calls_before
+                  and roster2 == roster,
+                  str(roster2))
+    finally:
+        teams_vm_pull.urllib.request.urlopen = tsaved_urlopen
+        teams_vm_pull.time.sleep = tsaved_sleep
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
