@@ -4068,6 +4068,20 @@ def main() -> int:
           "oauth2/v2.0/token" in teams_vm_pull.TOKEN_PATH_FMT
           and ".default" in
           inspect.getsource(teams_vm_pull.TokenBox.mint))
+    check("teams GraphAPI: exactly ONE place builds the Authorization "
+          "header; bearer only",
+          inspect.getsource(teams_vm_pull).count('"Authorization"') == 1)
+    check("teams _meta: the documented org-wide team filter, and "
+          "channel/member walks",
+          "resourceProvisioningOptions/Any(x:x eq 'Team')"
+          in inspect.getsource(teams_vm_pull.pull_meta)
+          and "/channels" in inspect.getsource(teams_vm_pull.pull_meta)
+          and "/members" in inspect.getsource(teams_vm_pull.pull_meta))
+    check("teams _meta filenames match the spec layout",
+          all(n in inspect.getsource(teams_vm_pull.pull_meta) for n in
+              ("teams.jsonl", "channels.jsonl", "users.jsonl",
+               "team-members.jsonl", "channel-members.jsonl",
+               "name-map.json")))
 
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,

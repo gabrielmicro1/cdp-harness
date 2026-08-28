@@ -307,3 +307,228 @@ class PaceBucket:
         if now < self._next:
             time.sleep(self._next - now)
         self._next = max(now, self._next) + self._interval
+
+
+class GraphAPI:
+    """Thin Graph client: pacing (one bucket per family, 'messages' vs
+    everything-else-is-directory), retry/sleep/remint per classify(), and
+    the SINGLE place that builds the Authorization header (bearer only —
+    the app-only token from TokenBox, never a delegated/browser flow)."""
+
+    def __init__(self, box, rps_messages=DEFAULT_RPS_MESSAGES,
+                 rps_directory=DEFAULT_RPS_DIRECTORY):
+        self.box = box
+        self._buckets = {"messages": PaceBucket(rps_messages)}
+        self._dir_bucket = PaceBucket(rps_directory)
+        self.calls = 0
+        self.sleeps = 0
+
+    def _bucket(self, family):
+        return self._buckets.get(family, self._dir_bucket)
+
+    def get_raw(self, url: str, family: str, required: bool = False):
+        for attempt in range(1, API_RETRIES + 2):
+            self._bucket(family).wait()
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {self.box.get()}"})
+            self.calls += 1
+            retry_after_hdr = None
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    return (r.status, r.read(),
+                            r.headers.get("Content-Type", ""))
+            except urllib.error.HTTPError as e:
+                status, body = e.code, e.read()
+                retry_after_hdr = e.headers.get("Retry-After")
+            except (urllib.error.URLError, TimeoutError):
+                status, body = 599, b""
+            action = classify(status, family, required)
+            if action == "sleep":
+                retry_after = 30
+                try:
+                    retry_after = int(retry_after_hdr)
+                except (TypeError, ValueError):
+                    pass
+                self.sleeps += 1
+                time.sleep(min(300, max(1, retry_after)))
+            elif action == "remint":
+                self.box.invalidate()
+                if attempt > 1:
+                    raise SystemExit("401 persists after re-mint — token "
+                                     "or permission problem")
+            elif action == "retry":
+                time.sleep(min(120, 10 * attempt))
+            elif action == "fatal":
+                raise SystemExit(
+                    f"fatal {status} on {family} {url.split('?')[0]}: "
+                    f"{body[:300].decode('utf-8', 'replace')}")
+            else:            # skip — terminal, caller records it
+                return (status, body, "")
+        raise SystemExit(f"retries exhausted on {url.split('?')[0]}")
+
+    def get(self, path, family, params=None, required=False):
+        url = GRAPH + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params, safe="$()/'! ,=")
+        status, body, _ = self.get_raw(url, family, required)
+        if status in (200, 201) and body:
+            return status, json.loads(body.decode())
+        return status, None
+
+
+def paged(api, path, family, params, required=False):
+    """Generator over items across @odata.nextLink pages. A refused first
+    page or a refused nextLink both just end the generator (the caller
+    already got the terminal status via api.get/get_raw's own handling —
+    classify() raises SystemExit for anything that should actually stop
+    the run, so reaching here with a non-2xx status means a recorded skip)."""
+    status, body = api.get(path, family, params, required)
+    while True:
+        if status not in (200, 201) or body is None:
+            return
+        for item in body.get("value", []):
+            yield item
+        nxt = body.get("@odata.nextLink")
+        if not nxt:
+            return
+        status, raw, _ = api.get_raw(nxt, family, required)
+        body = json.loads(raw.decode()) if status == 200 and raw else None
+
+
+def _paged_from_status(api, family, first_status, first_body,
+                        required=False):
+    """Continue a paged walk from an ALREADY-FETCHED first page, so a
+    caller that needs the first page's status (to record a member-list
+    refusal) never pays for it twice."""
+    status, body = first_status, first_body
+    while True:
+        if status not in (200, 201) or body is None:
+            return
+        for item in body.get("value", []):
+            yield item
+        nxt = body.get("@odata.nextLink")
+        if not nxt:
+            return
+        status, raw, _ = api.get_raw(nxt, family, required)
+        body = json.loads(raw.decode()) if status == 200 and raw else None
+
+
+def pull_meta(api: GraphAPI, dest: Path) -> dict:
+    """The one REQUIRED unit: org roster + channels + membership index.
+    required=True everywhere here — classify() makes any refusal on these
+    calls fatal, EXCEPT the specific per-team/per-channel tolerances noted
+    inline (an archived team's settings 404ing, a team/channel's member
+    list being 403'd) which are recorded, not fatal."""
+    d = unit_dir(dest, "_meta")
+    if is_complete(d):
+        log("_meta: already complete, skipping")
+        teams = [json.loads(ln) for ln in
+                 (d / "teams.jsonl").read_text().splitlines() if ln.strip()]
+        channels: dict[str, list] = {}
+        for ln in (d / "channels.jsonl").read_text().splitlines():
+            if not ln.strip():
+                continue
+            rec = json.loads(ln)
+            channels.setdefault(rec["team_id"], []).append(rec)
+        return {"teams": teams, "channels": channels,
+                "counts": {"teams": len(teams),
+                           "channels": sum(len(v)
+                                           for v in channels.values())}}
+
+    teams = []
+    channels: dict[str, list] = {}
+    name_map = {"teams": {}, "channels": {}}
+
+    teams_path = d / "teams.jsonl"
+    with open(teams_path, "w") as fh:
+        for grp in paged(
+                api, "/groups", "directory",
+                {"$filter":
+                 "resourceProvisioningOptions/Any(x:x eq 'Team')",
+                 "$select": "id,displayName,description,"
+                            "createdDateTime,visibility",
+                 "$top": "100"},
+                required=True):
+            gid = grp["id"]
+            tstatus, settings = api.get(f"/teams/{gid}", "directory",
+                                         required=False)
+            rec = dict(grp)
+            if settings is None:
+                rec["team_settings_status"] = tstatus
+            else:
+                rec.update(settings)
+            fh.write(json.dumps(rec) + "\n")
+            teams.append(rec)
+            name_map["teams"][gid] = grp.get("displayName")
+
+    channels_path = d / "channels.jsonl"
+    with open(channels_path, "w") as fh:
+        for team in teams:
+            gid = team["id"]
+            team_channels = []
+            for ch in paged(api, f"/teams/{gid}/channels", "directory",
+                             {}, required=True):
+                rec = dict(ch)
+                rec["team_id"] = gid
+                fh.write(json.dumps(rec) + "\n")
+                team_channels.append(rec)
+                name_map["channels"][ch["id"]] = ch.get("displayName")
+            channels[gid] = team_channels
+
+    users_path = d / "users.jsonl"
+    with open(users_path, "w") as fh:
+        for user in paged(
+                api, "/users", "directory",
+                {"$select": "id,userPrincipalName,displayName,mail,"
+                            "accountEnabled,userType",
+                 "$top": "100"},
+                required=True):
+            fh.write(json.dumps(user) + "\n")
+
+    team_members_path = d / "team-members.jsonl"
+    with open(team_members_path, "w") as fh:
+        for team in teams:
+            gid = team["id"]
+            status, body = api.get(
+                f"/groups/{gid}/members", "directory",
+                {"$select": "id,displayName,userPrincipalName",
+                 "$top": "100"},
+                required=False)
+            if status not in (200, 201):
+                fh.write(json.dumps(
+                    {"team_id": gid, "members_status": status}) + "\n")
+                continue
+            for member in _paged_from_status(api, "directory", status,
+                                              body, required=False):
+                rec = dict(member)
+                rec["team_id"] = gid
+                fh.write(json.dumps(rec) + "\n")
+
+    channel_members_path = d / "channel-members.jsonl"
+    with open(channel_members_path, "w") as fh:
+        for gid, team_channels in channels.items():
+            for ch in team_channels:
+                if ch.get("membershipType") == "standard":
+                    continue
+                cid = ch["id"]
+                status, body = api.get(
+                    f"/teams/{gid}/channels/{cid}/members", "directory",
+                    required=False)
+                if status not in (200, 201):
+                    fh.write(json.dumps(
+                        {"team_id": gid, "channel_id": cid,
+                         "members_status": status}) + "\n")
+                    continue
+                for member in _paged_from_status(api, "directory", status,
+                                                  body, required=False):
+                    rec = dict(member)
+                    rec["team_id"] = gid
+                    rec["channel_id"] = cid
+                    fh.write(json.dumps(rec) + "\n")
+
+    atomic_write_json(d / "name-map.json", name_map)
+
+    mark_complete(d)
+    return {"teams": teams, "channels": channels,
+            "counts": {"teams": len(teams),
+                       "channels": sum(len(v) for v in channels.values())}}
