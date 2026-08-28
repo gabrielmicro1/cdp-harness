@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import gzip
+import inspect
 import io
 import json
 import os
@@ -4044,6 +4045,29 @@ def main() -> int:
     check("figma pin: the pinned prefix is not an unexpected source",
           "figma-export" not in figs["unexpected_sources"],
           str(figs["unexpected_sources"]))
+
+    print("\n— teams_vm_pull pure helpers (classify, TokenBox shape, "
+          "pacing)")
+    import teams_vm_pull  # noqa: E402
+    check("teams classify: 403 on the messages family is the "
+          "protected-API fatal",
+          teams_vm_pull.classify(403, "messages", False) == "fatal"
+          and teams_vm_pull.classify(402, "messages", False) == "fatal")
+    check("teams classify: 403/404 on a single team unit is a recorded "
+          "skip, never fatal",
+          teams_vm_pull.classify(403, "team", False) == "skip"
+          and teams_vm_pull.classify(404, "channel", False) == "skip")
+    check("teams classify: _meta required units are fatal on any refusal",
+          teams_vm_pull.classify(404, "directory", True) == "fatal")
+    check("teams classify: 429 sleeps, 401 re-mints, 5xx retries",
+          teams_vm_pull.classify(429, "messages", True) == "sleep"
+          and teams_vm_pull.classify(401, "directory", True) == "remint"
+          and teams_vm_pull.classify(503, "messages", False) == "retry")
+    check("teams TokenBox: client-credentials mint against the tenant's "
+          "v2.0 endpoint, .default scope",
+          "oauth2/v2.0/token" in teams_vm_pull.TOKEN_PATH_FMT
+          and ".default" in
+          inspect.getsource(teams_vm_pull.TokenBox.mint))
 
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
