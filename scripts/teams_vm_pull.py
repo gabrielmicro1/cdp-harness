@@ -7,8 +7,15 @@ with ~/.config/xfer/{teams.env,dest-teams.env} sourced:
   TEAMS_TENANT_ID     — AAD tenant id (or verified domain)
   TEAMS_CLIENT_ID     — client-made app registration's client id
   TEAMS_CLIENT_SECRET — that app's client secret
-  AZURE_DEST_URL      — https://ACCT.blob.core.windows.net/<cont>/<prefix>
-  AZURE_DEST_SAS      — racwl container SAS
+  DEST_URL            — https://ACCT.blob.core.windows.net/<container>
+  DEST_SAS            — racwl container SAS
+  DEST_PREFIX         — export sub-path under the container (default
+                        "teams-export"); this script appends it itself —
+                        unlike figma/zoho's already-prefixed DEST_URL —
+                        so DEST_PREFIX is a real, consumed setting here.
+  RPS_MESSAGES        — optional pacing override (default 4/s)
+  RPS_DIRECTORY       — optional pacing override (default 10/s)
+  LIMIT_TEAMS         — optional pilot: only the first N teams
 
 Why a VM at all: a real tenant's Teams corpus is every team's every
 channel's every message thread plus every reply, walked page by page
@@ -54,17 +61,27 @@ ALONE and never imports from the repo (no `common`, no `phases`) — it
 must stand on its own exactly like figma_vm_pull.py, github_vm_pull.py
 and zoho_vm_pull.py before it.
 
-This module holds helpers + classes only; main() and the Graph-calling
-pull logic land in later tasks.
+The channel unit (`pull_channel`) writes one JSONL line per ROOT message,
+each carrying its replies fully expanded inline — a JSONL line is ALWAYS a
+complete thread, never a partial one paused mid-reply-page. Hosted content
+referenced from a thread's HTML body (`hostedContents/<id>/$value`) is
+staged as bytes under the unit's `hosted/` dir; attachment objects (a
+different Teams primitive — document-library files, whose bytes belong to
+the sharepoint-completion effort) are deliberately left as references in
+the message JSON and never fetched.
 
-Exit codes (once main() exists): 0 = complete success, 1 = fatal setup
-error (bad credentials / no teams reachable / no azcopy), 2 = finished
-but one or more units failed (see manifest.json).
+Exit codes: 0 = complete success, 1 = fatal setup error (bad credentials /
+no azcopy / missing env), 2 = finished but one or more units failed or
+were skipped (see manifest.json).
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -79,6 +96,23 @@ TOKEN_REFRESH_MARGIN = 120   # re-mint 2 min before the 1 h expiry
 API_RETRIES = 4
 DEFAULT_RPS_MESSAGES = 4.0   # conservative; Teams messaging is Graph's slow lane
 DEFAULT_RPS_DIRECTORY = 10.0 # groups/users/channels reads
+DEFAULT_DEST_PREFIX = "teams-export"
+MESSAGES_PAGE_SIZE = 50
+
+# hostedContents/$value URLs embedded in a message's body.content HTML —
+# never an attachment object's own download-URL field, which stays as a
+# reference (see module docstring). Group 1 = the message id the content
+# is attached to (root or reply — a reply's hosted image is served under
+# ITS OWN message id, not the thread root's), group 2 = the hostedContent
+# id.
+HOSTED_RE = re.compile(
+    r"https://graph\.microsoft\.com/v1\.0/teams/[^\"'\s]+"
+    r"/messages/([^/\"'\s]+)/hostedContents/([^/\"'\s]+)/\$value")
+
+EXT_BY_CONTENT_TYPE = {"image/png": ".png", "image/jpeg": ".jpg",
+                       "image/gif": ".gif", "image/webp": ".webp",
+                       "image/svg+xml": ".svg", "video/mp4": ".mp4",
+                       "application/pdf": ".pdf"}
 
 
 def log(msg: str) -> None:
@@ -160,6 +194,14 @@ def _count_lines(path: Path) -> int:
         for _ in fh:
             n += 1
     return n
+
+
+def fill_ext(content_type: str) -> str:
+    """PURE. Copied from figma_vm_pull.py. Extension for a downloaded
+    hostedContent blob, from Graph's Content-Type ($value URLs carry no
+    extension). Unknown types keep no extension rather than guessing."""
+    return EXT_BY_CONTENT_TYPE.get((content_type or "").split(";")[0]
+                                   .strip().lower(), "")
 
 
 # ── unit bookkeeping ─────────────────────────────────────────────────────────
@@ -534,3 +576,383 @@ def pull_meta(api: GraphAPI, dest: Path) -> dict:
     return {"teams": teams, "channels": channels,
             "counts": {"teams": len(teams),
                        "channels": sum(len(v) for v in channels.values())}}
+
+
+# ── channel units (messages + replies + hostedContents) ─────────────────────
+
+def hosted_refs(msg: dict) -> list:
+    """PURE. (message-id, hostedContent-id) pairs referenced by this
+    thread's HTML bodies — root and replies. Attachment objects are left
+    as references (document-library bytes belong to the sharepoint
+    completion), so only hostedContents URLs are harvested."""
+    out, seen = [], set()
+
+    def scan(m):
+        content = ((m.get("body") or {}).get("content")) or ""
+        for mid, hcid in HOSTED_RE.findall(content):
+            if (mid, hcid) not in seen:
+                seen.add((mid, hcid))
+                out.append((mid, hcid))
+    scan(msg)
+    for rep in msg.get("replies") or []:
+        scan(rep)
+    return out
+
+
+def complete_thread(api, gid, cid, msg) -> dict:
+    """Pages a truncated replies list to completion before the caller ever
+    writes the JSONL line — a line is ALWAYS a complete thread, never a
+    partial one paused mid-reply-page. gid/cid are accepted (not used
+    inside) for interface parity with pull_channel's other calls."""
+    nxt = msg.pop("replies@odata.nextLink", None)
+    if nxt:
+        replies = list(msg.get("replies") or [])
+        while nxt:
+            status, raw, _ = api.get_raw(nxt, "messages")
+            if status != 200 or not raw:
+                msg["replies_truncated"] = f"status {status}"
+                break
+            body = json.loads(raw.decode())
+            replies.extend(body.get("value", []))
+            nxt = body.get("@odata.nextLink")
+        msg["replies"] = replies
+    return msg
+
+
+def pull_channel(api, gid, cid, dest: Path, args) -> dict:
+    """One channel = one unit: `teams/<gid>/<cid>/messages.jsonl` (one
+    complete thread per line) + a `hosted/` dir of hostedContents blobs.
+
+    Resume is `.cdp-cursor.json` ({"next_link", "lines", "bytes"}) plus
+    `resume_truncate` discarding a torn trailing line. A cursor whose
+    `next_link` now answers a non-2xx (a channel deleted mid-run, a token
+    scope regression) is NOT trusted forward — the unit is cleared and
+    re-walked from scratch, which is cheap because channels are small
+    (unlike a CRM module's millions of records).
+
+    A terminal skip on the very FIRST page (no cursor at all — cid is 404,
+    an archived/deleted channel) is recorded via mark_skipped and returned
+    as a skip, never a failure. `args` is accepted for interface parity
+    with figma/zoho's per-unit signature; nothing here reads it today."""
+    unit = f"teams/{gid}/{cid}"
+    d = unit_dir(dest, unit)
+    if is_complete(d):
+        return _result(unit, "channel", "skipped-complete", bytes=dir_size(d))
+
+    jsonl = d / "messages.jsonl"
+    cursor = read_cursor(d)
+    total = 0
+    body = None
+
+    if cursor:
+        total = resume_truncate(jsonl, cursor)
+        next_link = cursor.get("next_link")
+        if next_link:
+            status, raw, _ = api.get_raw(next_link, "messages")
+            if status not in (200, 201):
+                log(f"{unit}: cursor next_link refused (status {status}) — "
+                    "clearing and re-walking from scratch (channels are "
+                    "small)")
+                clear_unit(d)
+                try:
+                    jsonl.unlink()
+                except OSError:
+                    pass
+                return pull_channel(api, gid, cid, dest, args)
+            body = json.loads(raw.decode()) if raw else None
+        # else: pagination already finished last time (next_link was None)
+        # — nothing left to page, fall through straight to hosted content.
+    else:
+        status, body = api.get(
+            f"/teams/{gid}/channels/{cid}/messages", "messages",
+            {"$top": str(MESSAGES_PAGE_SIZE), "$expand": "replies"})
+        if status not in (200, 201):
+            mark_skipped(d, f"status-{status}")
+            return _result(unit, "channel", "skipped",
+                           reason=f"status-{status}")
+
+    n_replies = 0
+    while body is not None:
+        msgs = body.get("value", [])
+        if msgs:
+            with open(jsonl, "a", encoding="utf-8") as fh:
+                for msg in msgs:
+                    msg = complete_thread(api, gid, cid, msg)
+                    n_replies += len(msg.get("replies") or [])
+                    fh.write(json.dumps(msg, separators=(",", ":")) + "\n")
+                    total += 1
+                fh.flush()
+                os.fsync(fh.fileno())
+        nxt = body.get("@odata.nextLink")
+        atomic_write_json(d / ".cdp-cursor.json", {
+            "next_link": nxt, "lines": total,
+            "bytes": jsonl.stat().st_size if jsonl.exists() else 0})
+        if not nxt:
+            break
+        status, raw, _ = api.get_raw(nxt, "messages")
+        body = json.loads(raw.decode()) if status in (200, 201) and raw \
+            else None
+
+    # hostedContents: harvested from the now-complete JSONL, one Bearer
+    # fetch per unique (mid, hcid); deterministic filenames ARE the
+    # resume, so an existing file (any extension) is skipped, never
+    # re-fetched. Per-item refusals are counted, never fatal here — a
+    # blanket refusal across the whole surface would already have raised
+    # inside api.get_raw via classify()'s messages-family rule.
+    n_hosted = 0
+    hosted_errors = 0
+    hosted_dir = d / "hosted"
+    if jsonl.exists():
+        for ln in jsonl.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            msg = json.loads(ln)
+            for mid, hcid in hosted_refs(msg):
+                stem = f"{mid}_{safe_component(hcid, 60)}"
+                if hosted_dir.is_dir() and any(
+                        p.name == stem or p.name.startswith(stem + ".")
+                        for p in hosted_dir.iterdir()):
+                    continue
+                url = (f"{GRAPH}/teams/{gid}/channels/{cid}/messages/"
+                       f"{mid}/hostedContents/{hcid}/$value")
+                hstatus, raw_h, ctype = api.get_raw(url, "messages")
+                if hstatus not in (200, 201) or raw_h is None:
+                    hosted_errors += 1
+                    continue
+                hosted_dir.mkdir(parents=True, exist_ok=True)
+                (hosted_dir / f"{stem}{fill_ext(ctype)}").write_bytes(raw_h)
+                n_hosted += 1
+
+    mark_complete(d)
+    return _result(unit, "channel", "ok", messages=total,
+                   replies=n_replies, hosted=n_hosted,
+                   hosted_errors=hosted_errors, bytes=dir_size(d))
+
+
+# ── manifest + upload ────────────────────────────────────────────────────────
+
+def build_manifest(context: dict, started_utc: str, finished_utc: str,
+                   api_calls: int, api_sleeps: int, results: list) -> dict:
+    """PURE. verify's authority — adapted from figma_vm_pull.py's
+    build_manifest (teams has no team_ids/plan inputs of its own: team
+    discovery is org-wide, and pacing is RPS, not a pricing-tier plan, so
+    both live inside `context` instead). failed_units and skipped_units
+    stay strictly separate: a skip is deliberate and never a failure."""
+    failed = [r["unit"] for r in results if r.get("status") == "failed"]
+    skipped = [{"unit": r["unit"], "reason": r.get("reason"),
+                "detail": r.get("detail")}
+               for r in results if r.get("status") == "skipped"]
+    total = sum(int(r.get("bytes") or 0) for r in results
+                if r.get("status") in ("ok", "skipped-complete"))
+    return {
+        "source": "teams",
+        "puller_version": 1,
+        "started_utc": started_utc,
+        "finished_utc": finished_utc,
+        "context": context,
+        "unit_count": len(results),
+        "total_staged_bytes": total,
+        "api_calls": api_calls,
+        "api_sleeps": api_sleeps,
+        "failed_units": failed,
+        "skipped_units": skipped,
+        "hosted_errors": sum(int(r.get("hosted_errors") or 0)
+                             for r in results),
+        "results": results,
+    }
+
+
+def upload(dest: Path, dest_url: str, sas: str, subpath: str = "",
+          overwrite: bool = False) -> bool:
+    """azcopy the staged tree (or one unit of it) to the container prefix.
+    Copied from figma_vm_pull.py verbatim (same flags, same write
+    invariant): --overwrite=false is client-side no-overwrite (the s3/
+    github/zoho/figma choice), NOT the API-enforced If-None-Match of the
+    local (qwilr/vimeo/zoom) pulls, and NOT copy-source-authorization
+    (that header belongs to the vimeo/zoom server-side-copy transport,
+    structurally unavailable here — hostedContents need a Bearer fetch).
+    SAS never printed; output is scanned, not echoed raw."""
+    if shutil.which("azcopy") is None:
+        log("upload: FATAL azcopy not found on PATH — bootstrap incomplete")
+        return False
+    src = dest / subpath if subpath else dest
+    url = f"{dest_url}/{subpath}" if subpath else dest_url
+    if not src.exists():
+        return True
+    log(f"upload: azcopy {src} -> {url.split('?')[0]}")
+    # Trailing /* copies dir CONTENTS so the container prefix isn't nested.
+    proc = subprocess.run(
+        ["azcopy", "copy", str(src) + "/*", f"{url}?{sas}",
+         "--recursive",
+         "--overwrite=true" if overwrite else "--overwrite=false",
+         "--log-level", "ERROR"],
+        capture_output=True, text=True)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    failed = "0"
+    status = ""
+    for ln in out.splitlines():
+        if "Transfers Failed" in ln:
+            failed = ln.split(":")[-1].strip()
+        if "Final Job Status" in ln:
+            status = ln.split(":")[-1].strip()
+    ok = failed == "0" and (proc.returncode == 0
+                            or status.startswith("Completed"))
+    log(f"upload: {'DONE' if ok else 'FAILED'} "
+        f"(status={status or 'rc=%d' % proc.returncode}, failed={failed})")
+    if not ok:
+        # never echo raw azcopy output wholesale — a URL line would leak
+        # the SAS; keep only sig-free lines
+        for ln in [x for x in out.splitlines()[-15:] if "sig=" not in x]:
+            log(f"upload:   {ln}")
+    return ok
+
+
+def upload_run_metadata(dest: Path, dest_url: str, sas: str) -> bool:
+    """progress.json (dest root) and _meta/manifest.json ride with
+    overwrite ALLOWED.
+
+    Everything else rides --overwrite=false, but these are OUR run
+    bookkeeping, not client corpus data — and manifest.json is exactly
+    what verify treats as authoritative. Uploading it no-overwrite means a
+    re-run's manifest is silently skipped and verify certifies against the
+    FIRST pass forever (the github pilot-poisons-verify bug, observed
+    live; zoho/figma shipped the fix from day one; teams inherits it).
+
+    UNLIKE figma (manifest.json at the dest ROOT), teams' manifest lives
+    at `_meta/manifest.json` — the spec layout, and where a later verify
+    greps `teams-export/_meta/manifest.json` (controller ruling,
+    2026-08-28)."""
+    if shutil.which("azcopy") is None:
+        return False
+    ok = True
+    for rel in ("progress.json", "_meta/manifest.json"):
+        src = dest / rel
+        if not src.exists():
+            continue
+        proc = subprocess.run(
+            ["azcopy", "copy", str(src), f"{dest_url}/{rel}?{sas}",
+             "--overwrite=true", "--log-level", "ERROR"],
+            capture_output=True, text=True)
+        good = proc.returncode == 0
+        log(f"upload: {rel} {'DONE' if good else 'FAILED'} (overwrite=true)")
+        ok = ok and good
+    # Per-unit control files are bookkeeping too: a re-walked unit rewrites
+    # a cursor/skip marker and no-overwrite would keep the stale one, so
+    # verify would report a phantom short_upload on a since-fixed unit.
+    proc = subprocess.run(
+        ["azcopy", "copy", str(dest) + "/*", f"{dest_url}?{sas}",
+         "--recursive", "--overwrite=true", "--log-level", "ERROR",
+         "--include-pattern",
+         ".cdp-complete;.cdp-cursor.json;.cdp-skipped.json"],
+        capture_output=True, text=True)
+    good = proc.returncode == 0
+    log(f"upload: control files {'DONE' if good else 'FAILED'} "
+        "(overwrite=true)")
+    return ok and good
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    """Fully env-driven — no argv, per the secrets-never-touch-argv rule
+    and because teams_transfer.py launches this with no arguments at all
+    (`python3 teams_vm_pull.py` inside tmux, both env files pre-sourced)."""
+    tenant = os.environ.get("TEAMS_TENANT_ID", "").strip()
+    client_id = os.environ.get("TEAMS_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("TEAMS_CLIENT_SECRET", "").strip()
+    if not (tenant and client_id and client_secret):
+        log("FATAL: TEAMS_TENANT_ID/TEAMS_CLIENT_ID/TEAMS_CLIENT_SECRET "
+            "not all in environment (teams.env not sourced?)")
+        return 1
+    dest_url = os.environ.get("DEST_URL", "").strip()
+    dest_sas = os.environ.get("DEST_SAS", "").strip()
+    if not (dest_url and dest_sas):
+        log("FATAL: DEST_URL/DEST_SAS not in environment "
+            "(dest-teams.env not sourced?)")
+        return 1
+    dest_prefix = (os.environ.get("DEST_PREFIX", "").strip()
+                  or DEFAULT_DEST_PREFIX)
+    full_dest_url = f"{dest_url.rstrip('/')}/{dest_prefix}"
+
+    def _env_float(name, default):
+        raw = os.environ.get(name, "").strip()
+        try:
+            return float(raw) if raw else default
+        except ValueError:
+            return default
+
+    rps_messages = _env_float("RPS_MESSAGES", DEFAULT_RPS_MESSAGES)
+    rps_directory = _env_float("RPS_DIRECTORY", DEFAULT_RPS_DIRECTORY)
+    limit_raw = os.environ.get("LIMIT_TEAMS", "").strip()
+    limit_teams = int(limit_raw) if limit_raw.isdigit() else 0
+
+    dest = Path(os.path.expanduser(
+        os.environ.get("XFER_DEST", "~/xfer-teams/dest")))
+    dest.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc).isoformat()
+
+    box = TokenBox(tenant, client_id, client_secret)
+    box.mint()  # proves credentials before anything else
+    api = GraphAPI(box, rps_messages=rps_messages, rps_directory=rps_directory)
+
+    write_progress(dest, "walk", 0, 0, "_meta")
+    log("pulling _meta (teams/channels/users/membership)")
+    roster = pull_meta(api, dest)
+    upload(dest, full_dest_url, dest_sas, "_meta")
+
+    teams = roster["teams"]
+    if limit_teams:
+        teams = teams[:limit_teams]
+    channel_map = roster.get("channels") or {}
+    plan = [(t["id"], ch["id"]) for t in teams
+            for ch in channel_map.get(t["id"], [])]
+    log(f"{len(teams)} team(s), {len(plan)} channel(s) planned"
+        + (f" (LIMIT_TEAMS={limit_teams})" if limit_teams else ""))
+
+    results: list = []
+    for i, (gid, cid) in enumerate(plan, 1):
+        unit = f"teams/{gid}/{cid}"
+        write_progress(dest, "pull", i, len(plan), unit)
+        log(f"[{i}/{len(plan)}] {unit}")
+        res = pull_channel(api, gid, cid, dest, None)
+        results.append(res)
+        if res.get("status") == "ok":
+            upload(dest, full_dest_url, dest_sas, res["unit"])
+
+    context = {"teams": roster["counts"].get("teams"),
+              "channels": roster["counts"].get("channels"),
+              "channels_planned": len(plan),
+              "limit_teams": limit_teams or None,
+              "dest_prefix": dest_prefix,
+              "rps_messages": rps_messages,
+              "rps_directory": rps_directory}
+    manifest = build_manifest(
+        context, started, datetime.now(timezone.utc).isoformat(),
+        api.calls, api.sleeps, results)
+    meta_dir = dest / "_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    failed = manifest["failed_units"]
+    skipped = manifest["skipped_units"]
+    log(f"SUMMARY: {len(results)} units, "
+        f"{human_bytes(manifest['total_staged_bytes'])} staged, "
+        f"{api.calls} api calls, {api.sleeps} sleeps, "
+        f"{len(failed)} failed {failed if failed else ''}, "
+        f"{len(skipped)} skipped")
+
+    # upload-what-succeeded: the final sweep is cheap because
+    # --overwrite=false skips everything already landed per unit, and it
+    # is what carries any leftover control/skip-marker files up.
+    write_progress(dest, "upload", len(results), len(results),
+                   "azcopy final sweep")
+    upload_ok = upload(dest, full_dest_url, dest_sas)
+    # the manifest must REPLACE any earlier pass's — verify trusts it
+    upload_ok = upload_run_metadata(dest, full_dest_url, dest_sas) \
+        and upload_ok
+    write_progress(dest, "done", len(results), len(results),
+                   f"{len(failed)} failed, {len(skipped)} skipped")
+    return 2 if failed or skipped or not upload_ok else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

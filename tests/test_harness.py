@@ -4254,6 +4254,204 @@ def main() -> int:
         teams_vm_pull.urllib.request.urlopen = tsaved_urlopen
         teams_vm_pull.time.sleep = tsaved_sleep
 
+    print("\n— teams_vm_pull: channel units, hosted content, upload, main "
+          "(Task 3) —")
+    tsrc = (SCRIPTS / "teams_vm_pull.py").read_text()
+    check("teams puller: markers, cursor, honest write invariant "
+          "(client-side no-overwrite, no If-None-Match, no "
+          "copy-source-auth)",
+          ".cdp-complete" in tsrc and ".cdp-cursor.json" in tsrc
+          and "--overwrite=false" in tsrc
+          and '"If-None-Match"' not in tsrc
+          and "x-ms-copy-source-authorization" not in tsrc)
+    check("teams puller: manifest replaces, corpus never does (the "
+          "pilot-poisons-verify fix ships from day one)",
+          "--overwrite=true" in tsrc and "upload_run_metadata" in tsrc)
+    check("teams puller: messages are pulled $top=50 with replies "
+          "expanded, and truncated reply lists are paginated to "
+          "completion before the line is written",
+          "$expand" in tsrc and "replies@odata.nextLink" in tsrc)
+    check("teams puller: hosted content is staged (Bearer fetch), "
+          "attachment bytes are NOT fetched",
+          "hostedContents" in tsrc and "attachment" in tsrc.lower()
+          and "contentUrl" not in tsrc)
+    check("teams puller: hosted_refs finds refs in root AND replies",
+          teams_vm_pull.hosted_refs({
+              "id": "1", "body": {"content":
+                  '<img src="https://graph.microsoft.com/v1.0/teams/t/'
+                  'channels/c/messages/1/hostedContents/AAA/$value">'},
+              "replies": [{"id": "2", "body": {"content":
+                  '<img src="https://graph.microsoft.com/v1.0/teams/t/'
+                  'channels/c/messages/2/hostedContents/BBB/$value">'}}],
+          }) == [("1", "AAA"), ("2", "BBB")])
+    check("teams puller: secrets via env only, never argv",
+          "TEAMS_CLIENT_SECRET" in tsrc and "--secret" not in tsrc)
+    _tmods = set()
+    for _n in ast.walk(ast.parse(tsrc)):
+        if isinstance(_n, ast.Import):
+            for _a in _n.names:
+                _tmods.add((_a.asname or _a.name).split(".")[0])
+        elif isinstance(_n, ast.ImportFrom) and _n.level == 0:
+            _tmods.add(_n.module.split(".")[0])
+    check("teams puller: stdlib-only imports", all(
+        m in sys.stdlib_module_names for m in _tmods), str(_tmods))
+    check("teams puller: run manifest lives at _meta/manifest.json, not "
+          "the dest root (controller ruling — a later verify greps this "
+          "exact path)",
+          '"_meta/manifest.json"' in tsrc and "manifest.json" in
+          inspect.getsource(teams_vm_pull.upload_run_metadata))
+
+    print("\n— teams_vm_pull pull_channel in-process (stubbed transport) —")
+
+    class _FakeChannelAPI:
+        """Duck-types GraphAPI's .get/.get_raw for pull_channel. get_routes
+        keyed by path (as api.get is always called with the same literal
+        messages-list path); raw_routes keyed by the exact URL passed to
+        get_raw (nextLinks and hostedContents $value URLs alike)."""
+
+        def __init__(self, get_routes=None, raw_routes=None):
+            self.get_routes = get_routes or {}
+            self.raw_routes = raw_routes or {}
+            self.get_calls = []
+            self.raw_calls = []
+
+        def get(self, path, family, params=None, required=False):
+            self.get_calls.append(path)
+            return self.get_routes[path]
+
+        def get_raw(self, url, family, required=False):
+            self.raw_calls.append(url)
+            return self.raw_routes[url]
+
+    with tempfile.TemporaryDirectory() as tdest_s:
+        tdest = Path(tdest_s)
+
+        # -- happy path: two message pages, a reply page that must be
+        # paginated to completion BEFORE the line is written, one hosted
+        # ref fetched fresh and one skipped because its file already
+        # exists (deterministic-name resume). --
+        hosted_url = (teams_vm_pull.GRAPH +
+                      "/teams/G1/channels/C1/messages/M2/hostedContents/"
+                      "H1/$value")
+        msg1 = {"id": "M1", "body": {"content": "plain"}, "replies": []}
+        msg2 = {"id": "M2",
+                "body": {"content": f'<img src="{hosted_url}">'},
+                "replies": [], "replies@odata.nextLink": "URL_REPLIES_M2"}
+        msg3_hosted_url = (teams_vm_pull.GRAPH +
+                           "/teams/G1/channels/C1/messages/M3/"
+                           "hostedContents/H2/$value")
+        msg3 = {"id": "M3",
+                "body": {"content": f'<img src="{msg3_hosted_url}">'},
+                "replies": []}
+        chan_unit = teams_vm_pull.unit_dir(tdest, "teams/G1/C1")
+        (chan_unit / "hosted").mkdir(parents=True, exist_ok=True)
+        (chan_unit / "hosted" / "M3_H2.png").write_bytes(b"OLD")
+
+        fake1 = _FakeChannelAPI(
+            get_routes={
+                "/teams/G1/channels/C1/messages": (200, {
+                    "value": [msg1, msg2], "@odata.nextLink": "URL_PAGE2"}),
+            },
+            raw_routes={
+                "URL_PAGE2": (200, json.dumps(
+                    {"value": [msg3], "@odata.nextLink": None}).encode(),
+                              ""),
+                "URL_REPLIES_M2": (200, json.dumps(
+                    {"value": [{"id": "M2-R1", "body": {"content": ""}}],
+                     "@odata.nextLink": None}).encode(), ""),
+                hosted_url: (200, b"PNGDATA", "image/png"),
+            })
+        res1 = teams_vm_pull.pull_channel(fake1, "G1", "C1", tdest, None)
+        lines1 = (chan_unit / "messages.jsonl").read_text().splitlines()
+        check("pull_channel happy path: 3 root messages across 2 pages, "
+              "1 reply pulled via pagination-to-completion, 1 hosted ref "
+              "fetched fresh, the pre-existing one skipped (never "
+              "re-fetched), unit marked complete",
+              res1["status"] == "ok" and res1["messages"] == 3
+              and res1["replies"] == 1 and res1["hosted"] == 1
+              and res1["hosted_errors"] == 0
+              and len(lines1) == 3
+              and msg3_hosted_url not in fake1.raw_calls
+              and (chan_unit / "hosted" / "M2_H1.png").read_bytes()
+                  == b"PNGDATA"
+              and (chan_unit / "hosted" / "M3_H2.png").read_bytes()
+                  == b"OLD"
+              and teams_vm_pull.is_complete(chan_unit),
+              str(res1))
+        check("pull_channel happy path: the M2-R1 reply landed on M2's "
+              "line, not a separate line (a JSONL line is ALWAYS a "
+              "complete thread)",
+              any(json.loads(ln)["id"] == "M2"
+                  and [r["id"] for r in json.loads(ln)["replies"]]
+                  == ["M2-R1"] for ln in lines1),
+              lines1)
+
+        # -- cursor resume: a prior partial pull left one line + a cursor
+        # naming the next page; resume must NOT call the fresh-start
+        # endpoint at all, must truncate/continue correctly, and must
+        # preserve the already-written line untouched. --
+        chan2 = teams_vm_pull.unit_dir(tdest, "teams/G2/C2")
+        prev_line = json.dumps({"id": "M0", "body": {"content": ""},
+                                "replies": []}, separators=(",", ":")) + "\n"
+        (chan2 / "messages.jsonl").write_text(prev_line)
+        teams_vm_pull.atomic_write_json(chan2 / ".cdp-cursor.json", {
+            "next_link": "URL_RESUME", "lines": 1,
+            "bytes": (chan2 / "messages.jsonl").stat().st_size})
+        fake2 = _FakeChannelAPI(raw_routes={
+            "URL_RESUME": (200, json.dumps(
+                {"value": [{"id": "M1", "body": {"content": ""},
+                           "replies": []}],
+                 "@odata.nextLink": None}).encode(), ""),
+        })
+        res2 = teams_vm_pull.pull_channel(fake2, "G2", "C2", tdest, None)
+        lines2 = (chan2 / "messages.jsonl").read_text().splitlines()
+        check("pull_channel cursor resume: continues from next_link "
+              "without re-hitting the fresh-start endpoint, appends "
+              "exactly the new page, keeps the prior line intact",
+              fake2.get_calls == [] and res2["status"] == "ok"
+              and res2["messages"] == 2 and len(lines2) == 2
+              and json.loads(lines2[0])["id"] == "M0"
+              and json.loads(lines2[1])["id"] == "M1",
+              str(res2))
+
+        # -- a cursor whose next_link now 4xxs is NOT trusted forward: the
+        # unit is cleared and re-walked from scratch (channels are small). --
+        chan3 = teams_vm_pull.unit_dir(tdest, "teams/G3/C3")
+        (chan3 / "messages.jsonl").write_text(prev_line)
+        teams_vm_pull.atomic_write_json(chan3 / ".cdp-cursor.json", {
+            "next_link": "URL_STALE", "lines": 1,
+            "bytes": (chan3 / "messages.jsonl").stat().st_size})
+        fake3 = _FakeChannelAPI(
+            get_routes={
+                "/teams/G3/channels/C3/messages": (200, {
+                    "value": [{"id": "M9", "body": {"content": ""},
+                              "replies": []}],
+                    "@odata.nextLink": None}),
+            },
+            raw_routes={"URL_STALE": (404, None, "")})
+        res3 = teams_vm_pull.pull_channel(fake3, "G3", "C3", tdest, None)
+        lines3 = (chan3 / "messages.jsonl").read_text().splitlines()
+        check("pull_channel: a cursor next_link that now 4xxs clears the "
+              "unit and re-walks fresh rather than trusting it forward",
+              res3["status"] == "ok" and res3["messages"] == 1
+              and len(lines3) == 1 and json.loads(lines3[0])["id"] == "M9"
+              and fake3.get_calls == ["/teams/G3/channels/C3/messages"],
+              str(res3))
+
+        # -- skip status: a terminal refusal on the very first page (no
+        # cursor at all) is a recorded skip, never a failure. --
+        fake4 = _FakeChannelAPI(get_routes={
+            "/teams/G4/channels/C4/messages": (404, None),
+        })
+        res4 = teams_vm_pull.pull_channel(fake4, "G4", "C4", tdest, None)
+        chan4 = teams_vm_pull.unit_dir(tdest, "teams/G4/C4")
+        check("pull_channel: a 404 on the first page (fresh start) is "
+              "mark_skipped, not mark_complete, and is returned as a skip",
+              res4["status"] == "skipped" and res4["reason"] == "status-404"
+              and (chan4 / ".cdp-skipped.json").exists()
+              and not teams_vm_pull.is_complete(chan4),
+              str(res4))
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
