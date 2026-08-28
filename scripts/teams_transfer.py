@@ -308,52 +308,59 @@ def _graph_paginate(token: str, path: str, params: dict | None,
 
 # ── subcommands (the engine covers create-vm/allow-network/check-azure) ──────
 
+_TEAMS_PLAN_NOTE = (
+    "Teams-specific: run probe first — the message-content gate (open / "
+    "metered-model-required / protected-api-approval-missing) can turn "
+    "this into a client conversation before any VM is billed.")
+
+
 def cmd_plan(root: Path, args) -> dict:
-    """Same shape as transfer_engine.cmd_plan, but Teams has no rclone
-    remote and no bucket/export to look up before a VM exists — so under
-    --dry-run this never shells out to az at all (unlike the other
-    *-azure-transfer plans, which still print their DRY-RUN az-command
-    preview even though they change nothing): a caller piping stdout
-    straight into json.loads() gets clean JSON, no az-command noise ahead
-    of it. A real (non-dry-run) plan still resolves the SA's actual
-    region, same as every other source."""
-    cfg = eng.load_cfg(root, args.slug)
+    """Under --dry-run this is a hand-built minimal dict that never shells
+    out to az at all — Teams has no rclone remote and no bucket/export to
+    look up before a VM exists, so there is nothing a dry-run preview
+    would need az for, and skipping it means a caller piping stdout
+    straight into json.loads() gets clean JSON with no DRY-RUN az-command
+    line ahead of it (unlike the other *-azure-transfer plans, which still
+    print that preview even though they change nothing).
+
+    A real (non-dry-run) plan delegates to transfer_engine.cmd_plan for
+    the actual SA region lookup, same as every other source — one source
+    of truth for the shared dict shape — and just appends the
+    Teams-specific note."""
     if args.dry_run:
-        region = "(unknown — dry-run)"
-    else:
-        eng.set_subscription(cfg, args.dry_run)
-        region = eng.sa_region(cfg, args.dry_run)
-    return {
-        "slug": args.slug,
-        "vm_name": SPEC.vm_name(args.slug),
-        "vm_size": args.vm_size,
-        "region": region,
-        "resource_group": args.rg or cfg["resource_group"],
-        "storage_account": cfg["storage_account"],
-        "container": cfg["container"],
-        "dest": f"{cfg['container']}/{args.dest_prefix}",
-        "source": SPEC.source_ref(args.tenant_id or ""),
-        "sas_expiry_days": args.sas_days,
-        "note": ("VM billing starts at create and runs until teardown; "
-                 "public IP is static Standard SKU (never deallocate). "
-                 "Same-region reminder: the SA firewall needs a vnet-rule "
-                 "for this VM's subnet — IP rules alone never match "
-                 "same-region traffic. Teams-specific: run probe first — "
-                 "the message-content gate (open / metered-model-required "
-                 "/ protected-api-approval-missing) can turn this into a "
-                 "client conversation before any VM is billed."),
-    }
+        cfg = eng.load_cfg(root, args.slug)
+        return {
+            "slug": args.slug,
+            "vm_name": SPEC.vm_name(args.slug),
+            "vm_size": args.vm_size,
+            "region": "(unknown — dry-run)",
+            "resource_group": args.rg or cfg["resource_group"],
+            "storage_account": cfg["storage_account"],
+            "container": cfg["container"],
+            "dest": f"{cfg['container']}/{args.dest_prefix}",
+            "source": SPEC.source_ref(args.tenant_id or ""),
+            "sas_expiry_days": args.sas_days,
+            "note": _TEAMS_PLAN_NOTE,
+        }
+    result = eng.cmd_plan(SPEC, root, args)
+    result["note"] = result["note"] + " " + _TEAMS_PLAN_NOTE
+    return result
 
 
 def cmd_write_creds(root: Path, args) -> dict:
     """3 stdin lines -> 600 teams.env on the VM. The tenant on line 1 must
-    agree with --tenant-id (or, absent that, the VM's teams_tenant_id tag)
-    — see _tenant_guard. When not dry-run, a laptop TokenBox mint proves
-    the three values actually work together before declaring success."""
-    cfg = eng.load_cfg(root, args.slug)
-    vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
+    agree with --tenant-id (or, absent that, the VM's teams_tenant_id tag —
+    the normal workflow is create-vm --tenant-id once, then write-creds
+    with no flag at all, reading the tag) — see _tenant_guard. When not
+    dry-run, a laptop TokenBox mint proves the three values actually work
+    together before declaring success.
+
+    Stdin is read and validated FIRST, before any VM lookup (the qwilr
+    fail-fast convention) — a malformed paste should never cost an az call."""
     stdin_tenant, client_id, secret = read_secrets(args.dry_run)
     stdin_tenant = validate_tenant_id(stdin_tenant)
+    cfg = eng.load_cfg(root, args.slug)
+    vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
     expected = getattr(args, "tenant_id", None) \
         or (vm.get("tags") or {}).get(SPEC.loc_tag)
     if expected:
@@ -420,14 +427,26 @@ def cmd_probe(root: Path, args) -> dict:
     user_read_all = ustatus == 200
 
     channels: list = []
+    cstatus = None
     first_team = groups[0] if groups else None
     if first_team is not None:
-        _cstatus, channels = _graph_paginate(
+        cstatus, channels = _graph_paginate(
             token, f"/teams/{first_team['id']}/channels", None)
 
     message_gate = "no-channel-to-test"
-    next_step = ("no team has a readable channel to test messages against "
-                 "— probe cannot confirm the message-content gate yet.")
+    if first_team is None:
+        next_step = ("no team is visible to this app registration — probe "
+                     "cannot confirm the message-content gate yet.")
+    elif cstatus not in (200, 201):
+        next_step = (
+            f"the first team's channel listing was refused (status "
+            f"{cstatus}) — check the Channel.ReadBasic.All (or "
+            "ChannelSettings.Read.All) application permission before "
+            "assuming the team simply has no channels.")
+    else:
+        next_step = ("the first team has no channels to test messages "
+                     "against — probe cannot confirm the message-content "
+                     "gate yet.")
     first_channel = channels[0] if channels else None
     if first_team is not None and first_channel is not None:
         mstatus, _ = graph_get(
@@ -509,9 +528,10 @@ def main() -> int:
     p.add_argument("--root", default=str(common.DEFAULT_COMPANIES_ROOT))
     p.add_argument("--tenant-id", dest="tenant_id", default=None,
                    help="the client's Entra ID Directory (tenant) ID (a "
-                        "GUID) — required for plan/write-creds/probe; "
-                        f"later read from the {SPEC.loc_tag} VM tag once a "
-                        "VM exists.")
+                        "GUID) — required for plan/probe; for write-creds "
+                        f"it falls back to the {SPEC.loc_tag} VM tag set at "
+                        "create-vm, so the normal workflow only passes it "
+                        "once.")
     p.add_argument("--rg", help="override VM resource group "
                                "(default: company's RG)")
     p.add_argument("--vm-size", default="Standard_D8s_v7")
@@ -525,8 +545,7 @@ def main() -> int:
     p.add_argument("--sas-days", type=int, default=21)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
-    if args.command in ("plan", "write-creds", "probe") \
-            and args.tenant_id is None:
+    if args.command in ("plan", "probe") and args.tenant_id is None:
         p.error(f"{args.command} requires --tenant-id")
     if args.dest_prefix is None and args.command == "plan":
         args.dest_prefix = SPEC.default_dest_prefix

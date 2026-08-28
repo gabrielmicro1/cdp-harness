@@ -4576,6 +4576,60 @@ def main() -> int:
           and "generate-sas" not in proc.stdout
           and "az vm" not in proc.stdout, proc.stdout[-300:])
 
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "teams_transfer.py"), "write-creds",
+         "democo", "--root", str(root), "--dry-run"],
+        input="505f352c-ec82-4ff9-9191-556112b420f9\n"
+              "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1\n"
+              "TEAMSSECRETSENTINEL4\n",
+        capture_output=True, text=True)
+    check("teams write-creds: --tenant-id is NOT required by argparse — "
+          "the normal workflow (create-vm --tenant-id once, then "
+          "write-creds bare) must reach the VM-tag fallback branch",
+          proc.returncode == 0 and "requires --tenant-id" not in proc.stderr
+          and "redacted" in proc.stdout,
+          proc.stdout[-300:] + proc.stderr[-300:])
+
+    print("\n— teams_transfer: write-creds tenant resolution from the VM "
+          "tag (--tenant-id omitted, in-process since a dry-run VM's tags "
+          "are always empty) —")
+    from types import SimpleNamespace as _TeamsNS
+    _tw_require_vm = teams_transfer.eng.require_vm
+    _tw_read_secrets = teams_transfer.read_secrets
+    try:
+        teams_transfer.eng.require_vm = lambda spec, cfg, slug, dry_run: {
+            "name": "xfer-teams-democo", "power_state": "VM running",
+            "public_ip": "203.0.113.10",
+            "tags": {"teams_tenant_id":
+                    "505f352c-ec82-4ff9-9191-556112b420f9"},
+            "location": "eastus"}
+        teams_transfer.read_secrets = lambda dry_run: (
+            "505f352c-ec82-4ff9-9191-556112b420f9",
+            "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1", "TEAMSSECRETSENTINEL5")
+        wargs = _TeamsNS(slug="democo", tenant_id=None, dry_run=True)
+        wres = teams_transfer.cmd_write_creds(root, wargs)
+        check("teams write-creds: no --tenant-id + matching VM tag "
+              "succeeds (the tag-fallback branch is reachable and works)",
+              wres.get("ok") is True and wres.get("secret") == "redacted",
+              str(wres))
+
+        teams_transfer.read_secrets = lambda dry_run: (
+            "deadbeef-0000-0000-0000-000000000000",
+            "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1", "TEAMSSECRETSENTINEL6")
+        tag_mismatch_msg = ""
+        try:
+            teams_transfer.cmd_write_creds(root, wargs)
+        except common.HarnessError as e:
+            tag_mismatch_msg = str(e)
+        check("teams write-creds: no --tenant-id + a stdin tenant that "
+              "disagrees with the VM tag still raises the mismatch guard "
+              "(the tag path is a real check, not a silent no-op)",
+              "tenant" in tag_mismatch_msg.lower()
+              and "mismatch" in tag_mismatch_msg.lower(), tag_mismatch_msg)
+    finally:
+        teams_transfer.eng.require_vm = _tw_require_vm
+        teams_transfer.read_secrets = _tw_read_secrets
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
