@@ -234,6 +234,20 @@ azcopy copy "$HOME/xfer-teams/dest/*" "${DEST_URL}/${DEST_PREFIX}?${DEST_SAS}" \
   --recursive --overwrite=false
 ```
 
+**A `--limit-teams` pilot's roster goes stale before the full run.** The
+`_meta` unit's `.cdp-complete` marker means a later full-run invocation
+would normally serve `pull_meta`'s roster straight from the pilot's disk
+state without re-walking it — fine when nothing changed, wrong if teams/
+channels were added or renamed between the pilot and the full run. Force a
+fresh roster walk with `REFRESH_META=1` ahead of the puller (jsonl files are
+always overwritten in `"w"` mode regardless; only the completion marker is
+cleared):
+
+```bash
+set -a; . ~/.config/xfer/teams.env; . ~/.config/xfer/dest-teams.env; set +a
+REFRESH_META=1 python3 ~/xfer-teams/teams_vm_pull.py 2>&1 | tee -a ~/xfer-teams/pull-teams.log
+```
+
 `teams_vm_pull.py` is fully env-driven — it is launched with **zero
 argv**; `--rps-messages` / `--limit-teams` ride as `export RPS_MESSAGES=…`
 / `export LIMIT_TEAMS=…` lines ahead of `python3 teams_vm_pull.py`, not CLI

@@ -4144,6 +4144,39 @@ def main() -> int:
               and json.loads(body.decode()) == {"value": []}
               and tapi.sleeps == 1)
 
+        # -- I3: 429s never consume the retry budget — more consecutive
+        # 429s than API_RETRIES must still end in success, not
+        # SystemExit. --
+        tsleeps.clear()
+        _tseq[:] = ([_thttp_err(429, b"{}", {"Retry-After": "1"})]
+                    * (teams_vm_pull.API_RETRIES + 3)
+                    + [_TResp({"value": ["ok"]})])
+        status, body, _ct = tapi.get_raw(
+            teams_vm_pull.GRAPH + "/groups", "directory", required=True)
+        check("teams GraphAPI.get_raw: sustained 429s beyond API_RETRIES "
+              "still succeed (sleep never charges the retry budget)",
+              status == 200 and len(tsleeps) == teams_vm_pull.API_RETRIES + 3)
+
+        # -- C2: a deterministic 4xx that exhausts retries on a
+        # required=False call RETURNS the terminal status (caller records
+        # a skip / clears the cursor) instead of killing the whole pass
+        # with SystemExit; required=True still raises. --
+        def _t400_urlopen(req, timeout=120):
+            raise _thttp_err(400, b'{"error":{"code":"BadRequest"}}')
+        teams_vm_pull.urllib.request.urlopen = _t400_urlopen
+        status, body, _ct = tapi.get_raw(
+            teams_vm_pull.GRAPH + "/x", "messages", required=False)
+        _c2_raised = False
+        try:
+            tapi.get_raw(teams_vm_pull.GRAPH + "/x", "directory",
+                         required=True)
+        except SystemExit:
+            _c2_raised = True
+        check("teams GraphAPI.get_raw: exhausted retries on an OPTIONAL "
+              "call return the terminal 4xx (failure isolation); a "
+              "REQUIRED call still raises",
+              status == 400 and _c2_raised)
+
         # -- pull_meta: happy path + the two documented tolerances +
         # is_complete short-circuit on resume. --
         class _FakeGraphAPI:
@@ -4275,15 +4308,29 @@ def main() -> int:
           "attachment bytes are NOT fetched",
           "hostedContents" in tsrc and "attachment" in tsrc.lower()
           and "contentUrl" not in tsrc)
-    check("teams puller: hosted_refs finds refs in root AND replies",
+    _hr = teams_vm_pull.hosted_refs({
+        "id": "1", "body": {"content":
+            '<img src="https://graph.microsoft.com/v1.0/teams/t/'
+            'channels/c/messages/1/hostedContents/AAA/$value">'},
+        "replies": [{"id": "2", "body": {"content":
+            '<img src="https://graph.microsoft.com/v1.0/teams/t/'
+            'channels/c/messages/1/replies/2/hostedContents/BBB/'
+            '$value">'}}],
+    })
+    check("teams puller: hosted_refs finds refs in root AND replies — "
+          "including the REPLY-SHAPED URL (…/messages/{root}/replies/"
+          "{reply}/hostedContents/…), keyed by innermost id, fetch URL "
+          "kept verbatim",
+          [(m, h) for _u, m, h in _hr] == [("1", "AAA"), ("2", "BBB")]
+          and _hr[0][0].endswith("/messages/1/hostedContents/AAA/$value")
+          and "/replies/2/hostedContents/BBB" in _hr[1][0])
+    check("teams puller: hosted_refs host-checks candidate URLs — a "
+          "non-Graph host is never yielded (no Bearer fetch off-host)",
           teams_vm_pull.hosted_refs({
               "id": "1", "body": {"content":
-                  '<img src="https://graph.microsoft.com/v1.0/teams/t/'
-                  'channels/c/messages/1/hostedContents/AAA/$value">'},
-              "replies": [{"id": "2", "body": {"content":
-                  '<img src="https://graph.microsoft.com/v1.0/teams/t/'
-                  'channels/c/messages/2/hostedContents/BBB/$value">'}}],
-          }) == [("1", "AAA"), ("2", "BBB")])
+                  '<img src="https://graph.microsoft.com.evil.example/'
+                  'v1.0/teams/t/channels/c/messages/1/hostedContents/'
+                  'AAA/$value">'}}) == [])
     check("teams puller: secrets via env only, never argv",
           "TEAMS_CLIENT_SECRET" in tsrc and "--secret" not in tsrc)
     _tmods = set()

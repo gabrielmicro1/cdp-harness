@@ -120,6 +120,21 @@ def validate_tenant_id(raw: str) -> str:
     return t.lower()
 
 
+def validate_client_id(raw: str) -> str:
+    """The app registration's Application (client) ID is always a GUID.
+    write-creds writes it UNQUOTED into the VM's sourced env file (unlike
+    the secret, which is single-quoted) — a non-GUID value could carry a
+    shell metacharacter (`&`, a space, a stray quote already refused by
+    read_secrets) that corrupts that `source` line, so it is validated
+    up front exactly like the tenant id."""
+    c = (raw or "").strip()
+    if not GUID_RE.match(c):
+        raise common.HarnessError(
+            f"client id {c!r} is not a GUID — copy the Application "
+            "(client) ID from the client's Entra app registration page")
+    return c
+
+
 def read_secrets(dry_run: bool) -> tuple[str, str, str]:
     """Exactly 3 stdin lines: tenant id, client id, client secret (the
     zoom 3-line convention). Stdin only — argv is world-readable via ps,
@@ -445,6 +460,63 @@ def _graph_paginate(token: str, path: str, params: dict | None,
     return status, items
 
 
+PAGE_SAMPLE_CAP = 20   # bound on the message-page-depth sample (I5) — a
+                       # probe must stay cheap, never a partial corpus walk
+
+
+def _sample_message_pages(token: str, gid: str, cid: str,
+                          max_pages: int = PAGE_SAMPLE_CAP) -> int | None:
+    """How many message pages a channel has, up to `max_pages` — page
+    COUNT only (never message content, never bytes), used to scale
+    probe's wall-clock estimate (I5). Returns None if even the first page
+    is refused (the channel is excluded from the sample, not counted as
+    depth 0 — a refusal is not the same as an empty channel)."""
+    status, body = graph_get(
+        token, f"/teams/{gid}/channels/{cid}/messages",
+        {"$top": str(puller.MESSAGES_PAGE_SIZE)})
+    if status not in (200, 201) or body is None:
+        return None
+    pages = 1
+    nxt = body.get("@odata.nextLink")
+    while nxt and pages < max_pages:
+        status, body = graph_get(token, nxt)
+        if status not in (200, 201) or body is None:
+            break
+        pages += 1
+        nxt = body.get("@odata.nextLink")
+    return pages
+
+
+def _estimate_from_samples(teams_total: int, team_channel_counts: list,
+                           channel_page_depths: list,
+                           rps_messages: float) -> dict:
+    """PURE. Scales a cheap, sampled census (a handful of teams' channel
+    LISTINGS, a handful of channels' message-page DEPTH) up to a rough
+    tenant-wide wall-clock estimate:
+    teams_total x avg_channels_per_sampled_team x avg_pages_per_sampled_channel
+    / rps_messages — NOT one team's channel count treated as the whole
+    tenant (the bug this replaces). Sample sizes always ride the output so
+    the estimate's basis is auditable, never asserted silently. Counts
+    only, never bytes — Graph publishes no message/attachment byte size."""
+    avg_channels = (sum(team_channel_counts) / len(team_channel_counts)
+                    if team_channel_counts else 0.0)
+    avg_pages = (sum(channel_page_depths) / len(channel_page_depths)
+                if channel_page_depths else 0.0)
+    est_seconds = 0.0
+    if avg_channels and avg_pages and rps_messages > 0:
+        est_seconds = teams_total * avg_channels * avg_pages / rps_messages
+    return {
+        "teams_total": teams_total,
+        "teams_sampled_for_channels": len(team_channel_counts),
+        "avg_channels_per_sampled_team": round(avg_channels, 2),
+        "channels_sampled_for_pages": len(channel_page_depths),
+        "avg_pages_per_sampled_channel": round(avg_pages, 2),
+        "rps_messages": rps_messages,
+        "estimated_seconds": round(est_seconds, 1),
+        "estimate_basis": "sampled",
+    }
+
+
 # ── subcommands (the engine covers create-vm/allow-network/check-azure) ──────
 
 _TEAMS_PLAN_NOTE = (
@@ -498,6 +570,7 @@ def cmd_write_creds(root: Path, args) -> dict:
     fail-fast convention) — a malformed paste should never cost an az call."""
     stdin_tenant, client_id, secret = read_secrets(args.dry_run)
     stdin_tenant = validate_tenant_id(stdin_tenant)
+    client_id = validate_client_id(client_id)
     cfg = eng.load_cfg(root, args.slug)
     vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
     expected = getattr(args, "tenant_id", None) \
@@ -562,8 +635,13 @@ def cmd_probe(root: Path, args) -> dict:
             "Nothing else can be probed until this is fixed.")
     team_names_sample = [g.get("displayName") for g in groups[:10]]
 
-    ustatus, _users = graph_get(token, "/users", _USER_PARAMS)
-    user_read_all = ustatus == 200
+    ustatus, ubody = graph_get(token, "/users", _USER_PARAMS)
+    # sampled COUNT, not a bool (m5, counts discipline) — a refused /users
+    # (missing User.Read.All) reads as 0 sampled, same as a genuinely
+    # user-less tenant; the top-level ok/message_gate fields are what
+    # actually gates the engagement, not this count.
+    users_sampled = (len((ubody or {}).get("value", []))
+                     if ustatus == 200 else 0)
 
     channels: list = []
     cstatus = None
@@ -627,28 +705,49 @@ def cmd_probe(root: Path, args) -> dict:
         chats = f"unexpected-{chat_status}"
 
     channels_sampled = len(channels)
-    pages_per_channel_sampled = 1 if first_channel is not None else 0
-    est_seconds = 0.0
-    if channels_sampled and pages_per_channel_sampled:
-        est_seconds = (channels_sampled * pages_per_channel_sampled
-                      / puller.DEFAULT_RPS_MESSAGES)
+
+    # -- I5: sample a handful of teams' channel LISTINGS (first_team's is
+    # already in hand above) and a handful of channels' message-page
+    # DEPTH (first_channel's is folded in too), then scale by the REAL
+    # team total. Cheap and bounded: at most TEAM_SAMPLE_SIZE extra
+    # channel listings and CHANNEL_SAMPLE_SIZE page-depth walks (each
+    # capped at PAGE_SAMPLE_CAP pages), never a corpus walk. --
+    TEAM_SAMPLE_SIZE = 5
+    CHANNEL_SAMPLE_SIZE = 5
+    team_channel_counts: list = []
+    sampled_channel_refs: list = []
+    for g in groups[:TEAM_SAMPLE_SIZE]:
+        if g is first_team:
+            team_channels = channels
+        else:
+            gcstatus, team_channels = _graph_paginate(
+                token, f"/teams/{g['id']}/channels", None)
+            if gcstatus not in (200, 201):
+                continue
+        team_channel_counts.append(len(team_channels))
+        for ch in team_channels:
+            sampled_channel_refs.append((g["id"], ch["id"]))
+
+    channel_page_depths = [
+        depth for depth in (
+            _sample_message_pages(token, gid, cid) for gid, cid in
+            sampled_channel_refs[:CHANNEL_SAMPLE_SIZE])
+        if depth is not None]
+
+    estimate = _estimate_from_samples(
+        len(groups), team_channel_counts, channel_page_depths,
+        puller.DEFAULT_RPS_MESSAGES)
 
     return {
         "ok": message_gate == "open",
         "teams_sampled": len(groups),
         "team_names_sample": team_names_sample,
-        "user_read_all": user_read_all,
+        "users_sampled": users_sampled,
         "channels_sampled": channels_sampled,
         "message_gate": message_gate,
         "next_step": next_step,
         "chats": chats,
-        "estimate": {
-            "channels_sampled": channels_sampled,
-            "pages_per_channel_sampled": pages_per_channel_sampled,
-            "rps_messages": puller.DEFAULT_RPS_MESSAGES,
-            "estimated_seconds": round(est_seconds, 1),
-            "estimate_basis": "sampled",
-        },
+        "estimate": estimate,
         "note": ("counts and a sampled wall-clock estimate only, NEVER "
                  "bytes — Graph publishes no message or attachment byte "
                  "sizes. Only message_gate == 'open' means the skill can "

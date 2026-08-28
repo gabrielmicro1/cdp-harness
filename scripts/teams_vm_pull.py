@@ -16,6 +16,11 @@ with ~/.config/xfer/{teams.env,dest-teams.env} sourced:
   RPS_MESSAGES        — optional pacing override (default 4/s)
   RPS_DIRECTORY       — optional pacing override (default 10/s)
   LIMIT_TEAMS         — optional pilot: only the first N teams
+  REFRESH_META        — optional: "1" clears the _meta unit's completion
+                        marker before pulling, so a roster gone stale
+                        between a --limit-teams pilot and the full run is
+                        re-walked instead of served from is_complete's
+                        short-circuit (manual VM rescue only)
 
 Why a VM at all: a real tenant's Teams corpus is every team's every
 channel's every message thread plus every reply, walked page by page
@@ -94,6 +99,10 @@ LOGIN = "https://login.microsoftonline.com"
 TOKEN_PATH_FMT = "{login}/{tenant}/oauth2/v2.0/token"
 TOKEN_REFRESH_MARGIN = 120   # re-mint 2 min before the 1 h expiry
 API_RETRIES = 4
+MAX_SLEEPS_PER_CALL = 50    # 429 never counts against API_RETRIES (sustained
+                            # throttling is not fatal), but this runaway
+                            # backstop bounds a call that never stops being
+                            # throttled.
 DEFAULT_RPS_MESSAGES = 4.0   # conservative; Teams messaging is Graph's slow lane
 DEFAULT_RPS_DIRECTORY = 10.0 # groups/users/channels reads
 DEFAULT_DEST_PREFIX = "teams-export"
@@ -102,12 +111,19 @@ MESSAGES_PAGE_SIZE = 50
 # hostedContents/$value URLs embedded in a message's body.content HTML —
 # never an attachment object's own download-URL field, which stays as a
 # reference (see module docstring). Group 1 = the message id the content
-# is attached to (root or reply — a reply's hosted image is served under
-# ITS OWN message id, not the thread root's), group 2 = the hostedContent
-# id.
+# is attached to (a thread ROOT id always appears here, even for a reply's
+# hosted content — Graph's reply-shaped hostedContents URLs nest the reply
+# under the root: ".../messages/{rootId}/replies/{replyId}/hostedContents/
+# {id}/$value"), group 2 = the reply id when the URL is reply-shaped (None
+# for a root message's own hosted content), group 3 = the hostedContent id.
+# The whole match (group 0) is fetched VERBATIM — never reconstructed from
+# ids — because a reply-shaped URL's path differs from a root one's and
+# reconstructing it would require re-deriving that shape.
 HOSTED_RE = re.compile(
     r"https://graph\.microsoft\.com/v1\.0/teams/[^\"'\s]+"
-    r"/messages/([^/\"'\s]+)/hostedContents/([^/\"'\s]+)/\$value")
+    r"/messages/([^/\"'\s]+)"
+    r"(?:/replies/([^/\"'\s]+))?"
+    r"/hostedContents/([^/\"'\s]+)/\$value")
 
 EXT_BY_CONTENT_TYPE = {"image/png": ".png", "image/jpeg": ".jpg",
                        "image/gif": ".gif", "image/webp": ".webp",
@@ -369,7 +385,26 @@ class GraphAPI:
         return self._buckets.get(family, self._dir_bucket)
 
     def get_raw(self, url: str, family: str, required: bool = False):
-        for attempt in range(1, API_RETRIES + 2):
+        """attempt counts only retry/remint tries — a 429 sleep is NEVER
+        charged against API_RETRIES (I3: sustained throttling must not
+        become fatal), it only consumes its own generous MAX_SLEEPS_PER_CALL
+        backstop. reminted tracks the remint-once guard on its OWN flag
+        (m4) rather than the shared attempt counter, so a 401 that shows up
+        after an earlier transient retry still gets its one re-mint instead
+        of being treated as already-reminted.
+
+        On exhausted retries: `required=True` raises (nothing can proceed
+        without it), `required=False` RETURNS the last terminal status
+        instead (C2) — the caller (pull_channel's cursor/fresh-start
+        branches) already knows how to treat a non-2xx status as a
+        recorded skip / clear-and-rewalk; raising SystemExit here would
+        kill the whole pass over one deterministic 4xx on an optional
+        call."""
+        attempt = 1
+        sleeps_this_call = 0
+        reminted = False
+        status, body = 599, b""
+        while True:
             self._bucket(family).wait()
             req = urllib.request.Request(
                 url, headers={"Authorization": f"Bearer {self.box.get()}"})
@@ -392,12 +427,20 @@ class GraphAPI:
                 except (TypeError, ValueError):
                     pass
                 self.sleeps += 1
+                sleeps_this_call += 1
+                if sleeps_this_call > MAX_SLEEPS_PER_CALL:
+                    raise SystemExit(
+                        f"429 sleep budget ({MAX_SLEEPS_PER_CALL}) "
+                        f"exhausted on {family} {url.split('?')[0]} — "
+                        "sustained throttling that never let up")
                 time.sleep(min(300, max(1, retry_after)))
+                continue          # sleeps never consume API_RETRIES
             elif action == "remint":
                 self.box.invalidate()
-                if attempt > 1:
+                if reminted:
                     raise SystemExit("401 persists after re-mint — token "
                                      "or permission problem")
+                reminted = True
             elif action == "retry":
                 time.sleep(min(120, 10 * attempt))
             elif action == "fatal":
@@ -406,7 +449,12 @@ class GraphAPI:
                     f"{body[:300].decode('utf-8', 'replace')}")
             else:            # skip — terminal, caller records it
                 return (status, body, "")
-        raise SystemExit(f"retries exhausted on {url.split('?')[0]}")
+            attempt += 1
+            if attempt > API_RETRIES + 1:
+                if required:
+                    raise SystemExit(
+                        f"retries exhausted on {url.split('?')[0]}")
+                return (status, body, "")
 
     def get(self, path, family, params=None, required=False):
         url = GRAPH + path
@@ -581,18 +629,41 @@ def pull_meta(api: GraphAPI, dest: Path) -> dict:
 # ── channel units (messages + replies + hostedContents) ─────────────────────
 
 def hosted_refs(msg: dict) -> list:
-    """PURE. (message-id, hostedContent-id) pairs referenced by this
-    thread's HTML bodies — root and replies. Attachment objects are left
-    as references (document-library bytes belong to the sharepoint
-    completion), so only hostedContents URLs are harvested."""
+    """PURE. (fetch_url, innermost_mid, hostedContent-id) triples referenced
+    by this thread's HTML bodies — root and replies. `fetch_url` is the
+    FULL matched URL, fetched verbatim by the caller rather than
+    reconstructed from ids (a reply-shaped URL nests under
+    `.../messages/{rootId}/replies/{replyId}/hostedContents/{id}/$value`,
+    a different shape than a root message's own `.../messages/{rootId}/
+    hostedContents/{id}/$value` — reconstruction would have to re-derive
+    which shape applies). `innermost_mid` is the reply id when the URL is
+    reply-shaped, else the (root) message id — this is what the staged
+    filename keys on, so two replies' hosted content never collides.
+
+    Every candidate URL is host-checked (netloc == graph.microsoft.com)
+    before being yielded — the figma next_page precedent: a URL lifted out
+    of message HTML is untrusted content and must never be followed
+    off-host with a Bearer token, even though the anchoring regex already
+    makes a non-Graph match unlikely.
+
+    Attachment objects are left as references (document-library bytes
+    belong to the sharepoint completion), so only hostedContents URLs are
+    harvested."""
     out, seen = [], set()
 
     def scan(m):
         content = ((m.get("body") or {}).get("content")) or ""
-        for mid, hcid in HOSTED_RE.findall(content):
-            if (mid, hcid) not in seen:
-                seen.add((mid, hcid))
-                out.append((mid, hcid))
+        for match in HOSTED_RE.finditer(content):
+            url = match.group(0)
+            if urllib.parse.urlparse(url).netloc != "graph.microsoft.com":
+                continue
+            mid, reply_id, hcid = match.group(1), match.group(2), \
+                match.group(3)
+            innermost = reply_id or mid
+            key = (innermost, hcid)
+            if key not in seen:
+                seen.add(key)
+                out.append((url, innermost, hcid))
     scan(msg)
     for rep in msg.get("replies") or []:
         scan(rep)
@@ -660,7 +731,11 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
 
     A terminal skip on the very FIRST page (no cursor at all — cid is 404,
     an archived/deleted channel) is recorded via mark_skipped and returned
-    as a skip, never a failure. `args` is accepted for interface parity
+    as a skip, never a failure. A terminal refusal on a LATER page (mid-
+    walk, after at least one page already landed) is different — it still
+    completes the unit with what was walked, but the result carries a
+    `pagination_truncated: "status-N"` field (never-silent) instead of
+    reading as a clean, total walk. `args` is accepted for interface parity
     with figma/zoho's per-unit signature; nothing here reads it today."""
     unit = f"teams/{gid}/{cid}"
     d = unit_dir(dest, unit)
@@ -704,6 +779,7 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
     # delta (a crash-resumed channel must report the whole channel, not
     # just what this pass added).
     n_replies = _count_replies(jsonl)
+    pagination_truncated = None
     while body is not None:
         msgs = body.get("value", [])
         if msgs:
@@ -722,8 +798,17 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
         if not nxt:
             break
         status, raw, _ = api.get_raw(nxt, "messages")
-        body = json.loads(raw.decode()) if status in (200, 201) and raw \
-            else None
+        if status not in (200, 201) or not raw:
+            # A mid-walk page refusal (e.g. a 404 on page 2's nextLink) is
+            # NOT the same as "pagination finished" — never-silent: record
+            # it on the result (and thus the manifest) instead of falling
+            # through to mark_complete as if every page had been walked.
+            # The cursor above already names this exact next_link, so a
+            # future run's cursor-resume path is the natural retry.
+            pagination_truncated = f"status-{status}"
+            body = None
+            break
+        body = json.loads(raw.decode())
 
     # hostedContents: harvested from the now-complete JSONL, one Bearer
     # fetch per unique (mid, hcid); deterministic filenames ARE the
@@ -734,26 +819,33 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
     # in the final result is derived from files present on disk AFTER
     # this pass, not an incremental this-pass-only counter, so a resumed
     # channel reports the whole channel's hosted count, not just what
-    # this pass fetched.
+    # this pass fetched. `hosted_types` (Content-Type -> count) is
+    # necessarily a THIS-PASS-only tally (Graph's Content-Type header is
+    # only observed at fetch time; an already-landed file carries no
+    # record of it) — an unknown content type still gets no filename
+    # extension (fill_ext's existing behavior), but now it IS recorded
+    # here under its raw Content-Type instead of vanishing with no trace.
     hosted_errors = 0
+    hosted_types: dict[str, int] = {}
     hosted_dir = d / "hosted"
     if jsonl.exists():
         for ln in jsonl.read_text(encoding="utf-8").splitlines():
             if not ln.strip():
                 continue
             msg = json.loads(ln)
-            for mid, hcid in hosted_refs(msg):
+            for url, mid, hcid in hosted_refs(msg):
                 stem = f"{mid}_{safe_component(hcid, 60)}"
                 if hosted_dir.is_dir() and any(
                         p.name == stem or p.name.startswith(stem + ".")
                         for p in hosted_dir.iterdir()):
                     continue
-                url = (f"{GRAPH}/teams/{gid}/channels/{cid}/messages/"
-                       f"{mid}/hostedContents/{hcid}/$value")
+                # fetched VERBATIM (never reconstructed) — see hosted_refs
                 hstatus, raw_h, ctype = api.get_raw(url, "messages")
                 if hstatus not in (200, 201) or raw_h is None:
                     hosted_errors += 1
                     continue
+                ctype_key = ctype or "(unknown)"
+                hosted_types[ctype_key] = hosted_types.get(ctype_key, 0) + 1
                 hosted_dir.mkdir(parents=True, exist_ok=True)
                 (hosted_dir / f"{stem}{fill_ext(ctype)}").write_bytes(raw_h)
 
@@ -761,9 +853,14 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
                if hosted_dir.is_dir() else 0)
 
     mark_complete(d)
+    extra = {}
+    if pagination_truncated:
+        extra["pagination_truncated"] = pagination_truncated
+    if hosted_types:
+        extra["hosted_types"] = hosted_types
     return _result(unit, "channel", "ok", messages=total,
                    replies=n_replies, hosted=n_hosted,
-                   hosted_errors=hosted_errors, bytes=dir_size(d))
+                   hosted_errors=hosted_errors, bytes=dir_size(d), **extra)
 
 
 # ── manifest + upload ────────────────────────────────────────────────────────
@@ -931,6 +1028,19 @@ def main() -> int:
     box = TokenBox(tenant, client_id, client_secret)
     box.mint()  # proves credentials before anything else
     api = GraphAPI(box, rps_messages=rps_messages, rps_directory=rps_directory)
+
+    # REFRESH_META=1 clears the _meta unit's completion marker (not its
+    # jsonl files — pull_meta always overwrites them in "w" mode) so a
+    # roster that went stale between a --limit-teams pilot and the full
+    # run gets re-walked instead of being served from is_complete's
+    # short-circuit. Manual VM rescue: `export REFRESH_META=1` ahead of
+    # `python3 teams_vm_pull.py` (see commands.md).
+    if os.environ.get("REFRESH_META", "").strip() == "1":
+        meta_unit_dir = dest / "_meta"
+        if is_complete(meta_unit_dir):
+            log("REFRESH_META=1: clearing _meta's completion marker — "
+                "the roster will be walked fresh")
+        clear_unit(meta_unit_dir)
 
     write_progress(dest, "walk", 0, 0, "_meta")
     log("pulling _meta (teams/channels/users/membership)")
