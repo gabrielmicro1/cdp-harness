@@ -5,8 +5,9 @@
 
 Copies tests/fixtures/companies/ to a temp root and exercises: report +
 dashboard generation, verify-completion (fail, pass, mark-complete,
-cannot-verify), the copied-forward path, status/stall transitions, launch
-summary parsing, sizer summary compactness, and fleet_size.py --dry-run.
+cannot-verify), offboard/restore archiving, the copied-forward path,
+status/stall transitions, launch summary parsing, sizer summary compactness,
+and fleet_size.py --dry-run.
 """
 from __future__ import annotations
 
@@ -378,6 +379,17 @@ def main() -> int:
     check("embedded bytes + location recorded",
           erows["hubspot"]["embedded_bytes"] == 400_000_000_000
           and erows["hubspot"]["embedded_in"] == ["workspace-export"])
+    check("embedded pct compares embedded vs declared (400/500 = 80%)",
+          erows["hubspot"]["pct"] is not None
+          and abs(erows["hubspot"]["pct"] - 80.0) < 0.01,
+          str(erows["hubspot"]["pct"]))
+    over_rows, _ = reconcile.service_rows(
+        {"services": {"crm": {"bytes": 100}}},
+        {"sources": {},
+         "detected_services": {"crm": {"bytes": 150, "sources": {"x": 150}}}})
+    check("embedded overshoot flagged",
+          set(over_rows[0]["flags"]) == {"found-embedded", "overshoot"}
+          and abs(over_rows[0]["pct"] - 150.0) < 0.01, str(over_rows[0]))
     enotes = " ".join(es["notes"])
     check("embedded note names hubspot + host",
           "hubspot" in enotes and "workspace-export" in enotes, enotes)
@@ -386,6 +398,10 @@ def main() -> int:
     ehtml = Path(proc.stdout.strip()).read_text()
     check("report renders found-embedded badge",
           "embedded in another source" in ehtml)
+    check("report table shows the embedded bytes, not 0 B",
+          "400.00 GB" in ehtml and "80.0%" in ehtml, ehtml[:0])
+    check("chart bars the embedded bytes (‡ marker + legend note)",
+          "hubspot ‡" in ehtml and "detected inside" in ehtml)
 
     print("\n— reconcile: prefix pin + variant aggregation —")
     pinco = root / "pinco"
@@ -726,6 +742,47 @@ def main() -> int:
           sizer.match_path("a/b/c/d/slack-log.txt", m) == "slack")
     check("depth cap: deep dir beyond 3 not matched",
           sizer.match_path("a/b/c/hubspot/x.csv", m) is None)
+    check("takeout child: Mail is gmail, not the wrapper's gdrive",
+          sizer.match_path("Takeout/Mail/All mail Including Spam.mbox", m)
+          == "gmail")
+    check("takeout child: Drive stays gdrive",
+          sizer.match_path("Takeout/Drive/folder/file.bin", m) == "gdrive")
+    check("takeout child: uncataloged Google service gets its own name",
+          sizer.match_path("Takeout/Chat/log.json", m) == "gchat")
+    check("takeout child: declared spelling wins",
+          sizer.build_matcher(("Gmail",))["gmail"] == "Gmail"
+          and sizer.match_path("Takeout/Mail/x.mbox",
+                               sizer.build_matcher(("Gmail",))) == "Gmail")
+    check("takeout child: deeper embedded service still wins",
+          sizer.match_path("Takeout/Drive/hubspot/x.csv", m) == "HubSpot")
+    check("takeout filename token still matches the wrapper",
+          sizer.match_path("workspace-export/u@x.com/takeout-2026-001.zip", m)
+          == "gdrive")
+    check("unknown takeout child falls back to the wrapper",
+          sizer.match_path("Takeout/Whatever/x", m) == "gdrive")
+    fp1 = sizer.matcher_fingerprint(m)
+    sizer.TAKEOUT_CHILDREN["zzz-test"] = "zzz"
+    try:
+        fp2 = sizer.matcher_fingerprint(m)
+    finally:
+        del sizer.TAKEOUT_CHILDREN["zzz-test"]
+    check("takeout child map feeds the matcher fingerprint", fp1 != fp2)
+
+    # Path-layer attribution must exclude entry bytes attributed elsewhere,
+    # so the detection lens stays disjoint (a takeout zip's Mail entries
+    # belong to gmail, not ALSO to the zip's own gdrive path attribution).
+    agg = sizer.Aggregator(str(tmp / "test-agg.tsv"), m, "fp")
+    agg.add({"name": "workspace-export/u@x.com/takeout-1.zip",
+             "clen": 100, "uncomp": 1000, "method": "zip:3entries",
+             "kind": "zip", "etag": "0xA1", "cached": False, "err": None,
+             "svc": {"gdrive": [700, 2], "gmail": [300, 1]}})
+    agg.close()
+    det = agg.detected
+    check("disjoint lens: path bytes exclude other services' entries",
+          det["gdrive"]["bytes"] == 700 and det["gdrive"]["path_bytes"] == 700
+          and det["gmail"]["bytes"] == 300
+          and det["gmail"]["zip_entry_bytes"] == 300,
+          str({k: v["bytes"] for k, v in det.items()}))
     check("l2_key shapes", sizer.l2_key("a/b/c.txt") == "a/b"
           and sizer.l2_key("a/c.txt") == "a/(files)"
           and sizer.l2_key("c.txt") == "(root)")
@@ -1059,9 +1116,10 @@ def main() -> int:
               and det["hubspot"]["entry_count"] == 1
               and det["hubspot"]["zip_entry_bytes"] == 5000
               and det["hubspot"]["sources"] == {"gdrive": 5000}, str(det))
-        check("gdrive path-detected (zip 6000 + plain 200)",
-              det["gdrive"]["bytes"] == 6200
-              and det["gdrive"]["path_bytes"] == 6200, str(det.get("gdrive")))
+        check("gdrive path-detected, minus the embedded hubspot entry "
+              "(zip 6000 - 5000 + plain 200)",
+              det["gdrive"]["bytes"] == 1200
+              and det["gdrive"]["path_bytes"] == 1200, str(det.get("gdrive")))
         check("slack path-detected", det["slack"]["bytes"] == 3000)
         check("cold cache stats", s1["cache"] == {"hits": 0, "misses": 2},
               str(s1["cache"]))
@@ -3622,9 +3680,9 @@ def main() -> int:
         elif isinstance(_n, ast.ImportFrom) and _n.level == 0:
             _fmods.add((_n.module or "").split(".")[0])
     check("figma puller is stdlib-only (nothing to pip install on the VM)",
-          _fmods <= {"argparse", "concurrent", "json", "os", "shutil",
-                     "subprocess", "sys", "time", "urllib", "datetime",
-                     "pathlib", "__future__"}, str(sorted(_fmods)))
+          _fmods <= {"argparse", "concurrent", "http", "json", "os",
+                     "shutil", "subprocess", "sys", "time", "urllib",
+                     "datetime", "pathlib", "__future__"}, str(sorted(_fmods)))
 
     print("\n— figma_transfer / figma_vm_pull in-process (stubbed "
           "transport) —")
@@ -4325,6 +4383,8 @@ def main() -> int:
           and qcp.is_public({"Status": "Live", "Password protected": "false"})
           and not qcp.is_public({"Status": "Draft",
                                  "Password protected": "false"})
+          and not qcp.is_public({"Status": "Declined",
+                                 "Password protected": "false"})
           and not qcp.is_public({"Status": "Live",
                                  "Password protected": "true"}))
     loader = ('ng-init="initialData = {&quot;downloadPdfPath&quot;:&quot;'
@@ -4403,7 +4463,7 @@ def main() -> int:
         cargs = types.SimpleNamespace(
             slug="democo", csv=None, dest_prefix="qwilr-export", sas_days=1,
             limit=None, pdf_concurrency=2, pdf_timeout=60,
-            pdf_poll_seconds=0, dry_run=False)
+            pdf_poll_seconds=0, html_only=False, dry_run=False)
         cres = qcp.cmd_pull(root, cargs)
         names = [n for n, _ in put_names]
         check("csv pull: landed page + ledger skipped, never re-fetched",
@@ -5427,6 +5487,78 @@ def main() -> int:
          zoom_transfer.TokenBox.mint, common.run_az,
          phases.ip_rule_ensure, phases.ip_rule_remove_if_ours,
          phases.mint_sas) = zsaved
+
+    print("\n— offboard_company (archive out of the fleet, restore back) —")
+    goneco = root / "goneco"
+    (goneco / "sizing-runs").mkdir(parents=True)
+    common.write_json(goneco / "config.json", {
+        "slug": "goneco", "subscription": "m1 corpus", "subscription_id": "x",
+        "resource_group": "rg-goneco", "storage_account": "stgoneco",
+        "container": "goneco-raw",
+        "vm": {"name": None, "resource_group": "rg-goneco", "exists": False},
+        "onboarded_at": "2026-08-01T00:00:00Z"})
+    common.write_json(goneco / "status.json", {
+        "slug": "goneco", "stage": "complete",
+        "last_run": {"timestamp": "2026-08-10T09:00:00Z", "outcome": "sized",
+                     "reason": None},
+        "last_change_detected_at": "2026-08-10T09:00:00Z"})
+    arch = root / ".archive" / "goneco"
+    check("goneco active before offboard", "goneco" in common.list_companies(root))
+
+    proc = run_script("offboard_company.py", "offboard", "goneco",
+                      "--root", root, "--dry-run")
+    check("dry-run reports but moves nothing",
+          json.loads(proc.stdout).get("dry_run") is True
+          and goneco.is_dir() and not arch.exists())
+
+    ostate = phases.load_state(root)
+    ostate["companies"]["goneco"] = {"phase": "launched",
+                                     "tag": "goneco-sizer", "pid": None}
+    phases.save_state(root, ostate)
+    proc = run_script("offboard_company.py", "offboard", "goneco",
+                      "--root", root, expect_rc=1)
+    check("in-flight guard refuses and moves nothing",
+          json.loads(proc.stdout)["outcome"] == "failed" and goneco.is_dir())
+    ostate["companies"].pop("goneco")
+    phases.save_state(root, ostate)
+
+    proc = run_script("offboard_company.py", "offboard", "goneco", "--root", root)
+    o = json.loads(proc.stdout)
+    check("offboard outcome", o["outcome"] == "offboarded")
+    check("dir moved to companies/.archive/",
+          arch.is_dir() and not goneco.exists())
+    check("invisible to list_companies",
+          "goneco" not in common.list_companies(root))
+    check("offboarded_at stamped in archived status.json",
+          bool(common.read_json(arch / "status.json").get("offboarded_at")))
+    dash_out2 = tmp / "index-offboard.html"
+    proc = run_script("gen_dashboard.py", "--root", root, "--out", dash_out2)
+    dsum = json.loads(proc.stdout)
+    check("dashboard omits offboarded company",
+          all(c["slug"] != "goneco" for c in dsum["companies"]))
+    proc = run_script("offboard_company.py", "offboard", "goneco", "--root", root)
+    check("re-offboard idempotent",
+          json.loads(proc.stdout)["outcome"] == "already-offboarded")
+
+    proc = run_script("offboard_company.py", "list", "--root", root)
+    larch = json.loads(proc.stdout)["archived"]
+    check("list shows archived company",
+          any(c["slug"] == "goneco" and c.get("offboarded_at")
+              and c.get("stage") == "complete" for c in larch))
+
+    proc = run_script("offboard_company.py", "restore", "goneco", "--root", root)
+    check("restore outcome", json.loads(proc.stdout)["outcome"] == "restored")
+    check("dir moved back", goneco.is_dir() and not arch.exists())
+    check("offboarded_at cleared on restore",
+          "offboarded_at" not in common.read_json(goneco / "status.json"))
+    check("active again after restore",
+          "goneco" in common.list_companies(root))
+    proc = run_script("offboard_company.py", "restore", "goneco", "--root", root)
+    check("re-restore idempotent",
+          json.loads(proc.stdout)["outcome"] == "already-active")
+
+    run_script("offboard_company.py", "offboard", "nosuchco", "--root", root,
+               expect_rc=1)
 
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]

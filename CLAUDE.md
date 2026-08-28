@@ -76,8 +76,12 @@ companies/                   # ALL runtime state; gitignored (local only)
                              # rebuilt by each harvest — the incremental-run seed
   .fleet-state.json          # transient in-flight fleet state; gitignored
   .sizer-work/               # local sizer work files (<slug>-sizer.*); gitignored
+  .archive/<slug>/           # offboarded companies (full state, intact); the dot
+                             # prefix hides them from list_companies -> dashboard
+                             # and every fleet loop; restore moves them back
 .claude/skills/              # the judgment layer
   onboard-company/SKILL.md
+  offboard-company/SKILL.md
   size-company/SKILL.md
   size-company/references/sizing-lore.md   # interpretation knowledge (shared)
   update-all/SKILL.md
@@ -112,6 +116,8 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   reconcile.py               # declared-vs-actual math: %, deltas, ETA, flags, lore notes
   corpus_sizer_rest.py       # portable stdlib+SAS sizer; runs locally, detached
   discover_company.py        # az discovery for onboarding → config.json
+  offboard_company.py        # offboard/restore/list: move a company to/from
+                             #   companies/.archive/ (local only; Azure untouched)
   size_company.py            # single-company sizing CLI (fleet of one)
   fleet_size.py              # fleet sizing CLI (launch-all / poll-all / harvest)
   deep_verify.py             # deep-verify step machine: sizer w/ DEEP_VERIFY=1 on an
@@ -368,7 +374,11 @@ Cached so daily runs skip discovery entirely.
     "outcome": "sized",                  // sized | skipped-unchanged | failed
     "reason": null                       // human-readable failure reason when outcome=failed
   },
-  "last_change_detected_at": "2026-08-12T14:00:00Z" // last time total bytes grew
+  "last_change_detected_at": "2026-08-12T14:00:00Z", // last time total bytes grew
+  "offboarded_at": "2026-08-28T14:00:00Z" // OPTIONAL — present only while the company
+                                          // sits in companies/.archive/ (stamped by
+                                          // offboard_company.py offboard, removed by
+                                          // restore); active companies never carry it
 }
 ```
 
@@ -909,6 +919,13 @@ Preserve these. They are why the code looks the way it does.
   inside wrapper exports — but the headline % and per-source reconciliation
   still run on `sources`. A declared service found only inside another
   source's archives is flagged `found-embedded`, not `declared-empty`.
+- **Takeout archives split by child folder:** inside a Google Takeout zip the
+  wrapper `Takeout/` segment defers to `TAKEOUT_CHILDREN` (`Mail` → gmail,
+  `Drive` → gdrive, `Chat` → gchat, …), and the path layer subtracts
+  entry-attributed bytes so gmail-vs-gdrive splits are real (wallaroo-media,
+  2026-08: 100% of a 12.4 TB Workspace export previously read as gdrive).
+  The map is part of the matcher fingerprint — editing it forces a
+  fleet-wide full re-size, like editing `SERVICE_CATALOG`.
 
 ---
 

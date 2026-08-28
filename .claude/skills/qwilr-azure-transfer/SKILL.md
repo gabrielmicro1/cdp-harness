@@ -181,12 +181,18 @@ call (never re-trigger to poll); the loader page embeds a
 `download.qwilr.com/<uuid>.pdf` URL that 403s (S3 AccessDenied) until the
 render lands ~3–5 min later. Budget hours of wall clock for hundreds of
 pages (`--pdf-concurrency`, default 6, is politeness toward Qwilr's render
-farm). **The /pdf/ endpoint rate-limits hard** (learned live: ~5 renders,
-then a wall of 429s): the pipeline paces triggers (one per sweep, 20s
-apart) and a 429 requeues the job with exponential backoff (60s → 15 min
-cap) instead of counting an error; 12 consecutive rate-limits end the
-pass — re-run pull later, resume mops up. A pass that ends with a pile of
-"rate-limited, gave up" errors is a CLOCK, not a fault. The CSV itself lands as `_meta/qwilr-pages.csv` — it IS part of the
+farm). **The /pdf/ endpoint sits behind Cloudflare bot mitigation**
+(learned live: a burst of ~6 concurrent triggers bought a 429 challenge
+wall — `cf-mitigated: challenge` — scoped to /pdf/; HTML fetches kept
+working): the pipeline paces triggers (one per sweep, 30s apart) and a
+429 requeues the job with exponential backoff (60s → 15 min cap) instead
+of counting an error; 12 consecutive rate-limits end the pass — go QUIET
+for some hours (probing keeps the wall warm), then re-run pull; resume
+mops up. `--html-only` skips the PDF phase entirely while walled. A pass
+ending with "rate-limited, gave up" errors is a CLOCK, not a fault, and
+never something to automate around with challenge-solving. Draft pages
+401 and Declined pages 403 on public + /pdf/ URLs — both are pulled via
+their collaborator URL, HTML only, and verify exempts them from PDFs. The CSV itself lands as `_meta/qwilr-pages.csv` — it IS part of the
 corpus (the analytics/acceptance ledger). Unlike the API path this
 fallback delivers PDF renders but NOT raw block JSON; the rendered HTML
 embeds the page's content JSON, and CDN assets are still manifested, not

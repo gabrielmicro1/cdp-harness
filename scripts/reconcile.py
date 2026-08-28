@@ -157,12 +157,19 @@ def service_rows(expected: dict | None, run: dict | None,
             if row["actual_bytes"] == 0:
                 d = _find_detected(svc, detected)
                 if d and d.get("bytes", 0) > 0:
-                    # data exists, just inside another source's blobs
+                    # data exists, just inside another source's blobs — the
+                    # embedded detection is the only measurement there is for
+                    # a nested service, so the % compares it against the
+                    # declaration (the lens-not-ledger rule is about run
+                    # totals and the headline %, which stay untouched)
                     row["flags"].append("found-embedded")
                     row["embedded_bytes"] = d["bytes"]
                     row["embedded_in"] = sorted(
                         d.get("sources", {}),
                         key=lambda s: -d["sources"][s])
+                    row["pct"] = d["bytes"] / row["declared_bytes"] * 100
+                    if row["pct"] > 100:
+                        row["flags"].append("overshoot")
                 else:
                     row["flags"].append("declared-empty")
             elif row["pct"] > 100:

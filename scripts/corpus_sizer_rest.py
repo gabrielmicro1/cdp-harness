@@ -386,6 +386,31 @@ SERVICE_CATALOG = {
     "airtable": ("airtable",),
 }
 
+# Google Takeout's wrapper folder ("Takeout/") is a gdrive alias, but the
+# child folder right under it names the REAL service. Consulted only for the
+# segment under an exact "takeout" segment, so these generic names ("mail",
+# "chat") stay out of the global alias space — the catalog's deliberate
+# no-generic-aliases rule holds everywhere else. Values not in SERVICE_CATALOG
+# ("gchat", "gphotos", …) surface under their own name. Part of the matcher
+# fingerprint: editing this map invalidates EVERY company's cache (fleet-wide
+# full re-size on the next run), same as editing SERVICE_CATALOG.
+TAKEOUT_CHILDREN = {
+    "mail": "gmail",
+    "drive": "gdrive",
+    "calendar": "gcal",
+    "chat": "gchat",
+    "googlechat": "gchat",
+    "contacts": "gcontacts",
+    "groups": "ggroups",
+    "keep": "gkeep",
+    "meet": "gmeet",
+    "photos": "gphotos",
+    "googlephotos": "gphotos",
+    "tasks": "gtasks",
+    "voice": "gvoice",
+    "youtubeandyoutubemusic": "youtube",
+}
+
 _NORM_RE = re.compile(r"[^a-z0-9]")
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
 
@@ -413,10 +438,13 @@ def build_matcher(declared=()):
 
 def matcher_fingerprint(matcher):
     """Short stable hash of a built matcher. Changes whenever EXPECTED_SERVICES
-    (or the service catalog) changes the matcher's content, so cached
-    zip-entry detection can be fail-safe-invalidated instead of silently
-    going stale when a company's declared services change."""
-    payload = json.dumps(sorted(matcher.items()), separators=(",", ":"))
+    (or the service catalog, or TAKEOUT_CHILDREN) changes the matcher's
+    content, so cached zip-entry detection can be fail-safe-invalidated
+    instead of silently going stale when a company's declared services
+    change."""
+    payload = json.dumps([sorted(matcher.items()),
+                          sorted(TAKEOUT_CHILDREN.items())],
+                         separators=(",", ":"))
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
@@ -433,15 +461,23 @@ def match_segment(seg, matcher):
 def match_path(path, matcher, max_depth=3):
     """Deepest matching candidate wins — one service per path, so per-service
     attribution stays disjoint. Candidates: first max_depth segments, plus
-    the filename when the path is deeper than max_depth."""
+    the filename when the path is deeper than max_depth. A candidate that IS
+    the Takeout wrapper folder (exactly "Takeout", not a mere takeout-* token)
+    defers to TAKEOUT_CHILDREN for the segment under it — Takeout/Mail is
+    gmail, not the wrapper's gdrive."""
     segs = [s for s in path.split("/") if s]
-    candidates = segs[:max_depth]
+    idxs = list(range(min(len(segs), max_depth)))
     if len(segs) > max_depth:
-        candidates = candidates + [segs[-1]]
-    for seg in reversed(candidates):
-        hit = match_segment(seg, matcher)
-        if hit:
-            return hit
+        idxs.append(len(segs) - 1)
+    for i in reversed(idxs):
+        hit = match_segment(segs[i], matcher)
+        if not hit:
+            continue
+        if norm_seg(segs[i]) == "takeout" and i + 1 < len(segs):
+            child = TAKEOUT_CHILDREN.get(norm_seg(segs[i + 1]))
+            if child:
+                return matcher.get(norm_seg(child), child)
+        return hit
     return None
 
 
@@ -1373,16 +1409,22 @@ class Aggregator:
         if r["kind"] in CACHEABLE_KINDS and not r["err"]:
             self.index_rows.append(
                 (name, r["etag"], clen, uncomp, r["method"], det_json))
-        # detection — path layer attributes the whole blob to its (single,
-        # deepest-wins) match; zip-entry layer attributes per-entry bytes,
-        # skipping the blob's own path service (those bytes are already in).
+        # detection — path layer attributes the blob to its (single,
+        # deepest-wins) match, MINUS whatever the zip-entry layer attributed
+        # to other services, so the lens stays disjoint (a takeout zip's Mail
+        # entries belong to gmail, not also to the zip's gdrive path match);
+        # zip-entry layer attributes per-entry bytes, skipping the blob's own
+        # path service (those bytes are already in).
         path_hit = match_path(name, self.matcher)
         if path_hit:
+            overlap = sum(b for svc, (b, _c) in (r["svc"] or {}).items()
+                          if svc != path_hit)
+            attributed = max(uncomp - overlap, 0)
             d = self._svc(path_hit)
-            d["bytes"] += uncomp
-            d["path_bytes"] += uncomp
+            d["bytes"] += attributed
+            d["path_bytes"] += attributed
             d["blob_count"] += 1
-            d["sources"][top] = d["sources"].get(top, 0) + uncomp
+            d["sources"][top] = d["sources"].get(top, 0) + attributed
         for svc, (b, cnt) in (r["svc"] or {}).items():
             if svc == path_hit:
                 continue

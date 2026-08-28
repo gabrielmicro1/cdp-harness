@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
 import os
 import shutil
@@ -190,6 +191,11 @@ def classify(status: int, family: str, required: bool) -> str:
         500 "most commonly very large image render requests") and get the
         `decompose` verdict — retry with depth=1 + per-node fetches.
     429 never reaches here (the request layer sleeps Retry-After itself).
+    ONE body-message exception lives OUTSIDE this table: _pull_document
+    short-circuits 400 "File type not supported by this endpoint"
+    (a Slides/Buzz deck — /v1/files serves Design+FigJam only) to
+    UnsupportedFileType before classify is consulted, because that 400
+    refuses identically at any depth and must not trigger decompose.
     """
     if status == 429:
         return "sleep"
@@ -432,6 +438,14 @@ class FigmaAPIError(Exception):
         self.family = family
 
 
+class UnsupportedFileType(FigmaAPIError):
+    """400 'File type not supported by this endpoint' — /v1/files serves
+    Design + FigJam only; Slides/Buzz/etc decks refuse identically at any
+    depth, so decomposition cannot help. A deliberate skip, never a
+    failure (seen live: 3 Slides decks on wallaroo-media, 2026-08).
+    Subclasses FigmaAPIError so branch handling stays unchanged."""
+
+
 class FigmaAPI:
     """One client for the whole pull. Counts its own calls (the manifest's
     api_calls). The token appears on exactly one header, built in exactly
@@ -464,7 +478,16 @@ class FigmaAPI:
                 raise FigmaAPIError(
                     0, family, f"refusing to follow pagination off-host "
                                f"({host!r}) — the token stays on {FIGMA_API}")
-            url = absolute_url
+            # Figma emits next_page URLs with RAW spaces in query values
+            # (versions' after=<timestamp> — seen live on wallaroo-media,
+            # 2026-08); http.client rejects any URL with control chars, so
+            # re-encode path+query, leaving existing %-escapes alone.
+            parts = urllib.parse.urlsplit(absolute_url)
+            url = urllib.parse.urlunsplit((
+                parts.scheme, parts.netloc,
+                urllib.parse.quote(parts.path, safe="/%:@"),
+                urllib.parse.quote(parts.query, safe="=&%+:@/?~.,-_"),
+                ""))
         else:
             url = f"https://{FIGMA_API}{path}"
             if params:
@@ -520,7 +543,11 @@ class FigmaAPI:
                 raise FigmaAPIError(
                     e.code, family, f"HTTP {e.code} on {path or url}: "
                                     f"{detail}")
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, OSError,
+                    http.client.HTTPException) as e:
+                # HTTPException covers http.client.InvalidURL: urllib does
+                # NOT wrap it in URLError, and uncaught it kills the whole
+                # pass instead of failing one unit.
                 last = e
                 time.sleep(2 ** attempt)
         status = getattr(last, "code", 0) or 0
@@ -865,6 +892,8 @@ def _pull_document(api: FigmaAPI, key: str, d: Path) -> tuple[dict, bool]:
         atomic_write_json(d / "document.json", doc)
         return doc, False
     except FigmaAPIError as e:
+        if e.status == 400 and "not supported" in str(e).lower():
+            raise UnsupportedFileType(e.status, e.family, str(e)) from None
         if classify(e.status, e.family, False) != "decompose":
             raise
         log(f"files/{key}: full document refused ({e.status}) — "
@@ -1000,6 +1029,10 @@ def pull_file(api: FigmaAPI, row: dict, dest: Path, args) -> dict:
                   "last_modified": row.get("last_modified")}
     try:
         doc, decomposed = _pull_document(api, key, d)
+    except UnsupportedFileType as e:
+        mark_skipped(d, "unsupported-file-type", str(e))
+        return _result(unit, "file", "skipped",
+                       reason="unsupported-file-type", detail=str(e))
     except FigmaAPIError as e:
         return _handle_unit_error(unit, "file", e)
     meta["editor_type"] = doc.get("editorType")

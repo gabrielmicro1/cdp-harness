@@ -28,6 +28,7 @@ and summarize what needs attention. Then open `reports/index.html`.
 | Skill | What it does |
 |---|---|
 | **onboard-company** | Discovers a new company's Azure resources (SA, RG, container, VM info) from just a slug, parses the manifest screenshot into per-service expected sizes, echoes the table back for confirmation before writing (a mis-read number poisons every downstream report), and sets up `companies/<slug>/`. |
+| **offboard-company** | The reverse of onboarding, without losing anything: moves `companies/<slug>/` into `companies/.archive/<slug>/`, a dot-prefixed dir the fleet enumeration skips — the company disappears from the dashboard and every fleet loop while its full state (config, expected sizes, sizing-run history, the blob-index cache that seeds an incremental re-size) stays intact. Local bookkeeping only — Azure and the client's data are never touched. Refuses mid-sizing-run, idempotent both ways; `restore <slug>` brings a company back whenever a later sizing is needed. |
 | **size-company** | Sizes one company's `-raw` container: compressed + uncompressed bytes per source, blob counts, error breakdown. Runs locally as a detached background process — no VM required. Skips automatically (copy-forward) when the account's `UsedCapacity` metric shows nothing changed. |
 | **update-all** | The fleet sizing run: skip-checks every company in parallel, launches all non-skipped sizers concurrently, polls to completion, harvests. One broken company never kills the run — every company gets an outcome (`sized \| skipped-unchanged \| failed`). Resumable across sessions. |
 | **report-company** | Generates a self-contained, micro1-branded HTML progress report for one company: declared vs received per source (log-scale bars when sources span orders of magnitude), % complete vs the manifest headline, per-service flags, growth rate + projected completion date, and interpretation notes. Clean enough to send to the client. |
@@ -103,13 +104,15 @@ Runtime scales with blob *count*, not bytes.
 CLAUDE.md                    # the spec: architecture, schemas, operational model
 docs/sizing-internals.md     # mechanism-level walkthrough of the sizer
 docs/github-transfer-handoff.md  # provenance + scope of the GitHub pull layer
-.claude/skills/              # judgment layer (18 skills, see table above)
+.claude/skills/              # judgment layer (19 skills, see table above)
 scripts/
   common.py                  # paths, az runner, JSON IO, time, units
   phases.py                  # skip-check / launch / poll / harvest / cleanup + stage transitions
   reconcile.py               # declared-vs-actual math: %, deltas, ETA, flags, notes
   corpus_sizer_rest.py       # the portable sizer (stdlib + SAS)
   discover_company.py        # Azure discovery for onboarding
+  offboard_company.py        # offboard / restore / list — archive a company
+                             #   out of the fleet (local move; Azure untouched)
   size_company.py            # size ONE company (a fleet of one)
   fleet_size.py              # fleet phases: launch-all / poll-all / harvest / run / status
   gen_report.py              # per-company HTML report
@@ -170,9 +173,9 @@ python3 tests/test_harness.py
 ```
 
 Exercises everything that doesn't need Azure against fixture companies:
-reconciliation math, report + dashboard generation, verify-completion, the
-copied-forward path, stall transitions, and the full local launch → poll →
-harvest cycle with a fake sizer. `fleet_size.py launch-all --dry-run` shows
+reconciliation math, report + dashboard generation, verify-completion,
+offboard/restore archiving, the copied-forward path, stall transitions, and
+the full local launch → poll → harvest cycle with a fake sizer. `fleet_size.py launch-all --dry-run` shows
 the exact az commands a real run would execute.
 
 For the full operational model (firewall rules, SAS policy, the UsedCapacity

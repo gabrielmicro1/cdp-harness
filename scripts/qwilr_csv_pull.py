@@ -47,8 +47,10 @@ DEFAULT_DEST_PREFIX = "qwilr-export"
 DEFAULT_CSV_NAME = "qwilr-pages.csv"
 USER_AGENT = "cdp-harness-qwilr-csv-pull/1 (client-authorized corpus export)"
 
-# statuses whose public + /pdf/ URLs answer unauthenticated
-PUBLIC_STATUSES = {"Live", "Accepted", "Declined"}
+# statuses whose public + /pdf/ URLs answer unauthenticated. Learned live:
+# Draft 401s and Declined 403s on both public and /pdf/ URLs -- only their
+# collaborator URL answers, so both get collaborator HTML and no PDF.
+PUBLIC_STATUSES = {"Live", "Accepted"}
 
 PDF_LOADER_RE = re.compile(
     r"downloadPdfPath&quot;:&quot;(https://[^&]+?\.pdf)")
@@ -254,7 +256,8 @@ def poll_pdf(url: str) -> bytes | None:
     return body
 
 
-TRIGGER_SPACING = 20      # seconds between successful triggers (politeness)
+TRIGGER_SPACING = 30      # seconds between successful triggers -- the burst
+                          # that tripped Cloudflare was ~6 at once; stay slow
 TRIGGER_BACKOFF_BASE = 60     # first 429 -> wait this long
 TRIGGER_BACKOFF_CAP = 900     # exponential cap; the limiter window is opaque
 
@@ -475,7 +478,7 @@ def cmd_pull(root: Path, args) -> dict:
                         bytes_uploaded += n
                     consecutive_failures = 0
                 except FetchError as e:
-                    if e.status in (401, 404) and is_public(row):
+                    if e.status in (401, 403, 404) and is_public(row):
                         try:
                             status, body = http_get(row["Collaborator URL"])
                             n = azure_put_bytes(cfg, sas, html_name, body,
@@ -502,7 +505,7 @@ def cmd_pull(root: Path, args) -> dict:
         pdf_jobs: list[tuple[str, str, str]] = []
         pdf_skipped = 0
         for row in rows:
-            if not is_public(row):
+            if not is_public(row) or args.html_only:
                 continue
             pid = row["Page ID"]
             tok = pdf_token(row)
@@ -626,6 +629,9 @@ def main() -> int:
     p.add_argument("--sas-days", type=int, default=1)
     p.add_argument("--limit", type=int, default=None,
                    help="pull only the first N CSV rows (live smoke tests)")
+    p.add_argument("--html-only", action="store_true",
+                   help="skip the PDF phase (e.g. while /pdf/ is behind a "
+                        "bot-mitigation wall); a later pull mops up PDFs")
     p.add_argument("--pdf-concurrency", type=int, default=6,
                    help="max Qwilr renders in flight (politeness cap)")
     p.add_argument("--pdf-timeout", type=int, default=1500,

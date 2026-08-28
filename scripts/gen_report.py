@@ -116,9 +116,12 @@ def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
         if r["declared_records"] is not None:
             continue  # record-count services: listed in the table, not the chart
         eq = r.get("equivalent_bytes")
-        entries.append((r["service"] + (" †" if eq else ""),
-                        r["declared_bytes"] or 0, eq or r["actual_bytes"]))
+        emb = r.get("embedded_bytes")
+        name = r["service"] + (" †" if eq else " ‡" if emb else "")
+        entries.append((name, r["declared_bytes"] or 0,
+                        eq or r["actual_bytes"] or emb or 0))
     adjusted = any(n.endswith(" †") for n, _, _ in entries)
+    embedded = any(n.endswith(" ‡") for n, _, _ in entries)
     for s in unexpected:
         entries.append((s + " *", 0, sources[s]["uncompressed_bytes"]))
     entries.sort(key=lambda e: -e[2])
@@ -166,10 +169,12 @@ def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
                   if log_scale else "")
     adj_note = (" · † actual re-expressed in the manifest's declared unit"
                 if adjusted else "")
+    emb_note = (" · ‡ detected inside another source's archives"
+                if embedded else "")
     legend = (f'<div class="legend"><span><i style="background:{DECLARED_COLOR}">'
               f'</i>declared</span><span><i style="background:{ACTUAL_COLOR}"></i>'
               f'uncompressed (actual)</span><span class="meta">'
-              f'* not in manifest{adj_note}{scale_note}</span></div>')
+              f'* not in manifest{adj_note}{emb_note}{scale_note}</span></div>')
     return f'<div class="chart">{legend}{"".join(parts)}</div>'
 
 
@@ -188,6 +193,12 @@ def service_table(rows: list[dict], unexpected: list[str], sources: dict) -> str
             actual += (f' <span class="meta">(≈ '
                        f'{common.human_bytes(r["equivalent_bytes"])} in '
                        f'declared units)</span>')
+        elif r.get("embedded_bytes"):
+            # a found-embedded service has no top-level bytes of its own —
+            # the detected embedded size IS the actual number to show
+            host = r["embedded_in"][0] if r.get("embedded_in") else "?"
+            actual = (f'{common.human_bytes(r["embedded_bytes"])} '
+                      f'<span class="meta">(inside {esc(host)})</span>')
         out.append(f'<tr><td>{esc(r["service"])}</td>'
                    f'<td class="num">{esc(decl)}</td>'
                    f'<td class="num">{actual}</td>'

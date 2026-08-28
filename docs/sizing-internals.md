@@ -344,10 +344,26 @@ first 3 segments plus the filename (only when deeper than 3); the **deepest
 match wins**, so each path attributes to exactly one service and per-service
 byte totals never double-count. `gdrive/hubspot/x.csv` is hubspot, not both.
 
+**Takeout children** (`TAKEOUT_CHILDREN`): "takeout" is a gdrive alias (the
+wrapper is Drive-ish by default), but when the matched segment is *exactly*
+`Takeout` — the folder Google writes at every archive root — the segment
+under it names the real service, and the generic child names live in a
+separate map consulted only there (so "mail"/"chat" stay out of the global
+alias space): `Takeout/Mail` → gmail, `Takeout/Drive` → gdrive,
+`Takeout/Chat` → gchat, etc. Children without a catalog canon surface under
+their own name ("gchat", "gphotos"); unknown children fall back to the
+wrapper's gdrive. A mere `takeout-*.zip` filename token does NOT trigger the
+child lookup — only the exact wrapper folder does. The map is hashed into
+the matcher fingerprint (§5): editing it invalidates every company's cache,
+same as editing `SERVICE_CATALOG`.
+
 **Two additive layers**, aggregated per blob in `Aggregator.add`:
 
-- *Path layer*: if the blob's own path matches service S, the blob's full
-  uncompressed size goes to S (`path_bytes`, `blob_count`).
+- *Path layer*: if the blob's own path matches service S, the blob's
+  uncompressed size goes to S (`path_bytes`, `blob_count`) — minus whatever
+  the zip-entry layer attributed to OTHER services, so the two layers stay
+  disjoint (a takeout zip's Mail entries belong to gmail, not also to the
+  zip's own gdrive path match).
 - *Zip-entry layer*: `_parse_cd` decodes every CD entry filename (utf-8 first,
   cp437 `errors="replace"` fallback — decoding can never fail a blob) and
   matches it; matched entries contribute their exact per-entry usize
