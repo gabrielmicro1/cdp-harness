@@ -4507,6 +4507,75 @@ def main() -> int:
               and not teams_vm_pull.is_complete(chan4),
               str(res4))
 
+    print("\n— teams_transfer --dry-run (engine lifecycle, VM-side REST "
+          "puller)")
+    import teams_transfer  # noqa: E402
+    check("teams Spec: stdin secrets (no OAuth/rclone), engine-default "
+          "disk with 64 GB headroom",
+          teams_transfer.SPEC.vm_prefix == "xfer-teams-"
+          and teams_transfer.SPEC.authorize_target == ""
+          and teams_transfer.SPEC.remote_type == ""
+          and teams_transfer.SPEC.default_dest_prefix == "teams-export"
+          and teams_transfer.SPEC.default_os_disk_gb == 64)
+    proc = run_script("teams_transfer.py", "plan", "democo",
+                      "--tenant-id", "505f352c-ec82-4ff9-9191-556112b420f9",
+                      "--root", root, "--dry-run")
+    tplan = json.loads(proc.stdout)
+    check("teams plan: dest + tenant as the loc",
+          tplan["vm_name"] == "xfer-teams-democo"
+          and tplan["dest"] == "democo-raw/teams-export"
+          and "505f352c" in tplan["source"])
+    proc = run_script("teams_transfer.py", "plan", "democo",
+                      "--tenant-id", "not-a-guid", "--root", root,
+                      "--dry-run", expect_rc=1)
+    check("teams tenant-id validation: refuses a non-GUID before any az "
+          "call", "GUID" in proc.stdout and "az " not in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "teams_transfer.py"), "write-creds",
+         "democo", "--tenant-id", "505f352c-ec82-4ff9-9191-556112b420f9",
+         "--root", str(root), "--dry-run"],
+        input="505f352c-ec82-4ff9-9191-556112b420f9\n"
+              "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1\n"
+              "TEAMSSECRETSENTINEL\n",
+        capture_output=True, text=True)
+    check("teams write-creds: secret sentinel never echoed; 3-line stdin",
+          proc.returncode == 0
+          and "TEAMSSECRETSENTINEL" not in proc.stdout
+          and "redacted" in proc.stdout, proc.stdout[-300:])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "teams_transfer.py"), "write-creds",
+         "democo", "--tenant-id", "505f352c-ec82-4ff9-9191-556112b420f9",
+         "--root", str(root), "--dry-run"],
+        input="only-two\nlines\n", capture_output=True, text=True)
+    check("teams write-creds: refuses malformed stdin (must be 3 lines)",
+          proc.returncode == 1 and "3 lines" in proc.stdout)
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "teams_transfer.py"), "write-creds",
+         "democo", "--tenant-id", "505f352c-ec82-4ff9-9191-556112b420f9",
+         "--root", str(root), "--dry-run"],
+        input="deadbeef-0000-0000-0000-000000000000\n"
+              "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1\nsecret\n",
+        capture_output=True, text=True)
+    check("teams write-creds: stdin tenant must match the VM tag / flag "
+          "(zoho's wrong-DC guard)",
+          proc.returncode == 1 and "tenant" in proc.stdout.lower()
+          and "mismatch" in proc.stdout.lower())
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "teams_transfer.py"), "probe",
+         "democo", "--tenant-id", "505f352c-ec82-4ff9-9191-556112b420f9",
+         "--root", str(root), "--dry-run"],
+        input="505f352c-ec82-4ff9-9191-556112b420f9\n"
+              "7dd22ed9-b3ce-4016-88fb-a043f99fd3f1\n"
+              "TEAMSSECRETSENTINEL\n",
+        capture_output=True, text=True)
+    check("teams probe: laptop-side Graph JSON only — no Azure, no VM, "
+          "secret redacted",
+          proc.returncode == 0
+          and "graph.microsoft.com/v1.0/groups" in proc.stdout
+          and "TEAMSSECRETSENTINEL" not in proc.stdout
+          and "generate-sas" not in proc.stdout
+          and "az vm" not in proc.stdout, proc.stdout[-300:])
+
     print("\n— deep_verify --dry-run (VM step machine, engine lifecycle) —")
     proc = run_script("deep_verify.py", "step", "democo", "--root", root,
                       "--dry-run")
