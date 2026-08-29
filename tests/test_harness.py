@@ -4057,6 +4057,13 @@ def main() -> int:
           "skip, never fatal",
           teams_vm_pull.classify(403, "team", False) == "skip"
           and teams_vm_pull.classify(404, "channel", False) == "skip")
+    check("teams classify: a 403 on an individual hostedContents fetch "
+          "(family 'hosted') is a per-item skip, NEVER the protected-API "
+          "fatal — a video preview Graph refuses must not kill the pass",
+          teams_vm_pull.classify(403, "hosted", False) == "skip"
+          and teams_vm_pull.classify(404, "hosted", False) == "skip"
+          and 'api.get_raw(url, "hosted")' in
+          inspect.getsource(teams_vm_pull.pull_channel))
     check("teams classify: _meta required units are fatal on any refusal",
           teams_vm_pull.classify(404, "directory", True) == "fatal")
     check("teams classify: 429 sleeps, 401 re-mints, 5xx retries",

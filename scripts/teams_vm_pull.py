@@ -330,9 +330,13 @@ class TokenBox:
 def classify(status: int, family: str, required: bool) -> str:
     """Status + endpoint family, figma's rule (Graph error bodies are
     secondary evidence). Families: 'directory' (_meta reads: groups,
-    users, teams, channels, members), 'messages' (channel messages,
-    replies, hostedContents), 'team' / 'channel' (a single optional
-    unit's refusal)."""
+    users, teams, channels, members), 'messages' (channel message
+    LISTINGS and reply pagination — the surface the protected-API gate
+    guards), 'hosted' (individual hostedContents/$value fetches — paced
+    like messages but a 403 here is a PER-ITEM refusal, e.g. Graph
+    refusing a video preview's bytes, counted as a hosted_error and
+    never fatal; killed a real saxon run at 664/833 before this split),
+    'team' / 'channel' (a single optional unit's refusal)."""
     if status in (200, 201, 204):
         return "ok"
     if status == 429:
@@ -382,6 +386,11 @@ class GraphAPI:
         self.sleeps = 0
 
     def _bucket(self, family):
+        # "hosted" shares the messages bucket: hostedContents/$value is
+        # Tier-1-adjacent Teams traffic, only its FAILURE classification
+        # differs (per-item skip, never the protected-API fatal).
+        if family == "hosted":
+            family = "messages"
         return self._buckets.get(family, self._dir_bucket)
 
     def get_raw(self, url: str, family: str, required: bool = False):
@@ -840,7 +849,7 @@ def pull_channel(api, gid, cid, dest: Path, args) -> dict:
                         for p in hosted_dir.iterdir()):
                     continue
                 # fetched VERBATIM (never reconstructed) — see hosted_refs
-                hstatus, raw_h, ctype = api.get_raw(url, "messages")
+                hstatus, raw_h, ctype = api.get_raw(url, "hosted")
                 if hstatus not in (200, 201) or raw_h is None:
                     hosted_errors += 1
                     continue
