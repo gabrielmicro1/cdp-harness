@@ -36,6 +36,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore the per-company blob index (full re-size)")
+    ap.add_argument("--skip-prefix", action="append", metavar="PREFIX",
+                    help="top-level prefix NOT to list this run (repeatable); "
+                         "its numbers are carried forward from the previous "
+                         "run and noted in the run file. Only when you know "
+                         "that prefix is unchanged.")
     ap.add_argument("--force", action="store_true",
                     help="bypass the UsedCapacity skip check and size anyway "
                          "(for re-sizing an unchanged container under new "

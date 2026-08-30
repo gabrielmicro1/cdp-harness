@@ -19,6 +19,11 @@ Env:
   CACHE_FILE         optional cache file path (default "")
   SEED_TSV           optional seed TSV path (default "")
   EXPECTED_SERVICES  comma-separated service names (default "")
+  SKIP_PREFIXES      comma-separated TOP-LEVEL prefixes to NOT list at all
+                     (default ""). The caller is asserting that prefix is
+                     unchanged and will carry its numbers forward from the
+                     previous run; the summary records them under
+                     "skipped_prefixes" so the omission is never silent.
   GZ_STREAM_THRESHOLD compressed-byte size at/above which a gz blob is always
                       exact-streamed, regardless of trailer plausibility
                       (default 256_000_000)
@@ -102,6 +107,7 @@ SA = CONTAINER = SAS = TAG = ""
 MAX_ZIP_ENTRIES = 5_000_000
 SIZER_WORKERS = 16      # zip/gz range-read worker threads
 LIST_WORKERS = 8        # concurrent top-level-prefix listers
+SKIP_PREFIXES = frozenset()  # top-level prefixes not listed at all
 CACHE_FILE = SEED_TSV = ""
 EXPECTED_SERVICES: tuple = ()
 GZ_STREAM_THRESHOLD = 256_000_000
@@ -113,7 +119,7 @@ BASE = LOG = OUT = SUMMARY = SUMMARY_JSON = DONE = INDEX = ""
 
 def _init_from_env():
     global SA, CONTAINER, SAS, TAG, MAX_ZIP_ENTRIES, SIZER_WORKERS, LIST_WORKERS
-    global CACHE_FILE, SEED_TSV, EXPECTED_SERVICES
+    global CACHE_FILE, SEED_TSV, EXPECTED_SERVICES, SKIP_PREFIXES
     global GZ_STREAM_THRESHOLD, GZ_STREAM_FLOOR_MIN, GZ_STREAM_BUDGET
     global DEEP_VERIFY
     global BASE, LOG, OUT, SUMMARY, SUMMARY_JSON, DONE, INDEX
@@ -129,6 +135,9 @@ def _init_from_env():
     EXPECTED_SERVICES = tuple(
         s.strip() for s in os.environ.get("EXPECTED_SERVICES", "").split(",")
         if s.strip())
+    SKIP_PREFIXES = frozenset(
+        s.strip().strip("/") for s in os.environ.get("SKIP_PREFIXES", "").split(",")
+        if s.strip().strip("/"))
     GZ_STREAM_THRESHOLD = int(os.environ.get("GZ_STREAM_THRESHOLD", "256000000"))
     GZ_STREAM_FLOOR_MIN = int(os.environ.get("GZ_STREAM_FLOOR_MIN", "8000000"))
     GZ_STREAM_BUDGET = int(os.environ.get("GZ_STREAM_BUDGET", "50000000000"))
@@ -1527,6 +1536,16 @@ def enumerate_and_size(cache, matcher):
         prefixes, root_blobs = discover_prefixes()
         for name, clen, etag in root_blobs:
             handle_blob(name, clen, etag)
+        if SKIP_PREFIXES:
+            kept = [p for p in prefixes if p.strip("/") not in SKIP_PREFIXES]
+            skipped = [p for p in prefixes if p.strip("/") in SKIP_PREFIXES]
+            missing = sorted(SKIP_PREFIXES - {p.strip("/") for p in prefixes})
+            agg.skipped_prefixes = [p.strip("/") for p in skipped]
+            logmsg(f"SKIPPING {len(skipped)} top-level prefix(es) not listed "
+                   f"this run: {', '.join(p.strip('/') for p in skipped) or '(none matched)'}"
+                   + (f" | requested but absent from the container: "
+                      f"{', '.join(missing)}" if missing else ""))
+            prefixes = kept
         if prefixes:
             logmsg(f"listing {len(prefixes)} top-level prefixes, "
                    f"{LIST_WORKERS} listers, {SIZER_WORKERS} sizers, "
@@ -1617,6 +1636,7 @@ def write_summary(agg, dur_s):
         "detected_services": {k: v for k, v in sorted(
             agg.detected.items(), key=lambda kv: -kv[1]["bytes"])},
         "sources_l2": rollup_l2(agg.l2),
+        "skipped_prefixes": list(getattr(agg, "skipped_prefixes", []) or []),
     }
     if DEEP_VERIFY:
         machine["verification"] = {

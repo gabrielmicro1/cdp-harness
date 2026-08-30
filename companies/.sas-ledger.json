@@ -1,0 +1,59 @@
+{
+  "tokens": [
+    {
+      "id": "helpsy-20260828T191252Z",
+      "slug": "helpsy",
+      "storage_account": "helpsyholdingsprod9b14b5",
+      "container": "helpsy-holdings-pbc-raw",
+      "permissions": "racwl",
+      "signing": "account-key",
+      "created_at": "2026-08-28T19:12:52Z",
+      "expires_at": "2026-09-11T19:12:52Z",
+      "days": 14,
+      "note": "initial push token for helpsy onboarding, requested by Gabe 2026-08-28",
+      "fingerprint": "b30af4f6e607"
+    },
+    {
+      "id": "helpsy-20260828T191939Z",
+      "slug": "helpsy",
+      "storage_account": "helpsyholdingsprod9b14b5",
+      "container": "helpsy-holdings-pbc-raw",
+      "permissions": "racwl",
+      "signing": "account-key",
+      "created_at": "2026-08-28T19:19:39Z",
+      "expires_at": "2026-09-11T19:19:39Z",
+      "days": 14,
+      "note": "initial push token for helpsy onboarding (zip delivery), requested by Gabe 2026-08-28",
+      "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/helpsy/helpsy-push-sas-20260828T191939Z.zip",
+      "fingerprint": "61476e4d7797"
+    },
+    {
+      "id": "song-division-usa-h-20260829T000914Z",
+      "slug": "song-division-usa-h",
+      "storage_account": "songdivisionusprod2216a0",
+      "container": "song-division-usa-h-raw",
+      "permissions": "racwl",
+      "signing": "account-key",
+      "created_at": "2026-08-29T00:09:14Z",
+      "expires_at": "2026-09-12T00:09:14Z",
+      "days": 14,
+      "note": "fresh push key requested by Gabe, 2026-08-28",
+      "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/song-division-usa-h/song-division-usa-h-push-sas-20260829T000914Z.zip",
+      "fingerprint": "eb69c5e18331"
+    },
+    {
+      "id": "song-division-usa-h-20260829T222834Z",
+      "slug": "song-division-usa-h",
+      "storage_account": "songdivisionusprod2216a0",
+      "container": "song-division-usa-h-raw",
+      "permissions": "rl",
+      "signing": "account-key",
+      "created_at": "2026-08-29T22:28:34Z",
+      "expires_at": "2026-09-12T22:28:34Z",
+      "days": 14,
+      "note": "read-only download token for client Titan (data buyer), requested by Gabe 2026-08-29",
+      "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/song-division-usa-h/song-division-usa-h-read-sas-20260829T222834Z.zip",
+      "fingerprint": "3d63d4964b70"
+    }
+  ]
+}

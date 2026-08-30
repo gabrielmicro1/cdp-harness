@@ -241,7 +241,7 @@ def _sizer_cmd() -> list[str]:
 
 
 def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False,
-          use_cache: bool = True) -> dict:
+          use_cache: bool = True, skip_prefixes: list[str] | None = None) -> dict:
     """Start the sizer as a detached local process (nohup-equivalent: new
     session, stdin closed, output to <tag>.stdout). It keeps running if the
     harness/agent dies — the work files are the rescue path. When use_cache,
@@ -284,6 +284,8 @@ def launch(root: Path, slug: str, cfg: dict, dry_run: bool = False,
     services = ",".join((expected or {}).get("services", {}).keys())
     if services:
         env["EXPECTED_SERVICES"] = services
+    if skip_prefixes:
+        env["SKIP_PREFIXES"] = ",".join(skip_prefixes)
     with open(wd / f"{tag}.stdout", "w") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL,
@@ -328,6 +330,44 @@ def poll_one(root: Path, slug: str, comp_state: dict,
 
 
 # ── Phase 3: harvest ─────────────────────────────────────────────────────────
+
+def carry_forward_skipped(run: dict, summary: dict, prev: dict | None) -> dict:
+    """Fold prefixes the sizer was told to SKIP back in, from the previous
+    run's numbers, and say so in notes.
+
+    A skipped prefix was not listed at all this run, so its blobs are absent
+    from summary["src"] and from the totals. The caller asserted it is
+    unchanged (size_company.py --skip-prefix), which is the per-prefix
+    analogue of the container-level UsedCapacity copy-forward. Every carried
+    prefix gets a note naming the run it came from — the omission is never
+    silent, and a prefix with no previous numbers is reported as a gap rather
+    than quietly dropped."""
+    skipped = summary.get("skipped_prefixes") or []
+    if not skipped:
+        return run
+    prev_sources = (prev or {}).get("sources", {})
+    for name in skipped:
+        src = prev_sources.get(name)
+        if not src:
+            run["notes"].append(
+                f"--skip-prefix {name}: NOT re-measured this run and no "
+                f"previous numbers exist to carry forward — this prefix is "
+                f"MISSING from the totals below.")
+            continue
+        run["sources"][name] = dict(src)
+        run["totals"]["blob_count"] += src["blob_count"]
+        run["totals"]["compressed_bytes"] += src["compressed_bytes"]
+        run["totals"]["uncompressed_bytes"] += src["uncompressed_bytes"]
+        run["notes"].append(
+            f"--skip-prefix {name}: NOT re-measured this run; "
+            f"{src['blob_count']:,} blobs / "
+            f"{src['uncompressed_bytes'] / 1e12:.2f} TB carried forward from "
+            f"run {(prev or {}).get('timestamp')}. detected_services, "
+            f"sources_l2, methods and the blob-index cache cover only the "
+            f"prefixes actually scanned.")
+    run["skipped_prefixes"] = list(skipped)
+    return run
+
 
 def summary_to_run(slug: str, summary: dict, skip_info: dict,
                    notes: list[str]) -> dict:
@@ -382,7 +422,9 @@ def harvest_one(root: Path, slug: str, cfg: dict, comp_state: dict,
     summary = common.read_json(summary_path)
     skip_info = {"metric": comp_state.get("metric"),
                  "metric_at": comp_state.get("metric_at")}
+    prev_runs = common.latest_runs(root, slug, 1)
     run = summary_to_run(slug, summary, skip_info, [])
+    run = carry_forward_skipped(run, summary, prev_runs[0] if prev_runs else None)
     path = _run_path(root, slug)
     common.write_json(path, run)
     idx = wd / f"{tag}.index.tsv.gz"

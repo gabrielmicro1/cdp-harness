@@ -43,10 +43,15 @@ git history.
    the commercial artifact being bought; any write from us contaminates the
    audit story ("did micro1 modify the data?"). Provable read-only access is
    non-negotiable. **One sanctioned exception:** the `*-azure-transfer`
-   skills (gcs, dropbox, gdrive, s3, github, zoho, qwilr, vimeo, zoom) *populate* `<slug>-raw`
+   skills (gcs, dropbox, gdrive, s3, github, zoho, figma, teams, slack, qwilr,
+   vimeo, zoom) *populate* `<slug>-raw`
    from a cloud source (rwlc SAS — 21-day default on the VM paths, 1–2-day on
-   the local qwilr/vimeo/zoom pulls, whose writes are additionally create-only
-   via `If-None-Match: *`) — they are the ingest path, not an audit path. They
+   the local qwilr/vimeo/zoom pulls). The pulls that write through the blob
+   REST API — local qwilr/vimeo/zoom, plus the VM-based **slack** file pull,
+   which shares vimeo's server-side-copy transport — are additionally
+   create-only via `If-None-Match: *`, i.e. no-overwrite is API-ENFORCED
+   there rather than an azcopy flag. They are the ingest path, not an audit
+   path. They
    only add blobs under their dest prefix and never modify or delete
    existing data; everything else in the harness stays strictly read-only.
 
@@ -109,6 +114,9 @@ companies/                   # ALL runtime state; gitignored (local only)
   figma-azure-transfer/references/commands.md
   teams-azure-transfer/SKILL.md            # Microsoft Teams messages/metadata → <slug>-raw (engine VM lifecycle, VM-side REST puller)
   teams-azure-transfer/references/commands.md
+  slack-azure-transfer/SKILL.md            # Slack export's FILES → <slug>-raw (engine VM lifecycle,
+                                           #   source is the export already in the container)
+  slack-azure-transfer/references/commands.md
   qwilr-azure-transfer/SKILL.md            # Qwilr REST → <slug>-raw (local, no VM)
   qwilr-azure-transfer/references/commands.md
   vimeo-azure-transfer/SKILL.md            # Vimeo API → <slug>-raw (local, Azure server-side copy)
@@ -150,6 +158,16 @@ scripts/                     # the deterministic layer (python3, stdlib only)
                              #   engine lifecycle + own pull layer
   teams_vm_pull.py           # VM-side puller: team/channel/user/membership JSONL,
                              #   per-channel messages+replies+hostedContents (pushed like figma_vm_pull.py)
+  slack_transfer.py          # Slack export → blob: finds the export INSIDE <slug>-raw, then
+                             #   engine VM lifecycle + Azure server-side-copy of every file link
+  slack_vm_pull.py           # VM-side puller: ledger (files-index/objects/shares/external/
+                             #   unavailable JSONL) + Put Blob-From-URL copy (pushed like
+                             #   teams_vm_pull.py)
+  saxon_sp_complete.py       # ONE-OFF (saxon only, slug-guarded): SharePoint completion CLI —
+                             #   engine VM lifecycle + mapping-approval gate + laptop plan/harvest/verify
+  saxon_sp_vm_pull.py        # VM-side one-off: Graph delta walk → per-file diff → create-only
+                             #   server-side copy of MISSING files into the client's own sharepoint/
+                             #   prefix (calibration-gated; pushed like teams_vm_pull.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   qwilr_csv_pull.py          # Qwilr support-CSV → blob ingest (API-less fallback):
                              #   fetches each page's public/collaborator HTML +
@@ -165,6 +183,8 @@ reports/
   sas-tokens.html            # generated push-SAS tokens page (mint_push_sas.py page)
 tests/
   fixtures/companies/democo/ # fake company for offline validation
+  fixtures/slack-export-mini.zip        # SYNTHETIC Slack export (schema, never client data);
+  fixtures/make_slack_export_mini.py    #   regenerate with the generator beside it
   test_harness.py            # runs all offline validation; python3 tests/test_harness.py
 ```
 
@@ -214,7 +234,18 @@ Cached so daily runs skip discovery entirely.
   "services": {
     "gdrive":  {"bytes": 1200000000000}, // byte-declared service
     "slack":   {"records": 1500000},     // record-count declaration: EXCLUDED from byte
-                                         // reconciliation, but listed + flagged in reports
+                                         // reconciliation, but listed + flagged in reports.
+                                         // Charts a single ACTUAL bar (no declared bar —
+                                         // there is no byte declaration to compare against)
+                                         // with the count as the declared-side label.
+    "gusto":   {"records": 4, "record_unit": "W2 employees"},
+                                         // optional "record_unit": the count's OWN unit when
+                                         // it isn't "records" (W2 employees, transactions,
+                                         // seats). Rendered verbatim in the table and chart
+                                         // label; absent = the plain "N records" default.
+                                         // A count is only honest with its unit attached —
+                                         // "4 records" for 4 W2 employees misstates the
+                                         // declaration in a client-facing report.
     "zendesk": {"bytes": 0},             // declared 0 B: flagged if data actually appears
     "workspace": {"bytes": 1, "prefix": "workspace-export"},
                                          // optional "prefix" (string or list) pins a
@@ -240,8 +271,20 @@ Cached so daily runs skip discovery entirely.
                                          // "unit-adjusted", and the note ALWAYS renders
                                          // (reconcile.equivalent_unit_notes — the
                                          // duplicate_prefixes never-silent discipline).
-                                         // Headline % is unaffected (run totals). ONLY set
-                                         // from a real measurement, never a client assertion.
+                                         // The headline is published TWICE: pct_complete /
+                                         // uncompressed_total stay the pure measurement (run
+                                         // totals), and pct_complete_adjusted /
+                                         // uncompressed_total_adjusted add
+                                         // (equivalent_bytes - actual_bytes) so the headline
+                                         // agrees with the row. gen_report renders both in the
+                                         // KPI card ("unit-adjusted", with the raw % beneath);
+                                         // gen_dashboard uses the adjusted figure and marks the
+                                         // row "unit-adj". BEFORE 2026-08-30 the headline used
+                                         // run totals ONLY, which let checkmate show BigQuery at
+                                         // 119% in its row while the headline counted the same
+                                         // service 37.39 TB lower (66.0% vs 94.7%) with the gap
+                                         // stated nowhere. ONLY set from a real measurement,
+                                         // never a client assertion.
   },
   "source_split": ["gdrive-export2"],    // optional: top-level prefixes whose SECOND level
                                          // holds the real services (swiftlaw pushed every
@@ -565,7 +608,11 @@ the SA's region, static Standard-SKU public IP (never deallocated before
 teardown), the copy in a tmux session into `<slug>-raw/workspace-export/`
 (Dropbox: `dropbox-export/`, Drive: `gdrive-export/`, S3: `s3-export/`,
 GitHub: `github-export/`, Zoho: `zoho-export/<product>/`, Figma:
-`figma-export/`, Teams: `teams-export/`).
+`figma-export/`, Teams: `teams-export/`, Slack: `slack-export-files/`).
+Slack is the odd one out and worth flagging here: its VM is
+`xfer-slack-<slug>` and its SOURCE is the client's own Slack export already
+sitting in `<slug>-raw`, so that container is both the read side and the
+write side of the same job (see the Slack paragraph below).
 Rules that differ from the sizing path — do not cross-contaminate:
 
 - **Network rules are engine-run via `allow-network`** (policy change,
@@ -883,6 +930,109 @@ export-mailbox fallback is a recorded future option, not built here),
 calendars, mail, tabs/apps, Planner, Wiki, meeting recordings
 (doc-library files), document-library files generally, and attachment
 bytes. Driven by the `teams-azure-transfer` skill.
+
+**Slack is the ingest whose source is already in the destination.** A
+Business+ / Enterprise compliance export is a complete transcript and ZERO
+file bytes: every attachment, image, video, canvas and huddle transcript
+survives only as an authenticated `files.slack.com` link inside the JSON.
+Measured on a real 2.35 GB export (123k day files, 1.1M messages): **63,636
+unique files, 62,056 of them Slack-hosted and worth 81.1 GB — about 34x the
+export itself** (996 more are Drive links Slack holds no bytes for, 584 are
+deleted or retention-aged), so a company
+whose Slack "landed" has in fact delivered the index and none of the
+content. `scripts/slack_transfer.py` reuses the engine's VM lifecycle on
+`xfer-slack-<slug>` and pushes `scripts/slack_vm_pull.py`, which reads the
+export **out of `<slug>-raw`** and writes the files back into the same
+container under `slack-export-files/`. Four things differ from every sibling.
+**(1) Discovery is a real step**: `discover-export` lists the container over
+the READ (`rl`) SAS and recognises a `.zip` blob (confirmed by two ranged
+GETs of its central directory — never a download) or an already-extracted
+tree (a `channels.json` + `users.json` pair); zero or several candidates is
+a QUESTION for the user, never a guess, because the wrong archive builds a
+ledger for the wrong workspace — several usually means a two-phase export
+(public channels first, private/DMs later), which is two runs into two
+`--dest-prefix` values, never merged. The choice rides one `slack_export`
+VM tag as `zip:<blob>` / `tree:<prefix>`; no state file. **(2) The export
+carries its own auth** — every URL embeds one workspace-wide `xoxe-` token,
+so there is normally NO client credential to ask for; `write-creds` is an
+override (one stdin line, a `files:read` `xoxp-`/`xoxb-` token used as
+`Authorization: Bearer`, which Azure's `x-ms-copy-source-authorization`
+also speaks) for an export whose links were stripped or expired. That
+expiry IS the day-one stall — export links die WITH the export and cannot
+be refreshed, so a dead token means a FRESH export (days of client work),
+which is why `probe` reads the export over the `rl` SAS and makes exactly
+one live Slack request before any VM is billed, classifying `link_gate` as
+open / token-expired / no-file-links / files-missing / no-range-support /
+redirect-unresolvable. **(3) Transport is Azure server-side copy** (the
+vimeo/zoom transport, NOT the stage-then-azcopy of github/zoho/figma/teams):
+the VM resolves each redirect chain itself and hands the final signed URL to
+Put Blob From URL (or Put Block From URL + Put Block List above 256 MiB,
+re-resolving on expiry), so file bytes never touch VM disk and create-only
+is API-enforced by `If-None-Match: *`; a per-file stream-through fallback
+covers what Azure will not copy. This family uses **no azcopy at all** — it
+is REST end to end. `classify()` keys on the copy-SOURCE status
+(`x-ms-copy-source-status-code`), the inverse of teams' endpoint-family
+rule, because two servers can refuse us: Slack 401/403 is fatal only while
+nothing has copied (a dead token) and a per-file skip afterwards, Slack 404
+is a file deleted since the export, 429 from either side always sleeps.
+**(4) Verify makes a REAL source-truth claim** — the export declares a byte
+`size` for every file, so `_meta/objects.jsonl` (one row per blob, streamed
+by verify) is compared declared-vs-committed rather than staged→container
+only; renditions carry no declared size, so only presence is asserted for
+them and the two claims are reported separately, never merged. Ground truth
+that drives specific code, all measured on the sample: Slack writes UTF-8
+zip member names with the UTF-8 flag bit UNSET (7 of 3,352 conversation dirs
+arrive as cp437 mojibake — `zip_member_name` re-decodes); `token=` on
+files-pri URLs but `t=` on files-tmb transcodes, and `attachments[].files[]`
+entries carry NO token and need one appended (a naive `message.files[]` walk
+misses them entirely); root `canvases.json` / `lists.json` /
+`huddle_transcripts.json` hold assets no message walk reaches, each with its
+own `*_history_download`; and renditions (thumbnails, mp4/hls, vtt) are
+409,782 against 62,056 originals — 471,838 objects in all, a 7.6x
+multiplier — and are ON by
+default behind `--no-renditions` with probe reporting both counts. Blob
+paths are **id-led** (`files/<fid[:4]>/<file_id>/<name>`) because file and
+channel names are mutable and a two-phase export makes a rename between
+passes a live hazard; the ledger is the join table that keeps the corpus
+LINKED (`_meta/files-index.jsonl` one row per file with its conversation and
+message ts, `_meta/file-shares.jsonl` every additional sighting). Ledger
+rows store URLs token-STRIPPED (keeping the parameter name so it can be
+re-attached) — the export already holds that credential but writing 470k
+copies of it into a new prefix is not hygiene worth shipping. Resume is
+stronger than the sibling ingests': the blob's existence is the record
+(create-only at the API), shard markers only note which fixed-size slices of
+the ledger were walked. Out of scope, recorded not fetched: `mode: external`
+(gdrive) files — Slack holds a LINK and no bytes, so no Slack token can ever
+retrieve them; they land in `_meta/external-references.jsonl` (996 files /
+3.97 GB on the sample) for the gdrive ingest to reconcile against, and that
+is a quantified exclusion, never a shortfall. `tombstone` and
+`hidden_by_limit` entries have no URL at all and go to
+`_meta/unavailable.jsonl` with their reason. `expected-data-sizes.json`
+pins BOTH halves: `"slack": {"bytes": N, "prefix": ["<the client's export
+prefix>", "slack-export-files"]}` — and remember the container grows by
+~34x the export size from OUR writes, not client push, which any report or
+nudge must say out loud. Driven by the `slack-azure-transfer` skill.
+
+**The saxon SharePoint completion (one-off, not a family).**
+`scripts/saxon_sp_complete.py` + `scripts/saxon_sp_vm_pull.py` finish the
+client's OWN partial `sharepoint/` push (saxon only — slug-guarded): the
+laptop `plan` step freezes the in-scope folder set (a snapshot of what's
+under `sharepoint/`), auto-maps each folder to its Graph site collection
+(exact slug → site-id GUID → sanitized display name; anything else is
+skip-ambiguous and excluded until a human resolves it in `mapping.json` +
+`approve-mapping`), the VM (`xfer-sp-saxon`, engine lifecycle verbatim)
+delta-walks only the mapped collections and copies ONLY files whose exact
+dest path is absent — Azure Put Blob/Block From URL from the pre-authed
+`@microsoft.graph.downloadUrl` (the vimeo transport, so `If-None-Match: *`
+create-only is API-enforced while writing inside the client's prefix), with
+zero bookkeeping blobs in the container (all state VM-side, pulled home by
+`harvest` — a hard gate before teardown). Because the 08-27 census never
+validated per-file paths, a **calibration gate** walks a few
+believed-complete sites first and aborts before any copy if >1% of a
+complete site reads as missing (a path-convention bug would otherwise
+duplicate the corpus); `transfer --diff-only` is the mandated first pass.
+Size mismatches and dest-only files are recorded, never touched. The
+census artifacts live in `companies/saxon/reports/sharepoint-census-20260827/`.
 
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no

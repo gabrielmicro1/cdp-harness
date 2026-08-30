@@ -94,7 +94,9 @@ def cmd_launch_all(args) -> dict:
         try:
             launched = phases.launch(root, slug, cfg, dry_run=args.dry_run,
                                      use_cache=not getattr(args, "no_cache",
-                                                           False))
+                                                           False),
+                                     skip_prefixes=getattr(args, "skip_prefix",
+                                                           None))
             comp.update(launched)
         except HarnessError as exc:
             phases.update_status(root, slug, "failed", str(exc))
@@ -196,6 +198,12 @@ def main() -> int:
                     help="print az commands instead of running them")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore the per-company blob index (full re-size)")
+    ap.add_argument("--skip-prefix", action="append", metavar="PREFIX",
+                    help="top-level prefix NOT to list this run (repeatable). "
+                         "Its numbers are carried forward from the previous "
+                         "run and every carried prefix is named in the run "
+                         "file's notes. Use only when you know that prefix is "
+                         "unchanged.")
     ap.add_argument("--force", action="store_true",
                     help="bypass the UsedCapacity skip check and size anyway "
                          "(for re-sizing an unchanged container under new "

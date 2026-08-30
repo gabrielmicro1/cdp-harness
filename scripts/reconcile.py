@@ -11,10 +11,27 @@ import re
 from pathlib import Path
 
 import common
+from corpus_sizer_rest import SERVICE_CATALOG, TAKEOUT_CHILDREN
 
 # Export-timestamp top-level prefixes (latchel: 20260707T180401Z, a Google
 # Takeout run) — the real sources are one level deeper.
 TIMESTAMP_PREFIX_RE = re.compile(r"^\d{8}[T_-]?\d{4,6}Z?$")
+
+# normalized alias → canonical detection id ("googlecalendar" → "gcal").
+# detected_services keys are canonical ids whenever the path resolves through
+# the catalog (TAKEOUT_CHILDREN especially), so matching a declared name to a
+# detected key must go through the same alias table.
+_ALIAS_TO_CANON = {c: c for c in SERVICE_CATALOG}
+_ALIAS_TO_CANON.update({a: c for c, aliases in SERVICE_CATALOG.items()
+                        for a in aliases})
+# Takeout children not in the catalog ("gphotos", "gchat", …) surface under
+# their own id; map both the id and its Takeout folder spellings ("photos",
+# "googlephotos") so "Google Photos" finds a detected "gphotos". Catalog
+# aliases win on collisions ("drive" stays gdrive's).
+for _seg, _child in TAKEOUT_CHILDREN.items():
+    _ALIAS_TO_CANON.setdefault(_child, _child)
+    _ALIAS_TO_CANON.setdefault(_seg, _ALIAS_TO_CANON[_child])
+del _seg, _child
 
 
 def norm(name: str) -> str:
@@ -87,8 +104,10 @@ def effective_sources(expected: dict | None, run: dict | None) -> dict:
 
 def _find_detected(service: str, detected: dict) -> dict | None:
     n = norm(service)
+    canon = _ALIAS_TO_CANON.get(n, n)
     for svc, d in detected.items():
-        if norm(svc) == n:
+        k = norm(svc)
+        if k == n or _ALIAS_TO_CANON.get(k, k) == canon:
             return d
     return None
 
@@ -97,8 +116,8 @@ def service_rows(expected: dict | None, run: dict | None,
                  sources: dict | None = None) -> tuple[list[dict], list[str]]:
     """Per-service reconciliation rows + unexpected actual sources.
 
-    Row: {service, declared_bytes, declared_records, actual_bytes,
-          actual_compressed, blob_count, pct, flags[]}
+    Row: {service, declared_bytes, declared_records, declared_record_unit,
+          actual_bytes, actual_compressed, blob_count, pct, flags[]}
     Flags: record-count | declared-empty | zero-declared-has-data | overshoot | found-embedded | deduplicated | unit-adjusted
 
     A declaration may carry "equivalent_bytes" (+ mandatory
@@ -125,6 +144,9 @@ def service_rows(expected: dict | None, run: dict | None,
             "service": svc,
             "declared_bytes": decl.get("bytes"),
             "declared_records": decl.get("records"),
+            # optional label for counts that aren't "records" (W2 employees,
+            # transactions) — the count is only honest with its own unit
+            "declared_record_unit": decl.get("record_unit"),
             "actual_bytes": sum(sources[s].get("uncompressed_bytes", 0)
                                 for s in srcs),
             "actual_compressed": sum(sources[s].get("compressed_bytes", 0)
@@ -142,6 +164,18 @@ def service_rows(expected: dict | None, run: dict | None,
         if row["declared_records"] is not None:
             # record-count declarations are EXCLUDED from byte reconciliation
             row["flags"].append("record-count")
+            if row["actual_bytes"] == 0:
+                # no top-level prefix of its own — but detection may still
+                # find it inside another source's archives, and switching a
+                # declaration to record-count must never HIDE that data
+                # (there is no byte declaration, so no pct either way)
+                d = _find_detected(svc, detected)
+                if d and d.get("bytes", 0) > 0:
+                    row["flags"].append("found-embedded")
+                    row["embedded_bytes"] = d["bytes"]
+                    row["embedded_in"] = sorted(
+                        d.get("sources", {}),
+                        key=lambda s: -d["sources"][s])
         elif row["declared_bytes"] == 0:
             if row["actual_bytes"] > 0:
                 row["flags"].append("zero-declared-has-data")
@@ -551,6 +585,23 @@ def company_summary(root: Path, slug: str) -> dict:
         sources.pop(_p, None)        # non-corpus: not a source at all
     rows, unexpected = service_rows(expected, latest, sources)
 
+    # Unit-adjusted headline. A service carrying equivalent_bytes is measured
+    # in a different unit than the manifest declares (checkmate's BigQuery:
+    # the sizer sees compressed avro + parquet page bytes, the client declared
+    # BigQuery LOGICAL bytes). service_rows already scores THAT ROW like for
+    # like, but the headline sums raw run totals — so without this the report
+    # can show a row at 119% while the headline counts the same service at a
+    # third of that, with the difference stated nowhere. Both numbers are
+    # published: pct_complete stays the pure measurement, *_adjusted is the
+    # like-for-like comparison, and gen_report renders them side by side.
+    equivalent_adjustment = sum(
+        (r["equivalent_bytes"] - (r.get("actual_bytes") or 0))
+        for r in rows if r.get("equivalent_bytes"))
+    unc_adjusted = (unc_total + equivalent_adjustment
+                    if unc_total is not None else None)
+    pct_adjusted = (unc_adjusted / manifest_total * 100
+                    if unc_adjusted is not None and manifest_total else None)
+
     now = common.utc_now()
     last_change = status.get("last_change_detected_at")
     days_since_change = ((now - common.parse_iso(last_change)).total_seconds() / 86400
@@ -575,6 +626,9 @@ def company_summary(root: Path, slug: str) -> dict:
         "prev_run": prev,
         "manifest_total_bytes": manifest_total,
         "uncompressed_total": unc_total,
+        "uncompressed_total_adjusted": unc_adjusted,
+        "equivalent_adjustment": equivalent_adjustment,
+        "pct_complete_adjusted": pct_adjusted,
         "uncompressed_total_raw": unc_raw,
         "duplicate_bytes": dup_total,
         "excluded_bytes": exc_total,

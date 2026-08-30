@@ -12,6 +12,7 @@ and fleet_size.py --dry-run.
 from __future__ import annotations
 
 import ast
+import base64
 import gzip
 import inspect
 import io
@@ -49,9 +50,15 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"  [{mark}] {name}" + (f" — {detail}" if detail and not cond else ""))
 
 
-def run_script(script: str, *args, expect_rc=0) -> subprocess.CompletedProcess:
+def run_script(script: str, *args, expect_rc=0,
+               stdin_data: str = "") -> subprocess.CompletedProcess:
+    # stdin is ALWAYS fed (default: empty, i.e. immediate EOF). Without
+    # this the child inherits the runner's stdin, and any script that
+    # reads credentials from it (saxon_sp_complete's probe/plan/
+    # write-creds) blocks forever when the suite runs detached — a real
+    # 3-hour hang, 2026-08-29.
     proc = subprocess.run([sys.executable, str(SCRIPTS / script), *map(str, args)],
-                          capture_output=True, text=True)
+                          input=stdin_data, capture_output=True, text=True)
     if expect_rc is not None:
         check(f"{script} {' '.join(map(str, args[:2]))} rc={expect_rc}",
               proc.returncode == expect_rc,
@@ -116,6 +123,71 @@ def main() -> int:
     check("tar.gz caveat note", "tar.gz" in notes)
     check("BadZipFile note", "BadZipFile" in notes)
     check("no store-mode note (ratio 2.3)", "store-mode" not in notes)
+
+    print("\n— reconcile + report: record_unit (non-'records' count units) —")
+    import gen_report as _gr
+    _ru_exp = {"services": {
+        "gusto": {"records": 4, "record_unit": "W2 employees"},
+        "outplay_ai": {"records": 100, "record_unit": "transactions"},
+        "slack": {"records": 1500000},
+        # record-declared, NO top-level prefix of its own, but detection
+        # finds it inside another source's archives (declared as
+        # google_calendar; detected under its canonical id gcal — the row
+        # must resolve through the alias table like byte-declared rows do)
+        "google_calendar": {"records": 125000}}}
+    _ru_run = {"sources": {
+        "gusto": {"blob_count": 1, "compressed_bytes": 500,
+                  "uncompressed_bytes": 900},
+        "outplay_ai": {"blob_count": 6, "compressed_bytes": 73445,
+                       "uncompressed_bytes": 73445},
+        "slack": {"blob_count": 2, "compressed_bytes": 10,
+                  "uncompressed_bytes": 20}},
+        "detected_services": {
+            "gcal": {"bytes": 206_000_000,
+                     "sources": {"workspace-export": 206_000_000}}}}
+    _ru_rows, _ru_unexp = reconcile.service_rows(_ru_exp, _ru_run)
+    _ru_by = {r["service"]: r for r in _ru_rows}
+    check("record_unit carried onto the row",
+          _ru_by["gusto"].get("declared_record_unit") == "W2 employees")
+    check("record_unit absent → None (renderer falls back to 'records')",
+          _ru_by["slack"].get("declared_record_unit") is None)
+    check("record_unit rows still flagged record-count",
+          all("record-count" in _ru_by[s]["flags"]
+              for s in ("gusto", "outplay_ai", "slack")))
+    check("record_unit rows have no byte pct",
+          all(_ru_by[s]["pct"] is None
+              for s in ("gusto", "outplay_ai", "slack")))
+    # a record-declared service with no top-level prefix but embedded
+    # detection must still surface the detection (found-embedded), exactly
+    # like a byte-declared one — going record-declared must never HIDE data
+    _ru_gc = _ru_by["google_calendar"]
+    check("record-declared + embedded: found-embedded flagged",
+          "found-embedded" in _ru_gc["flags"], str(_ru_gc["flags"]))
+    check("record-declared + embedded: bytes + host carried",
+          _ru_gc.get("embedded_bytes") == 206_000_000
+          and _ru_gc.get("embedded_in") == ["workspace-export"])
+    check("record-declared + embedded: pct stays None (no byte declaration)",
+          _ru_gc["pct"] is None)
+    check("record-declared with own top-level bytes: NOT found-embedded",
+          "found-embedded" not in _ru_by["gusto"]["flags"])
+    _ru_tbl = _gr.service_table(_ru_rows, _ru_unexp, _ru_run["sources"])
+    check("table renders the declared unit verbatim",
+          "4 W2 employees" in _ru_tbl and "100 transactions" in _ru_tbl
+          and "1,500,000 records" in _ru_tbl, _ru_tbl)
+    check("table never mislabels a non-record unit as 'records'",
+          "4 records" not in _ru_tbl and "100 records" not in _ru_tbl)
+    check("table shows embedded host for record-declared service",
+          "inside workspace-export" in _ru_tbl, _ru_tbl)
+    _ru_chart = _gr.bar_chart(_ru_rows, _ru_unexp, _ru_run["sources"])
+    check("chart labels the declared unit verbatim",
+          "4 W2 employees" in _ru_chart and "100 transactions" in _ru_chart,
+          _ru_chart[:400])
+    # the point of a record declaration: an actual bar, never a declared bar
+    # (google_calendar's one bar is its embedded bytes, ‡-marked)
+    check("chart draws exactly one (actual) bar per record-declared service",
+          _ru_chart.count("<rect") == 4, str(_ru_chart.count("<rect")))
+    check("chart ‡-marks the embedded record-declared service",
+          "google_calendar ‡" in _ru_chart)
 
     print("\n— reconcile: excluded prefixes (non-corpus data) —")
     _exc_run = {"sources": {"2026": {"uncompressed_bytes": 500},
@@ -391,6 +463,26 @@ def main() -> int:
     check("embedded overshoot flagged",
           set(over_rows[0]["flags"]) == {"found-embedded", "overshoot"}
           and abs(over_rows[0]["pct"] - 150.0) < 0.01, str(over_rows[0]))
+    # detected keys are catalog canonical ids when the path resolves through
+    # the catalog (checkmate's Takeout/Calendar → "gcal"); a declared alias
+    # spelling must still find them (the gcal/Google Calendar bug, 2026-08-29)
+    alias_rows, _ = reconcile.service_rows(
+        {"services": {"Google Calendar": {"bytes": 100}}},
+        {"sources": {},
+         "detected_services": {"gcal": {"bytes": 60, "sources": {"gdrive": 60}}}})
+    check("declared alias matches canonical detected id (gcal)",
+          alias_rows[0]["flags"] == ["found-embedded"]
+          and alias_rows[0]["embedded_bytes"] == 60, str(alias_rows[0]))
+    # Takeout children NOT in SERVICE_CATALOG detect under their own id
+    # ("gphotos") — the declared spelling must bridge via TAKEOUT_CHILDREN
+    photo_rows, _ = reconcile.service_rows(
+        {"services": {"Google Photos": {"bytes": 100}}},
+        {"sources": {},
+         "detected_services": {"gphotos": {"bytes": 60,
+                                           "sources": {"gdrive": 60}}}})
+    check("declared alias matches Takeout child id (gphotos)",
+          photo_rows[0]["flags"] == ["found-embedded"]
+          and photo_rows[0]["embedded_bytes"] == 60, str(photo_rows[0]))
     enotes = " ".join(es["notes"])
     check("embedded note names hubspot + host",
           "hubspot" in enotes and "workspace-export" in enotes, enotes)
@@ -6280,7 +6372,11 @@ def main() -> int:
     common.run_az = _fake_run_az
     try:
         msum = mint_push_sas.cmd_mint(root, _argparse.Namespace(
-            slug="democo", days=14, note="test mint", dry_run=False))
+            slug="democo", days=14, note="test mint", dry_run=False,
+            read_only=False))
+        rsum = mint_push_sas.cmd_mint(root, _argparse.Namespace(
+            slug="democo", days=14, note="test read mint", dry_run=False,
+            read_only=True))
     finally:
         common.run_az = saved_run_az
     zip_path = Path(msum["zip"])
@@ -6306,6 +6402,21 @@ def main() -> int:
                             str(zip_path)], capture_output=True, text=True)
     check("zip refuses a wrong password", p_bad.returncode != 0)
     shutil.rmtree(unz)
+
+    # --read-only: the rl download token for a data buyer, not a push token.
+    r_zip = Path(rsum["zip"])
+    check("read-only mint records rl perms in summary + ledger",
+          rsum["permissions"] == "rl" and "read-sas-" in r_zip.name
+          and common.read_json(ledger_path)["tokens"][1]["permissions"] == "rl")
+    r_unz = tempfile.mkdtemp(prefix="cdp-sas-runzip-")
+    subprocess.run(["unzip", "-P", rsum["password"], "-d", r_unz,
+                    str(r_zip)], capture_output=True, text=True)
+    r_txt = (Path(r_unz) / "sas-credentials.txt").read_text()
+    check("read-only credentials txt gives download, not push, instructions",
+          "download credentials" in r_txt and "read/list" in r_txt
+          and "x-ms-blob-type" not in r_txt
+          and "network-rule add" in r_txt)
+    shutil.rmtree(r_unz)
 
     # Ledger/page are offline-testable without az: seed entries directly —
     # one live token minted "now", one long-expired.
@@ -6345,6 +6456,687 @@ def main() -> int:
                       "--out", sas_page)
     check("page regeneration idempotent",
           json.loads(proc.stdout)["tokens"] == 2)
+
+    print("\n— saxon sharepoint completion (one-off: pure functions) —")
+    import saxon_sp_vm_pull as spp  # noqa: E402
+    import saxon_sp_complete as spc  # noqa: E402
+
+    check("relpath nested",
+          spp.expected_relpath("Documents", "/drives/x/root:/A/B", "f.txt")
+          == "Documents/A/B/f.txt")
+    check("relpath at drive root",
+          spp.expected_relpath("Documents", "/drives/x/root:", "f.txt")
+          == "Documents/f.txt")
+    check("relpath refuses missing root anchor",
+          spp.expected_relpath("Documents", "/drives/x", "f.txt") is None)
+    check("relpath keeps odd chars",
+          spp.expected_relpath("Docs", "/drives/x/root:/RFQ's/a b", "f")
+          == "Docs/RFQ's/a b/f")
+    check("sitecoll ports the census regex",
+          spp.sitecoll("https://h.sharepoint.com/sites/VSS1/Docs/x")
+          == "https://h.sharepoint.com/sites/vss1"
+          and spp.sitecoll("https://h.sharepoint.com/")
+          == "https://h.sharepoint.com")
+
+    _exp = {"Documents/a.txt": (10, "d", "i", "m"),
+            "Documents/b.txt": (20, "d", "i", "m"),
+            "Documents/c.txt": (30, "d", "i", "m")}
+    _dst = {"Documents/a.txt": 10, "Documents/b.txt": 25,
+            "Documents/x.txt": 5, "Documents/a.txt.meta.json": 1}
+    _d = spp.diff_folder(_exp, _dst)
+    check("diff: missing", _d["missing"] == ["Documents/c.txt"])
+    check("diff: mismatch recorded, never copied",
+          len(_d["mismatched"]) == 1
+          and _d["mismatched"][0]["path"] == "Documents/b.txt"
+          and _d["mismatched"][0]["dest_size"] == 25)
+    check("diff: matched", _d["matched"] == 1 and _d["matched_bytes"] == 10)
+    check("diff: sidecar counted apart from dest_only",
+          _d["dest_only"] == 1 and _d["sidecars"] == 1)
+
+    check("classify table",
+          [spp.classify(s, "delta") for s in
+           (200, 429, 401, 503, 408, 403, 404, 400)]
+          == ["ok", "sleep", "remint", "retry", "retry",
+              "skip", "skip", "skip"])
+    _bp = spp.block_plan(600 * spp.MIB, 256 * spp.MIB)
+    check("block plan bounds",
+          len(_bp) == 3 and _bp[0][1] == 0
+          and _bp[-1][2] == 600 * spp.MIB - 1)
+    check("block ids are uniform length (Azure's rule)",
+          len({len(b[0]) for b in _bp}) == 1 and len(_bp[0][0]) == 12)
+    _bp36 = spp.block_plan(600 * spp.MIB, 256 * spp.MIB, 36)
+    check("widened block ids match a foreign 48-char id set",
+          len({len(b[0]) for b in _bp36}) == 1 and len(_bp36[0][0]) == 48
+          and [b[1] for b in _bp36] == [b[1] for b in _bp])
+    check("widened ids stay decodable + distinct",
+          base64.b64decode(_bp36[0][0]) == b"0" * 36
+          and len({b[0] for b in _bp36}) == 3)
+    check("source host pin",
+          spp.source_host_ok("https://x.sharepoint.com/a")
+          and spp.source_host_ok("https://cdn.svc.ms/a")
+          and not spp.source_host_ok("https://evil.example.com/a"))
+
+    _map = {"folders": [
+        {"folder": "big", "action": "complete", "order_bytes": 100},
+        {"folder": "cal", "action": "complete", "order_bytes": 1,
+         "calibrate": True},
+        {"folder": "small", "action": "complete", "order_bytes": 10},
+        {"folder": "amb", "action": "skip-ambiguous"}]}
+    check("plan_sites: calibration first, then size order",
+          [r["folder"] for r in spp.plan_sites(_map, None, 0)]
+          == ["cal", "big", "small"])
+    _map_p = {"folders": _map["folders"] + [
+        {"folder": "prio", "action": "complete", "order_bytes": 2,
+         "priority": True}]}
+    check("plan_sites: priority tier between calibration and the rest",
+          [r["folder"] for r in spp.plan_sites(_map_p, None, 0)]
+          == ["cal", "prio", "big", "small"])
+    check("plan_sites: limit keeps calibration rows",
+          [r["folder"] for r in spp.plan_sites(_map, None, 2)]
+          == ["cal", "big"])
+    check("plan_sites: only-sites filter",
+          [r["folder"] for r in spp.plan_sites(_map, {"small"}, 0)]
+          == ["small"])
+    check("gate passes at 0.5% missing",
+          spp.gate_check({"folder": "f", "expected_files": 1000,
+                          "missing_before": 5}) is None)
+    check("gate breaches at 2% missing",
+          spp.gate_check({"folder": "f", "expected_files": 1000,
+                          "missing_before": 20}) is not None)
+    check("mapping-suspect: near-zero overlap on a real folder",
+          spp.mapping_suspect({"matched": 1, "mismatched": [],
+                               "dest_only": 999}, 500))
+    check("mapping-suspect: healthy overlap passes",
+          not spp.mapping_suspect({"matched": 400, "mismatched": [],
+                                   "dest_only": 100}, 500))
+    check("mapping-suspect: sliver folders exempt",
+          not spp.mapping_suspect({"matched": 0, "mismatched": [],
+                                   "dest_only": 30}, 500))
+
+    _pb = spp.PaceBucket(12.0, 16.0)
+    _pb.throttled()
+    check("pace: one 429 halves the rate", abs(_pb.rate - 6.0) < 1e-6)
+    for _ in range(8):          # a burst from the concurrent copy pool
+        _pb.throttled()
+    check("pace: burst 429s coalesce into ONE halving",
+          abs(_pb.rate - 6.0) < 1e-6 and _pb.throttles == 9)
+    _pb._last_throttle -= (spp.PaceBucket.THROTTLE_COOLDOWN_S + 1)
+    _pb.throttled()
+    check("pace: a LATER congestion event halves again",
+          abs(_pb.rate - 3.0) < 1e-6)
+    _pb2 = spp.PaceBucket(2.0, 16.0)
+    for _ in range(5):
+        _pb2._last_throttle -= (spp.PaceBucket.THROTTLE_COOLDOWN_S + 1)
+        _pb2.throttled()
+    check("pace: never drops below the floor",
+          abs(_pb2.rate - spp.PaceBucket.MIN_RPS) < 1e-6)
+    _pb3 = spp.PaceBucket(4.0, 16.0)
+    _pb3._last_bump -= 61
+    _pb3.wait()
+    check("pace: a clean minute creeps the rate back up",
+          abs(_pb3.rate - 4.5) < 1e-6)
+
+    _guid = "dfeaf684-b537-4e57-9ea5-b76dae8558f0"
+    _sites = [
+        {"id": f"h.sharepoint.com,{_guid},"
+               "11111111-1111-1111-1111-111111111111",
+         "webUrl": "https://h.sharepoint.com/sites/connect4-0",
+         "displayName": "Connect4.0"},
+        {"id": "h.sharepoint.com,22222222-2222-2222-2222-222222222222,"
+               "33333333-3333-3333-3333-333333333333",
+         "webUrl": "https://h.sharepoint.com/sites/VSS1",
+         "displayName": "VSS One"},
+        {"id": "pers", "webUrl": "https://h-my.sharepoint.com/personal/u",
+         "displayName": "personal"},
+    ]
+    _colls = spc.build_collections(_sites)
+    check("collections drop personal sites",
+          len(_colls) == 2
+          and all("-my." not in k for k in _colls))
+    _folders = {"VSS1": (10, 100, 0), "Connect4-0": (5, 500, 0),
+                "Connect4.0": (5, 50, 2), _guid: (1, 1, 0),
+                "NoSuchSite": (1, 1, 0)}
+    _rows = {r["folder"]: r for r in spc.match_folders(_folders, _colls)}
+    check("match: exact slug", _rows["VSS1"]["confidence"] == "exact"
+          and _rows["VSS1"]["action"] == "complete")
+    check("match: bare-GUID folder via site id",
+          _rows[_guid]["confidence"] == "guid")
+    check("match: two folders one collection -> byte-heavier wins",
+          _rows["Connect4-0"]["action"] == "complete"
+          and _rows["Connect4.0"]["action"] == "skip-duplicate-target")
+    check("match: unmatched is skip-ambiguous, never guessed",
+          _rows["NoSuchSite"]["action"] == "skip-ambiguous")
+    _cal = spc.mark_calibration(
+        list(_rows.values()),
+        {"vss1": {"bytes": 2_000_000_000},
+         "connect4-0": {"bytes": 3_000_000_000}})
+    _r = _rows["VSS1"]
+    check("calibration: only existing>=census sites marked",
+          _cal == [] or all(
+              _rows[f]["existing_bytes"] >= 2_000_000_000 for f in _cal))
+    _rows["VSS1"]["existing_bytes"] = 2_500_000_000
+    _cal = spc.mark_calibration(list(_rows.values()),
+                                {"vss1": {"bytes": 2_000_000_000}})
+    check("calibration: marks the caught-up site", _cal == ["VSS1"]
+          and _rows["VSS1"].get("calibrate") is True)
+    check("folder_stats splits sidecars",
+          spc.folder_stats({"a": 10, "a.meta.json": 1, "b": 20})
+          == (2, 30, 1))
+    try:
+        spc._tenant_guard("aaa", "bbb")
+        check("tenant guard refuses mismatch", False)
+    except common.HarnessError:
+        check("tenant guard refuses mismatch", True)
+
+    print("\n— saxon_sp_complete --dry-run (one-off guard + gates) —")
+    check("SPEC is the sp one-off",
+          spc.SPEC.vm_prefix == "xfer-sp-"
+          and spc.SPEC.purpose == "saxon-sp-complete"
+          and spc.SPEC.default_dest_prefix == "sharepoint"
+          and spc.SPEC.default_os_disk_gb == 64)
+    proc = run_script("saxon_sp_complete.py", "plan", "democo",
+                      "--root", root, "--dry-run", expect_rc=1)
+    check("slug guard refuses non-saxon",
+          "ONE-OFF" in json.loads(proc.stdout)["error"])
+    saxon_dir = root / "saxon"
+    saxon_dir.mkdir()
+    common.write_json(saxon_dir / "config.json", {
+        "slug": "saxon", "subscription": "m1 corpus",
+        "subscription_id": "x", "resource_group": "rg-x",
+        "storage_account": "stx", "container": "saxon-technologies-raw",
+        "vm": {"name": None, "resource_group": "rg-x", "exists": False}})
+    run_script("saxon_sp_complete.py", "plan", "saxon",
+               "--root", root, "--dry-run")
+    proc = run_script("saxon_sp_complete.py", "transfer", "saxon",
+                      "--root", root, "--dry-run", expect_rc=1)
+    check("transfer refuses without a mapping",
+          "plan first" in json.loads(proc.stdout)["error"])
+    common.write_json(saxon_dir / "sharepoint-completion" / "mapping.json", {
+        "slug": "saxon", "dest_prefix": "sharepoint", "approved_utc": None,
+        "folders": [{"folder": "AGDemo", "action": "complete",
+                     "site_url": "https://h.sharepoint.com/sites/agdemo",
+                     "site_ids": ["h,1,2"], "existing_bytes": 1,
+                     "order_bytes": 1}]})
+    proc = run_script("saxon_sp_complete.py", "transfer", "saxon",
+                      "--root", root, "--dry-run", expect_rc=1)
+    check("transfer refuses an unapproved mapping",
+          "not approved" in json.loads(proc.stdout)["error"])
+    run_script("saxon_sp_complete.py", "approve-mapping", "saxon",
+               "--root", root, "--dry-run")
+    proc = run_script("saxon_sp_complete.py", "transfer", "saxon",
+                      "--root", root, "--dry-run", "--diff-only")
+    # DRY-RUN ssh lines precede the JSON — parse from the first brace
+    check("transfer dry-run after approval",
+          json.loads(proc.stdout[proc.stdout.index("{"):])
+          .get("dry_run") is True and "DIFF_ONLY=1" in proc.stdout)
+    run_script("saxon_sp_complete.py", "harvest", "saxon",
+               "--root", root, "--dry-run")
+    run_script("saxon_sp_complete.py", "create-vm", "saxon",
+               "--root", root, "--dry-run", "--tenant-id",
+               "12345678-1234-1234-1234-123456789012")
+    run_script("saxon_sp_complete.py", "teardown", "saxon",
+               "--root", root, "--dry-run", "--confirmed")
+
+    # ── slack export file ingest ────────────────────────────────────────────
+    # The fixture is a SYNTHETIC mini-export (tests/fixtures/
+    # make_slack_export_mini.py) built to the schema of a real Business+
+    # compliance export. Every awkward shape the real format has is in it
+    # once, so these checks exercise the ledger's actual edge cases rather
+    # than a happy path.
+    print("\n— slack export ingest (ledger, transport classification, CLI)")
+    import slack_vm_pull as svp   # noqa: E402
+    import slack_transfer as slt  # noqa: E402
+
+    MINI = REPO / "tests" / "fixtures" / "slack-export-mini.zip"
+    check("slack fixture exists", MINI.exists(), str(MINI))
+
+    # Slack writes UTF-8 member names with the UTF-8 flag bit UNSET, so
+    # zipfile mis-decodes them as cp437. The fixture reproduces that exactly;
+    # if this check ever fails the fixture stopped testing anything.
+    zi = [i for i in zipfile.ZipFile(MINI).infolist()
+          if "F0FIXCANVAS:" in i.filename][0]
+    check("slack fixture reproduces Slack's missing UTF-8 flag bit",
+          not (zi.flag_bits & 0x800) and zi.filename != svp.zip_member_name(zi),
+          f"flag={zi.flag_bits:#06x} raw={zi.filename!r}")
+    check("slack cp437 member names decode back to UTF-8",
+          svp.zip_member_name(zi).startswith("FC:F0FIXCANVAS:\U0001f517 Links/"),
+          repr(svp.zip_member_name(zi)))
+
+    # Token handling (fact 1 + fact 2): files-pri uses `token=`, files-tmb
+    # transcodes use `t=`, and attachments[].files[] entries carry neither.
+    u_pri = "https://files.slack.com/files-pri/T-F/download/a.m4a?token=xoxe-A"
+    u_tmb = "https://files.slack.com/files-tmb/T-F-x/f.vtt?_xcb=dc&t=xoxe-A"
+    u_none = "https://files.slack.com/files-pri/T-F/download/b.png"
+    check("slack token read from both `token=` and `t=`",
+          svp.url_token(u_pri) == "xoxe-A" and svp.url_token(u_tmb) == "xoxe-A"
+          and svp.url_token(u_none) is None)
+    check("slack tokenless url gets the workspace token appended",
+          svp.url_with_token(u_none, "xoxe-B").endswith("?token=xoxe-B"))
+    check("slack tokened url is used verbatim",
+          svp.url_with_token(u_tmb, "xoxe-B") == u_tmb)
+    for url, want_param in ((u_pri, "token"), (u_tmb, "t"), (u_none, None)):
+        bare, param = svp.strip_token(url)
+        check(f"slack token strip/restore round-trips ({want_param})",
+              param == want_param and "xoxe-A" not in bare
+              and svp.restore_token(bare, param, "xoxe-A") == url
+              if want_param else param is None and bare == url,
+              f"{param!r} {bare!r}")
+    check("slack `_xcb` and other query params survive the strip",
+          "_xcb=dc" in svp.strip_token(u_tmb)[0])
+
+    # Blob paths are id-led and deterministic: Slack file ids are immutable,
+    # names are not, and a rename between two export passes must never orphan
+    # already-copied bytes.
+    check("slack blob path is id-led and sanitised",
+          svp.blob_path("F047H9921PW", "Audio Clip (2022-10-20).m4a")
+          == "files/F047/F047H9921PW/Audio_Clip__2022-10-20_.m4a")
+    check("slack rendition path keeps the field name",
+          svp.rendition_blob_path(
+              "F047H9921PW", "thumb_360",
+              "https://files.slack.com/files-tmb/x/i_360.png?t=1")
+          == "renditions/F047/F047H9921PW/thumb_360__i_360.png")
+
+    export = svp.ZipExport(MINI)
+    ledger_dir = tmp / "slack-ledger"
+    ledger = svp.build_ledger(export, ledger_dir, renditions=True)
+    counts = ledger["counts"]
+    check("slack ledger counts the fixture exactly",
+          (counts["unique_files"], counts["hosted"], counts["external"],
+           counts["unavailable"], counts["renditions"], counts["objects"])
+          == (9, 7, 1, 1, 5, 12), json.dumps(counts))
+    check("slack ledger harvests the export's embedded token",
+          ledger["export_token_present"]
+          and ledger["export_token"].startswith("xoxe-"))
+    check("slack ledger sums declared bytes per disposition",
+          ledger["declared_bytes"] == {"hosted": 402724169,
+                                       "external": 4194304},
+          json.dumps(ledger["declared_bytes"]))
+
+    def jsonl(name):
+        return [json.loads(x) for x in
+                (ledger_dir / "_meta" / name).read_text(
+                    encoding="utf-8").splitlines() if x.strip()]
+
+    objects = jsonl("objects.jsonl")
+    index = jsonl("files-index.jsonl")
+    shares = jsonl("file-shares.jsonl")
+    check("slack ledger writes one object row per blob",
+          len(objects) == 12 and len({o["blob"] for o in objects}) == 12)
+    check("slack ledger never stores the token in the container ledger",
+          not any("xox" in json.dumps(r) for r in objects + index),
+          "a ledger row still carries a credential")
+    check("slack ledger records the token PARAM so it can be re-attached",
+          {o["tp"] for o in objects} == {"token", "t", None},
+          str(sorted(str(o["tp"]) for o in objects)))
+    check("slack ledger picks up attachments[].files[] (tokenless)",
+          any(o["file_id"] == "F0FIXATT001" and o["tp"] is None
+              for o in objects))
+    check("slack ledger picks up root canvases/lists/huddle transcripts",
+          {"F0FIXCANVAS", "F0FIXLIST001", "F0FIXHUDDLE1"}
+          <= {o["file_id"] for o in objects})
+    check("slack ledger captures the canvas history link as a rendition",
+          any(o["kind"] == "rendition:canvas_history" for o in objects))
+    check("slack ledger dedups a re-shared file and records the sighting",
+          len(shares) == 2
+          and {s["file_id"] for s in shares} == {"F0FIXCANVAS", "F0FIXPNG001"}
+          and len([o for o in objects
+                   if o["file_id"] == "F0FIXPNG001"
+                   and o["kind"] == "original"]) == 1)
+    check("slack shares ledger carries the cp437-decoded conversation dir",
+          any(s["conversation"]["dir"]
+              == "FC:F0FIXCANVAS:\U0001f517 Links" for s in shares))
+    check("slack external (gdrive) files are recorded, never queued for copy",
+          [r["file_id"] for r in jsonl("external-references.jsonl")]
+          == ["F0FIXEXT001"]
+          and not any(o["file_id"] == "F0FIXEXT001" for o in objects))
+    check("slack tombstones are recorded with their reason",
+          [(r["file_id"], r["reason"])
+           for r in jsonl("unavailable.jsonl")] == [("F0FIXTOMB01",
+                                                     "tombstone")])
+    check("slack ledger links every file to its conversation and message",
+          all(r.get("conversation") for r in index)
+          and any(r["file_id"] == "F0FIXPNG001"
+                  and r["conversation"]["name"] == "general"
+                  and r["message_ts"] == "1767312000.000100" for r in index))
+
+    # --no-renditions is the object-count lever probe reports on.
+    lean = svp.build_ledger(export, tmp / "slack-ledger-lean", renditions=False)
+    check("slack --no-renditions drops derivative objects only",
+          lean["counts"]["objects"] == 7
+          and lean["counts"]["renditions"] == 0
+          and lean["counts"]["hosted"] == counts["hosted"])
+
+    # A second build must produce byte-identical blob paths — that is what
+    # makes create-only resume correct across runs.
+    again = svp.build_ledger(export, tmp / "slack-ledger-again",
+                             renditions=True)
+    check("slack ledger is deterministic across runs",
+          [o["blob"] for o in jsonl("objects.jsonl")]
+          == [json.loads(x)["blob"] for x in
+              (tmp / "slack-ledger-again" / "_meta" / "objects.jsonl")
+              .read_text(encoding="utf-8").splitlines() if x.strip()]
+          and again["counts"] == counts)
+
+    # classify() keys on the COPY-SOURCE status, not just Azure's.
+    table = {
+        (201, "", ""): "ok", (409, "", ""): "ok",
+        (0, "", "429"): "sleep", (429, "", ""): "sleep",
+        (0, "", "401"): "source-auth", (0, "", "403"): "source-auth",
+        (0, "", "404"): "skip",
+        (412, "CannotVerifyCopySource", ""): "resolve-again",
+        (500, "", ""): "retry", (403, "", ""): "retry", (0, "", "503"): "retry",
+        (400, "InvalidHeaderValue", ""): "fallback",
+    }
+    check("slack classify() maps every copy outcome",
+          all(svp.classify(*k) == v for k, v in table.items()),
+          str({k: svp.classify(*k) for k, v in table.items()
+               if svp.classify(*k) != v}))
+
+    # Export discovery: both shapes, and never a silent guess.
+    listing = {
+        "slack/export-2026.zip": {"size": 999},
+        "slack-extracted/channels.json": {"size": 10},
+        "slack-extracted/users.json": {"size": 10},
+        "slack-extracted/general/2026-01-02.json": {"size": 10},
+        "gdrive-export/whatever.txt": {"size": 1},
+    }
+    cands = slt.find_export_candidates(listing)
+    check("slack discovery finds an extracted tree by its signature files",
+          any(c["kind"] == "tree" and c["prefix"] == "slack-extracted"
+              for c in cands))
+    check("slack discovery surfaces .zip blobs as candidates",
+          any(c["kind"] == "zip" and c["blob"] == "slack/export-2026.zip"
+              for c in cands))
+    check("slack discovery ignores unrelated prefixes",
+          not any("gdrive-export" in json.dumps(c) for c in cands))
+    check("slack export_ref round-trips both shapes",
+          slt.parse_export_ref(slt.export_ref(
+              {"kind": "zip", "blob": "a/b.zip"})) == {"kind": "zip",
+                                                       "blob": "a/b.zip"}
+          and slt.parse_export_ref(slt.export_ref(
+              {"kind": "tree", "prefix": "x/y"})) == {"kind": "tree",
+                                                      "prefix": "x/y"})
+    check("slack detect_export_root handles a re-zipped wrapper folder",
+          svp.detect_export_root(
+              ["Slack Export/channels.json", "Slack Export/users.json",
+               "Slack Export/general/2026-01-02.json"]) == "Slack Export/"
+          and svp.detect_export_root(["random/thing.json"]) is None)
+
+    # verify: the byte-exact claim only this family can make.
+    ok_objs = [{"blob": "files/F0/A/a.png", "kind": "original", "size": 100,
+                "status": "copied"},
+               {"blob": "renditions/F0/A/t.png", "kind": "rendition:thumb_64",
+                "size": 0, "status": "copied"},
+               {"blob": "files/F0/B/b.png", "kind": "original", "size": 5,
+                "status": "gone"}]
+    good = {"p/files/F0/A/a.png": {"size": 100},
+            "p/renditions/F0/A/t.png": {"size": 42}}
+    res = slt.compare_objects_to_blobs(list(ok_objs), good, "p")
+    check("slack verify passes when declared bytes match what Azure committed",
+          res["ok"] and res["expected_objects"] == 2 and res["originals"] == 1
+          and res["renditions"] == 1 and res["missing"] == 0, json.dumps(res))
+    res = slt.compare_objects_to_blobs(
+        list(ok_objs), {"p/files/F0/A/a.png": {"size": 99},
+                        "p/renditions/F0/A/t.png": {"size": 42}}, "p")
+    check("slack verify catches a declared-vs-landed size mismatch",
+          not res["ok"] and res["size_mismatches"] == 1
+          and res["size_mismatch_sample"][0]["landed"] == 99)
+    res = slt.compare_objects_to_blobs(
+        list(ok_objs), {"p/renditions/F0/A/t.png": {"size": 42}}, "p")
+    check("slack verify catches a missing object",
+          not res["ok"] and res["missing"] == 1
+          and res["missing_sample"][0]["blob"] == "files/F0/A/a.png")
+    res = slt.compare_objects_to_blobs(
+        list(ok_objs), dict(good, **{"p/files/F0/B/b.png": {"size": 5}}), "p")
+    check("slack verify treats a since-landed 'gone' file as informational",
+          res["ok"] and res["unexpected_present"] == 1)
+
+    # CLI: every subcommand under --dry-run, and the refusals that matter.
+    check("slack Spec follows the VM-family conventions",
+          slt.SPEC.vm_prefix == "xfer-slack-"
+          and slt.SPEC.authorize_target == ""
+          and slt.SPEC.remote_type == ""
+          and slt.SPEC.default_dest_prefix == "slack-export-files"
+          and slt.SPEC.default_os_disk_gb == 256)
+    proc = run_script("slack_transfer.py", "plan", "democo", "--root", root,
+                      "--dry-run", "--export-blob", "slack/export.zip")
+    plan = json.loads(proc.stdout)
+    check("slack plan names the export and warns about the token clock",
+          plan["source"] == "slack:zip:slack/export.zip"
+          and "expire" in plan["note"], json.dumps(plan)[:300])
+    proc = run_script("slack_transfer.py", "plan", "democo", "--root", root,
+                      "--dry-run", expect_rc=2)
+    check("slack plan refuses without an export location",
+          "requires --export-blob" in proc.stderr, proc.stderr[-200:])
+    for cmd in ("discover", "discover-export", "create-vm", "allow-network",
+                "check-azure", "status", "verify", "transfer"):
+        run_script("slack_transfer.py", cmd, "democo", "--root", root,
+                   "--dry-run", "--export-blob", "slack/export.zip")
+    proc = run_script("slack_transfer.py", "write-dest", "democo", "--root",
+                      root, "--dry-run", "--export-blob", "slack/export.zip")
+    out = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("slack write-dest carries the export location to the VM env",
+          out["export"] == {"kind": "zip", "blob": "slack/export.zip"}
+          and out["dest_prefix"] == "slack-export-files")
+    proc = run_script("slack_transfer.py", "write-dest", "democo", "--root",
+                      root, "--dry-run", expect_rc=1)
+    check("slack write-dest refuses without an export location",
+          "no export location" in json.loads(
+              proc.stdout[proc.stdout.index("{"):])["error"])
+    proc = run_script("slack_transfer.py", "transfer", "democo", "--root",
+                      root, "--dry-run", "--limit-files", "50",
+                      "--no-renditions")
+    out = json.loads(proc.stdout[proc.stdout.index("{"):])
+    check("slack transfer dry-run discloses the pilot + rendition env",
+          "LIMIT_FILES=50" in out["env"] and "RENDITIONS=0" in out["env"]
+          and out["limit_files"] == 50 and out["renditions"] is False,
+          json.dumps(out))
+    proc = run_script("slack_transfer.py", "teardown", "democo", "--root",
+                      root, "--dry-run", expect_rc=2)
+    check("slack teardown refuses without --confirmed",
+          "confirm" in proc.stdout.lower())
+    proc = run_script("slack_transfer.py", "write-creds", "democo", "--root",
+                      root, "--dry-run", expect_rc=1,
+                      stdin_data="not-a-slack-token\n")
+    check("slack write-creds refuses a non-Slack token",
+          "not a Slack token" in json.loads(
+              proc.stdout[proc.stdout.index("{"):])["error"])
+    proc = run_script("slack_transfer.py", "write-creds", "democo", "--root",
+                      root, "--dry-run", expect_rc=1,
+                      stdin_data="xoxp-a'b\n")
+    check("slack write-creds refuses a token that would corrupt the env file",
+          "single quote" in json.loads(
+              proc.stdout[proc.stdout.index("{"):])["error"])
+    proc = run_script("slack_transfer.py", "write-creds", "democo", "--root",
+                      root, "--dry-run", stdin_data="xoxp-fixture-token\n")
+    check("slack write-creds never echoes the token",
+          "xoxp-fixture-token" not in proc.stdout
+          and json.loads(proc.stdout[proc.stdout.index("{"):])["secret"]
+          == "redacted")
+
+    # ── slack copy phase, end to end against an in-memory Azure + Slack ─────
+    # The copy phase is where every interesting failure lives (server-side
+    # copy, block staging, a deleted file, an Azure refusal falling back to
+    # streaming, a dead export token), and none of it is reachable through
+    # --dry-run. Both HTTP seams and Blob.list are stubbed; nothing leaves
+    # this process.
+    print("\n— slack copy phase (fake Azure + fake Slack)")
+    import email.message  # noqa: E402
+
+    SLACK_BASE = "https://stfixture.blob.core.windows.net/fixture-raw"
+    SLACK_PREFIX = "slack-export-files"
+    SLACK_SIZES = {"F0FIXCANVAS": 80, "F0FIXLIST001": 7,
+                   "F0FIXHUDDLE1": 5066, "F0FIXDM0001": 900,
+                   "F0FIXPNG001": 52594, "F0FIXATT001": 12345,
+                   "F0FIXVID001": 402653184}
+
+    class _Resp:
+        def __init__(self, status=200, headers=None, body=b""):
+            self.status, self.headers = status, headers or {}
+            self._body = body
+
+        def read(self, n=-1):
+            return self._body
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _herr(url, code, hdrs=None, body=b""):
+        m = email.message.Message()
+        for k, v in (hdrs or {}).items():
+            m[k] = v
+        return urllib.error.HTTPError(url, code, f"HTTP {code}", m,
+                                      io.BytesIO(body))
+
+    class _FakeCloud:
+        """Azure container + Slack file host, in memory."""
+
+        def __init__(self, behaviour):
+            self.blobs, self.blocks, self.behaviour = {}, {}, behaviour
+            self.copies = 0
+
+        @staticmethod
+        def _fid(url):
+            for part in urllib.parse.urlsplit(url).path.split("/"):
+                for tok in part.split("-"):
+                    if tok.startswith("F0FIX"):
+                        return tok
+            return None
+
+        def nr(self, req, timeout=60):          # Slack, no redirects
+            fid = self._fid(req.full_url)
+            how = self.behaviour.get(fid, "ok")
+            if how in ("404", "403"):
+                raise _herr(req.full_url, int(how))
+            return _Resp(206, {"Content-Range":
+                               f"bytes 0-0/{SLACK_SIZES.get(fid, 10)}"})
+
+        def _name(self, url):
+            path = urllib.parse.urlsplit(url).path
+            return urllib.parse.unquote(
+                path[len(urllib.parse.urlsplit(SLACK_BASE).path) + 1:])
+
+        def http(self, req, timeout=90):        # Azure blob REST
+            q = urllib.parse.urlsplit(req.full_url).query
+            name = self._name(req.full_url)
+            if req.get_method() != "PUT":
+                return _Resp(200, body=self.blobs.get(name, b""))
+            if "comp=blocklist" in q:
+                self.blobs[name] = sum(
+                    self.blocks.pop(k) for k in list(self.blocks)
+                    if k[0] == name)
+                return _Resp(201)
+            if "comp=block" in q:
+                lo, hi = (req.get_header("X-ms-source-range")
+                          or "bytes=0-0").split("=")[1].split("-")
+                self.blocks[(name, q)] = int(hi) - int(lo) + 1
+                return _Resp(201)
+            if req.get_header("If-none-match") == "*" and name in self.blobs:
+                raise _herr(req.full_url, 409,
+                            body=b"<Error><Code>BlobAlreadyExists</Code>"
+                                 b"</Error>")
+            src = req.get_header("X-ms-copy-source")
+            if src:
+                if self.behaviour.get(self._fid(src)) == "azure-refuses":
+                    raise _herr(req.full_url, 400, {},
+                                b"<Error><Code>InvalidHeaderValue</Code>"
+                                b"</Error>")
+                self.copies += 1
+                self.blobs[name] = SLACK_SIZES.get(self._fid(src), 10)
+            else:
+                self.blobs[name] = len(req.data or b"")
+            return _Resp(201)
+
+        def listing(self, prefix):
+            return {k: (v if isinstance(v, int) else len(v))
+                    for k, v in self.blobs.items() if k.startswith(prefix)}
+
+    _saved = (svp._http, svp._http_nr, svp.Blob.list, svp._sleep)
+
+    def slack_run(behaviour, seed_blobs=None):
+        cloud = _FakeCloud(behaviour)
+        if seed_blobs:
+            cloud.blobs.update(seed_blobs)
+        svp._http, svp._http_nr, svp._sleep = cloud.http, cloud.nr, \
+            (lambda _s: None)
+        svp.Blob.list = lambda self, prefix: cloud.listing(prefix)
+        d = Path(tempfile.mkdtemp(prefix="slack-copy-"))
+        led = svp.build_ledger(svp.ZipExport(MINI), d, renditions=True)
+        out = svp.run_copy(svp.Blob(SLACK_BASE, "sig=fake"), SLACK_PREFIX, d,
+                           d / "_meta" / "objects.jsonl",
+                           led["export_token"], None,
+                           {"shard_size": 5, "copy_workers": 2,
+                            "limit_files": 0, "rps_files": 0})
+        return cloud, led, out, d
+
+    try:
+        cloud, led, out, cdir = slack_run({})
+        check("slack copy: every object lands server-side, no failures",
+              out["totals"] == {"copied": 12, "streamed": 0,
+                                "already_present": 0,
+                                "copied_bytes": 805482635, "failed": 0},
+              json.dumps(out["totals"]))
+        check("slack copy: a file over the single-shot limit is block-staged",
+              cloud.copies == 10 and cloud.blobs[
+                  f"{SLACK_PREFIX}/files/F0FI/F0FIXVID001/screenshare.mp4"]
+              == 402653184, f"copies={cloud.copies}")
+        check("slack copy: one .cdp-complete marker per shard",
+              sorted(k for k in cloud.blobs
+                     if k.endswith(".cdp-complete"))
+              == [f"{SLACK_PREFIX}/_meta/shards/{i:05d}.cdp-complete"
+                  for i in range(3)])
+
+        svp.patch_statuses(cdir / "_meta" / "objects.jsonl",
+                           out["status_by_blob"])
+        objs = [json.loads(x) for x in
+                (cdir / "_meta" / "objects.jsonl").read_text(
+                    encoding="utf-8").splitlines() if x.strip()]
+        res = slt.compare_objects_to_blobs(
+            objs, {k: {"size": v} for k, v in cloud.blobs.items()},
+            SLACK_PREFIX)
+        check("slack verify certifies a clean run byte-for-byte",
+              res["ok"] and res["missing"] == 0
+              and res["size_mismatches"] == 0
+              and res["landed_bytes"] == 805482635, json.dumps(res)[:300])
+
+        # A file deleted from Slack since the export is a recorded gap, and an
+        # Azure refusal falls back to streaming that one file through the VM.
+        cloud, led, out, _ = slack_run({"F0FIXDM0001": "404",
+                                        "F0FIXATT001": "azure-refuses"})
+        check("slack copy: a since-deleted file is 'gone', never a failure",
+              out["status_by_blob"]["files/F0FI/F0FIXDM0001/notes.txt"]
+              == "gone" and out["totals"]["failed"] == 0)
+        check("slack copy: an Azure copy refusal falls back to streaming",
+              out["totals"]["streamed"] == 1
+              and out["status_by_blob"][
+                  "files/F0FI/F0FIXATT001/unfurled.png"] == "copied")
+
+        # A dead export token must stop the run, not burn hours on nothing.
+        try:
+            slack_run({k: "403" for k in SLACK_SIZES})
+            check("slack copy: a dead export token aborts the run", False,
+                  "TokenDead was not raised")
+        except svp.TokenDead as exc:
+            check("slack copy: a dead export token aborts the run",
+                  "token is dead" in str(exc)
+                  and "not a retry" in str(exc), str(exc)[:200])
+
+        # Resume: the blob's own existence is the record.
+        cloud0, _led0, _out0, _d0 = slack_run({})
+        cloud, led, out, _ = slack_run({}, seed_blobs=dict(cloud0.blobs))
+        check("slack copy: a resume re-copies nothing and says so",
+              cloud.copies == 0 and out["totals"]["copied"] == 0
+              and out["totals"]["already_present"] == 12
+              and all(r["status"] == "skipped-complete"
+                      for r in out["results"]), json.dumps(out["totals"]))
+    finally:
+        svp._http, svp._http_nr, svp.Blob.list, svp._sleep = _saved
 
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]

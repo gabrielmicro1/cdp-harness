@@ -84,7 +84,10 @@ def build(root: Path):
             rows.append((slug, None, str(exc)))
 
     total_decl = sum(s["manifest_total_bytes"] or 0 for _, s, _ in rows if s)
-    total_unc = sum(s["uncompressed_total"] or 0
+    # Use the unit-adjusted total where a company has one (equivalent_bytes),
+    # so the fleet number matches what that company's own report shows.
+    total_unc = sum((s.get("uncompressed_total_adjusted")
+                     or s["uncompressed_total"] or 0)
                     for _, s, _ in rows if s and s["manifest_total_bytes"])
     fleet_pct = total_unc / total_decl * 100 if total_decl else None
 
@@ -113,7 +116,11 @@ def build(root: Path):
             badges.append('<span class="badge b-warn">manifest unconfirmed</span>')
 
         pct = s["pct_complete"]
+        if s.get("equivalent_adjustment") and s.get("pct_complete_adjusted"):
+            pct = s["pct_complete_adjusted"]          # like-for-like vs manifest
         pct_txt = f"{pct:.1f}%" if pct is not None else "—"
+        if s.get("equivalent_adjustment"):
+            pct_txt += " <span class=\"badge b-warn\">unit-adj</span>"
         bar = (f'<span class="bar"><i style="width:{min(pct or 0, 100):.0f}%">'
                f'</i></span>{pct_txt}')
         d24 = s["delta_24h"]
@@ -130,7 +137,7 @@ def build(root: Path):
         link_html = f'<a href="{esc(link)}">report</a>' if link else ""
         body.append(f'<tr><td>{esc(slug)}</td><td>{" ".join(badges)}</td>'
                     f'<td>{bar}</td>'
-                    f'<td class="num">{common.human_bytes(s["uncompressed_total"])}</td>'
+                    f'<td class="num">{common.human_bytes(s.get("uncompressed_total_adjusted") or s["uncompressed_total"])}</td>'
                     f'<td class="num">{d24_txt}</td><td class="num">{esc(eta)}</td>'
                     f'<td>{last}</td><td>{link_html}</td></tr>')
         summary["companies"].append({

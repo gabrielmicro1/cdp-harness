@@ -4,7 +4,7 @@
 companies/<slug>/reports/<date>.html — self-contained (inline CSS/SVG, no CDN,
 no JS dependencies), micro1-branded, dark. Declared vs UNCOMPRESSED per source
 (grouped horizontal bars, sorted by uncompressed desc, log x-axis when sources
-span ≥3 orders of magnitude), headline % vs the manifest total, per-service
+span ≥2 orders of magnitude), headline % vs the manifest total, per-service
 flags, delta + ETA, stall flag, and interpretation notes from sizing lore.
 
 Units: headline totals in TB when ≥1 TB; per-source breakdown in GB (decimal,
@@ -109,31 +109,43 @@ FLAG_BADGES = {
 }
 
 
+def record_label(row: dict) -> str:
+    """A record-count declaration in its OWN unit — "4 W2 employees", not
+    "4 records". Declarations without a record_unit keep the plain default."""
+    return (f'{row["declared_records"]:,} '
+            f'{row.get("declared_record_unit") or "records"}')
+
+
 def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
     """Grouped horizontal bars, declared vs uncompressed, as inline SVG."""
     entries = []
     for r in rows:
-        if r["declared_records"] is not None:
-            continue  # record-count services: listed in the table, not the chart
         eq = r.get("equivalent_bytes")
         emb = r.get("embedded_bytes")
         name = r["service"] + (" †" if eq else " ‡" if emb else "")
-        entries.append((name, r["declared_bytes"] or 0,
-                        eq or r["actual_bytes"] or emb or 0))
-    adjusted = any(n.endswith(" †") for n, _, _ in entries)
-    embedded = any(n.endswith(" ‡") for n, _, _ in entries)
+        if r["declared_records"] is not None:
+            # record-count services: no byte declaration to bar — chart the
+            # received bytes alone (embedded detection when there's no
+            # top-level prefix), record count as the declared-side label
+            entries.append((name, None, r["actual_bytes"] or emb or 0,
+                            record_label(r)))
+        else:
+            entries.append((name, r["declared_bytes"] or 0,
+                            eq or r["actual_bytes"] or emb or 0, None))
+    adjusted = any(n.endswith(" †") for n, _, _, _ in entries)
+    embedded = any(n.endswith(" ‡") for n, _, _, _ in entries)
     for s in unexpected:
-        entries.append((s + " *", 0, sources[s]["uncompressed_bytes"]))
+        entries.append((s + " *", 0, sources[s]["uncompressed_bytes"], None))
     entries.sort(key=lambda e: -e[2])
     if not entries:
         return '<p class="meta">No byte-declared services to chart.</p>'
 
-    vals = [v for e in entries for v in e[1:] if v > 0]
+    vals = [v for e in entries for v in e[1:3] if v is not None and v > 0]
     if not vals:
         return '<p class="meta">No nonzero sizes to chart yet.</p>'
     vmax = max(vals)
     vmin = min(vals)
-    log_scale = vmin > 0 and vmax / vmin >= 1000  # spans ≥3 orders of magnitude
+    log_scale = vmin > 0 and vmax / vmin >= 100  # spans ≥2 orders of magnitude
     floor = vmin / 2 if log_scale else 0
 
     label_w, chart_w, bar_h, gap, group_gap = 260, 560, 12, 2, 14
@@ -151,12 +163,17 @@ def bar_chart(rows: list[dict], unexpected: list[str], sources: dict) -> str:
              f'xmlns="http://www.w3.org/2000/svg" role="img" '
              f'style="width:100%;height:auto;font-family:inherit">']
     y = 4
-    for name, decl, act in entries:
+    for name, decl, act, decl_label in entries:
         ty = y + group_h / 2 + 4
         parts.append(f'<text x="{label_w - 8}" y="{ty}" text-anchor="end" '
                      f'font-size="13" fill="rgba(255,255,255,.8)">{esc(name)}</text>')
         for i, (v, color) in enumerate(((decl, DECLARED_COLOR), (act, ACTUAL_COLOR))):
             by = y + i * (bar_h + gap)
+            if v is None:  # record-declared: no byte bar, just the count text
+                parts.append(f'<text x="{label_w + 6}" y="{by + bar_h - 2}" '
+                             f'font-size="11" fill="rgba(255,255,255,.4)">'
+                             f'{esc(decl_label)}</text>')
+                continue
             w = width(v)
             parts.append(f'<rect x="{label_w}" y="{by}" width="{w:.1f}" '
                          f'height="{bar_h}" rx="2" fill="{color}"/>')
@@ -183,8 +200,7 @@ def service_table(rows: list[dict], unexpected: list[str], sources: dict) -> str
            '<th class="num">Uncompressed (actual)</th><th class="num">%</th>'
            '<th>Flags</th></tr>']
     for r in rows:
-        decl = (f'{r["declared_records"]:,} records'
-                if r["declared_records"] is not None
+        decl = (record_label(r) if r["declared_records"] is not None
                 else common.human_bytes(r["declared_bytes"]))
         pct = f'{r["pct"]:.1f}%' if r["pct"] is not None else "—"
         flags = " ".join(badge(*FLAG_BADGES[f]) for f in r["flags"]) or ""
@@ -272,15 +288,42 @@ def build_html(s: dict) -> str:
     pct_txt = f"{pct:.1f}%" if pct is not None else "—"
     bar = (f'<div class="progress"><div style="width:{min(pct or 0, 100):.1f}%">'
            f'</div></div>' if pct is not None else "")
-    kpis.append(f'<div class="card"><div class="label">Complete vs manifest'
-                f'</div><div class="value">{pct_txt}</div>{bar}</div>')
+    # When a service is unit-adjusted (equivalent_bytes), the headline sums raw
+    # measured bytes while that service's ROW scores like for like — so publish
+    # both, adjacent, rather than letting the gap sit unstated.
+    adj_pct = s.get("pct_complete_adjusted")
+    adj_delta = s.get("equivalent_adjustment") or 0
+    if adj_pct is not None and adj_delta:
+        kpis.append(
+            f'<div class="card"><div class="label">Complete vs manifest'
+            f'</div><div class="value">{adj_pct:.1f}%</div>'
+            f'<div class="progress"><div style="width:{min(adj_pct, 100):.1f}%">'
+            f'</div></div>'
+            f'<div class="sub">unit-adjusted &mdash; counts unit-adjusted '
+            f'services in the manifest\u2019s own unit '
+            f'(+{common.human_bytes(adj_delta)}).<br>Raw measured bytes: '
+            f'{pct_txt}. See &ldquo;Reading these numbers&rdquo;.</div></div>')
+    else:
+        kpis.append(f'<div class="card"><div class="label">Complete vs manifest'
+                    f'</div><div class="value">{pct_txt}</div>{bar}</div>')
     # The dedup/exclusion arithmetic is disclosed in the "Reading these numbers"
     # notes (reconcile.duplicate_prefix_note / excluded_prefix_note), so the KPI
     # card carries only the headline and the compressed figure.
+    # Lead with the unit-adjusted figure: where a service is unit-adjusted the
+    # raw total is a MIXTURE of units (checkmate: parquet decompressed, avro
+    # still compressed because blob_kind has no .avro branch), so the adjusted
+    # number is the more honest answer to "uncompressed".
+    recv = (s["uncompressed_total_adjusted"] if adj_delta
+            else s["uncompressed_total"])
     kpis.append(f'<div class="card"><div class="label">Received (uncompressed)'
                 f'</div><div class="value">'
-                f'{common.human_bytes(s["uncompressed_total"])}</div>'
-                f'<div class="sub">compressed in storage: '
+                f'{common.human_bytes(recv)}</div>'
+                f'<div class="sub">'
+                + (f'as measured by the sizer: '
+                   f'{common.human_bytes(s["uncompressed_total"])} '
+                   f'(unit-adjusted services counted in their measured unit)'
+                   f'<br>' if adj_delta else "")
+                + f'compressed in storage: '
                 f'{common.human_bytes(run["totals"]["compressed_bytes"]) if run else "—"}'
                 f'</div></div>')
     kpis.append(f'<div class="card"><div class="label">Declared total (manifest)'

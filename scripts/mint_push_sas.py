@@ -21,7 +21,11 @@ Every mint is recorded in `companies/.sas-ledger.json` — METADATA ONLY
 lives only inside the zip. `page` renders the ledger as
 `reports/sas-tokens.html`.
 
-  mint_push_sas.py mint <slug> [--days N] [--note TEXT] [--dry-run]
+  mint_push_sas.py mint <slug> [--days N] [--note TEXT] [--read-only] [--dry-run]
+
+`--read-only` mints an `rl` (read+list) DOWNLOAD token instead — for a data
+buyer pulling the corpus out — with download instructions in the zip. The
+default stays the racwl push token; the ledger records which was minted.
   mint_push_sas.py list  [--root companies]
   mint_push_sas.py page  [--root companies] [--out reports/sas-tokens.html]
 
@@ -50,6 +54,7 @@ import common
 # a single engagement that needs longer uses --days instead.
 DEFAULT_EXPIRY_DAYS = 14
 PERMISSIONS = "racwl"  # read/add/create/write/list — no delete, ever
+READ_PERMISSIONS = "rl"  # --read-only: download token for a data buyer
 
 LEDGER_NAME = ".sas-ledger.json"
 
@@ -79,26 +84,56 @@ def token_view(entry: dict, now) -> dict:
     return out
 
 
-def build_credentials_txt(cfg: dict, sas_url: str, expiry: str) -> str:
+def build_credentials_txt(cfg: dict, sas_url: str, expiry: str,
+                          permissions: str = PERMISSIONS) -> str:
     account, container = cfg["storage_account"], cfg["container"]
+    firewall = f"""Network ACL — the storage account firewall is default-deny. Your egress IP
+must be on the allowlist or every request returns 403 even with a valid SAS.
+Send us the current one and we will add it:
+  az storage account network-rule add \\
+    -g {cfg['resource_group']} \\
+    --account-name {account} \\
+    --ip-address <your-ip>"""
+    if permissions == READ_PERMISSIONS:
+        return f"""Azure download credentials — {cfg['slug']}
+
+Storage account : {account}
+Container       : {container}
+Permissions     : {permissions} (read/list — download only, no write)
+Expires (UTC)   : {expiry}
+
+SAS URL (treat as a secret; anyone holding it can read the container):
+
+  {sas_url}
+
+{firewall}
+
+Download options:
+
+  azcopy (recommended; native chunking + retry):
+    # macOS:   brew install azcopy
+    # Linux/Windows: https://aka.ms/downloadazcopy
+    azcopy copy "<SAS URL above>" "./<local-dir>/" --recursive
+
+  curl (single blob):
+    curl -o <local-file> \\
+      "https://{account}.blob.core.windows.net/{container}/<blob-path>?<sas-query-only>"
+
+List the container's contents:
+  azcopy list "<SAS URL above>"
+"""
     return f"""Azure push credentials — {cfg['slug']}
 
 Storage account : {account}
 Container       : {container}
-Permissions     : {PERMISSIONS} (read/add/create/write/list — no delete)
+Permissions     : {permissions} (read/add/create/write/list — no delete)
 Expires (UTC)   : {expiry}
 
 SAS URL (treat as a secret; anyone holding it can write to the container):
 
   {sas_url}
 
-Network ACL — the storage account firewall is default-deny. Your egress IP
-must be on the allowlist or every request returns 403 even with a valid SAS.
-Send us the current one and we will add it:
-  az storage account network-rule add \\
-    -g {cfg['resource_group']} \\
-    --account-name {account} \\
-    --ip-address <your-ip>
+{firewall}
 
 Push options:
 
@@ -133,16 +168,17 @@ def zip_with_password(source_txt: Path, out_zip: Path, password: str) -> None:
 def cmd_mint(root: Path, args) -> dict:
     cfg = common.load_config(root, args.slug)
     common.ensure_subscription(args.dry_run)
+    permissions = READ_PERMISSIONS if args.read_only else PERMISSIONS
     now = common.utc_now()
     expiry = common.iso(now + timedelta(days=args.days))
     proc = common.run_az(["storage", "container", "generate-sas",
                           "--account-name", cfg["storage_account"],
                           "-n", cfg["container"],
-                          "--permissions", PERMISSIONS,
+                          "--permissions", permissions,
                           "--expiry", expiry, "--https-only",
                           "-o", "tsv"], dry_run=args.dry_run, timeout=120)
     summary = {"slug": args.slug, "storage_account": cfg["storage_account"],
-               "container": cfg["container"], "permissions": PERMISSIONS,
+               "container": cfg["container"], "permissions": permissions,
                "days": args.days, "expires_at": expiry}
     if args.dry_run:
         summary["dry_run"] = True
@@ -154,17 +190,19 @@ def cmd_mint(root: Path, args) -> dict:
 
     # The deliverable: password-protected zip in the gitignored company dir.
     # The SAS lives only inside it; the password only on stdout.
+    kind = "read" if args.read_only else "push"
     out_zip = (common.company_dir(root, args.slug)
-               / f"{args.slug}-push-sas-{common.ts_basic(now)}.zip")
+               / f"{args.slug}-{kind}-sas-{common.ts_basic(now)}.zip")
     password = secrets.token_urlsafe(16)
     with tempfile.TemporaryDirectory() as td:
         tmp_txt = Path(td) / "sas-credentials.txt"
-        tmp_txt.write_text(build_credentials_txt(cfg, sas_url, expiry))
+        tmp_txt.write_text(build_credentials_txt(cfg, sas_url, expiry,
+                                                 permissions))
         zip_with_password(tmp_txt, out_zip, password)
 
     entry = {"id": f"{args.slug}-{common.ts_basic(now)}", "slug": args.slug,
              "storage_account": cfg["storage_account"],
-             "container": cfg["container"], "permissions": PERMISSIONS,
+             "container": cfg["container"], "permissions": permissions,
              "signing": "account-key", "created_at": common.iso(now),
              "expires_at": expiry, "days": args.days,
              "note": args.note or "", "zip": str(out_zip),
@@ -273,11 +311,15 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("mint", parents=[root_ap],
-                       help="mint a racwl push SAS for one company")
+                       help="mint a racwl push SAS for one company "
+                            "(--read-only for an rl download SAS)")
     p.add_argument("slug")
     p.add_argument("--days", type=int, default=DEFAULT_EXPIRY_DAYS,
                    help=f"expiry in days (default {DEFAULT_EXPIRY_DAYS})")
     p.add_argument("--note", default="", help="ledger note (who/why)")
+    p.add_argument("--read-only", action="store_true",
+                   help="mint an rl (read+list) download SAS instead of the "
+                        "racwl push SAS — for a data buyer pulling the corpus")
     p.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("list", parents=[root_ap],

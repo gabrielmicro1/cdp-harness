@@ -20,3 +20,6 @@ scripts/sas-mint/.venv/
 
 # minted credential zips never belong in git
 *-sas.zip
+
+# client Slack exports used for schema work; never in git (real workspace data)
+slack-export.zip
