@@ -11,7 +11,11 @@ dance, no 403 propagation waits).
 
 The deliverable is a password-protected zip (the sas-mint packaging:
 ZipCrypto via the system `zip` CLI, so `unzip -P` works anywhere) holding a
-sas-credentials.txt with the SAS URL + push instructions. It lands in
+sas-credentials.txt with the SAS URL + push instructions, plus
+client_push.sh — the client's upload helper, so the zip is self-sufficient
+and nobody has to chase a second attachment. (`--read-only` omits the
+helper: a buyer downloads, never pushes. Same split as the platform's
+partner-vs-client bundles.) It lands in
 `companies/<slug>/` (gitignored — a credential zip can never be committed);
 the password is a fresh secrets.token_urlsafe(16) printed to stdout only.
 Send the zip and the password over different channels.
@@ -58,6 +62,19 @@ READ_PERMISSIONS = "rl"  # --read-only: download token for a data buyer
 
 LEDGER_NAME = ".sas-ledger.json"
 
+# The client's upload helper, shipped inside every push zip. Vendored
+# BYTE-IDENTICAL from cdp-platform `app/templates/client_push.sh`, which is
+# the source of truth — re-copy it rather than editing this one, and keep
+# `diff` between them clean. It is also the consumer of the `SAS URL:`
+# contract in build_credentials_txt() below.
+CLIENT_PUSH_SCRIPT = Path(__file__).resolve().parent / "templates" / "client_push.sh"
+
+
+def load_client_push_script() -> str:
+    if not CLIENT_PUSH_SCRIPT.is_file():
+        raise RuntimeError(f"push helper template missing: {CLIENT_PUSH_SCRIPT}")
+    return CLIENT_PUSH_SCRIPT.read_text()
+
 
 def ledger_path(root: Path) -> Path:
     return root / LEDGER_NAME
@@ -86,6 +103,19 @@ def token_view(entry: dict, now) -> dict:
 
 def build_credentials_txt(cfg: dict, sas_url: str, expiry: str,
                           permissions: str = PERMISSIONS) -> str:
+    """The sas-credentials.txt body that goes inside the zip.
+
+    The `SAS URL:` label and the URL on the IMMEDIATELY following line are a
+    machine-read contract, not prose: the client's push helper
+    (cdp-platform `app/templates/client_push.sh`) reads them with one awk
+    one-liner — `/^SAS URL:/{getline; sub(/^[[:space:]]+/,""); print}` — so
+    decorating the label ("SAS URL (treat as a secret...):") or slipping a
+    blank line between label and value silently breaks every client upload
+    with "could not read SAS URL from sas-credentials.txt". Clients already
+    hold their copy of that script, so this file is the side that must
+    conform. Same shape as scripts/sas-mint/mint_sas.py and the platform
+    backend's _compose_credentials_file. Warnings go ABOVE the label.
+    """
     account, container = cfg["storage_account"], cfg["container"]
     firewall = f"""Network ACL — the storage account firewall is default-deny. Your egress IP
 must be on the allowlist or every request returns 403 even with a valid SAS.
@@ -102,8 +132,10 @@ Container       : {container}
 Permissions     : {permissions} (read/list — download only, no write)
 Expires (UTC)   : {expiry}
 
-SAS URL (treat as a secret; anyone holding it can read the container):
+Treat the SAS URL below as a secret — anyone holding it can read the
+container until it expires.
 
+SAS URL:
   {sas_url}
 
 {firewall}
@@ -129,8 +161,10 @@ Container       : {container}
 Permissions     : {permissions} (read/add/create/write/list — no delete)
 Expires (UTC)   : {expiry}
 
-SAS URL (treat as a secret; anyone holding it can write to the container):
+Treat the SAS URL below as a secret — anyone holding it can write to the
+container until it expires.
 
+SAS URL:
   {sas_url}
 
 {firewall}
@@ -143,6 +177,13 @@ Push options:
     azcopy copy "./<local-file>" "<SAS URL above>"
     azcopy copy "./<local-dir>/" "<SAS URL above>" --recursive
 
+  client_push.sh (bundled in this zip — the easiest path for a whole tree):
+    Put each source in its own folder under one directory, then run the
+    script from the folder holding this sas-credentials.txt. Every
+    immediate subfolder uploads to the matching folder in the container,
+    so ./exports/gdrive/ lands at <container>/gdrive/:
+    ./client_push.sh --source-dir ./exports
+
   curl (single file):
     curl -X PUT -H "x-ms-blob-type: BlockBlob" \\
       --data-binary @<local-file> \\
@@ -153,16 +194,17 @@ Verify uploads arrived:
 """
 
 
-def zip_with_password(source_txt: Path, out_zip: Path, password: str) -> None:
+def zip_with_password(sources: list, out_zip: Path, password: str) -> None:
     # ZipCrypto via the system `zip` CLI (sas-mint precedent): universal
     # `unzip -P` support. Not AES — the out-of-band password split is doing
-    # the real work.
+    # the real work. `zip` carries unix permissions, so client_push.sh comes
+    # out of `unzip` still executable.
     if not shutil.which("zip"):
         raise RuntimeError("`zip` CLI not found on PATH")
     if out_zip.exists():
         out_zip.unlink()
-    subprocess.check_call(["zip", "-j", "-q", "-P", password,
-                           str(out_zip), str(source_txt)])
+    subprocess.check_call(["zip", "-j", "-q", "-P", password, str(out_zip)]
+                          + [str(p) for p in sources])
 
 
 def cmd_mint(root: Path, args) -> dict:
@@ -198,7 +240,15 @@ def cmd_mint(root: Path, args) -> dict:
         tmp_txt = Path(td) / "sas-credentials.txt"
         tmp_txt.write_text(build_credentials_txt(cfg, sas_url, expiry,
                                                  permissions))
-        zip_with_password(tmp_txt, out_zip, password)
+        bundle = [tmp_txt]
+        if not args.read_only:
+            # Push bundles carry the helper; read bundles do not (a buyer
+            # downloads). Staged 0o755 so it survives the zip executable.
+            tmp_sh = Path(td) / "client_push.sh"
+            tmp_sh.write_text(load_client_push_script())
+            tmp_sh.chmod(0o755)
+            bundle.append(tmp_sh)
+        zip_with_password(bundle, out_zip, password)
 
     entry = {"id": f"{args.slug}-{common.ts_basic(now)}", "slug": args.slug,
              "storage_account": cfg["storage_account"],

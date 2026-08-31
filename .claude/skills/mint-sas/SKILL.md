@@ -8,8 +8,9 @@ description: Use when a client needs credentials to push data into their -raw co
 Input: a company slug (must already be onboarded — config.json is the source
 of the storage account + container). Output: a password-protected zip in
 `companies/<slug>/` holding the `racwl` (no delete) container SAS +
-push instructions, the zip password (stdout only), a ledger entry in
-`companies/.sas-ledger.json`, and on request `reports/sas-tokens.html`.
+push instructions + the `client_push.sh` upload helper, the zip password
+(stdout only), a ledger entry in `companies/.sas-ledger.json`, and on
+request `reports/sas-tokens.html`.
 
 ## Steps
 
@@ -39,6 +40,15 @@ push instructions, the zip password (stdout only), a ledger entry in
    it into a file, a report, a commit, or a Slack draft yourself.
    Encryption is ZipCrypto (`unzip -P` works everywhere, not AES) — the
    out-of-band split is doing the real protective work.
+   - The zip is **self-sufficient**: it also carries `client_push.sh`, so
+     the client needs no second attachment. `--read-only` ships credentials
+     ONLY — a buyer downloads, never pushes (the platform's
+     partner-vs-client bundle split).
+   - **Never hand-edit `sas-credentials.txt`.** Its `SAS URL:` label and the
+     URL on the immediately following line are a machine-read contract:
+     `client_push.sh` pulls them with one awk line, and decorating the label
+     or adding a blank line under it fails every client upload with
+     "could not read SAS URL from sas-credentials.txt".
 
 3. **Regenerate the tokens page** after every mint, unprompted (the
    always-regenerate-report discipline):

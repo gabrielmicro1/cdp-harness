@@ -6398,6 +6398,61 @@ def main() -> int:
     check("credentials txt warns about the default-deny firewall",
           "network-rule add" in creds_txt and "403" in creds_txt
           and "rg-democo" in creds_txt)
+
+    # The SAS URL field is a MACHINE-READ contract, not prose: the client's
+    # push helper (cdp-platform app/templates/client_push.sh) pulls it with
+    # one awk one-liner — `/^SAS URL:/` then the very next line. Run that
+    # exact awk here rather than re-implementing it, so the test fails if
+    # either side drifts. Same shape as scripts/sas-mint/mint_sas.py and the
+    # platform backend's _compose_credentials_file.
+    CLIENT_PUSH_AWK = (r'/^SAS URL:/{getline; sub(/^[[:space:]]+/,""); '
+                       r'print; exit}')
+
+    def _client_push_parse(txt: str) -> str:
+        """Exactly what client_push.sh does to sas-credentials.txt."""
+        return subprocess.run(["awk", CLIENT_PUSH_AWK], input=txt,
+                              capture_output=True, text=True).stdout.strip()
+
+    check("client_push.sh can parse the SAS URL out of the push credentials",
+          _client_push_parse(creds_txt)
+          == f"https://stdemoco.blob.core.windows.net/democo-raw?{FAKE_SAS}")
+
+    # The push bundle ships the helper itself, so a client can upload with
+    # nothing but the zip. Mirrors the platform's partner bundle; the
+    # read-only bundle below deliberately omits it.
+    script_in_zip = Path(unz) / "client_push.sh"
+    check("push zip ships client_push.sh alongside the credentials",
+          script_in_zip.is_file()
+          and script_in_zip.read_text()
+          == (REPO / "scripts" / "templates" / "client_push.sh").read_text())
+    check("shipped client_push.sh keeps its executable bit through the zip",
+          os.access(script_in_zip, os.X_OK))
+    check("push credentials point the client at the bundled helper",
+          "client_push.sh" in creds_txt)
+
+    # End-to-end: run the SHIPPED script against the SHIPPED credentials with
+    # a stub azcopy, and assert the per-source targets it builds. This is the
+    # whole contract in one check — label, layout, and the container/query
+    # split client_push.sh does on the URL.
+    e2e = Path(tempfile.mkdtemp(prefix="cdp-sas-e2e-"))
+    (e2e / "bin").mkdir()
+    stub = e2e / "bin" / "azcopy"
+    stub.write_text("#!/bin/sh\necho \"azcopy $*\"\n")
+    stub.chmod(0o755)
+    for src in ("gdrive", "slack"):
+        (e2e / "exports" / src).mkdir(parents=True)
+        (e2e / "exports" / src / "f.txt").write_text("x")
+    e2e_env = dict(os.environ, PATH=f"{e2e / 'bin'}:{os.environ['PATH']}")
+    shutil.copy(creds, e2e / "sas-credentials.txt")
+    e2e_run = subprocess.run(
+        ["bash", str(script_in_zip), "--source-dir", "./exports"],
+        cwd=e2e, env=e2e_env, capture_output=True, text=True)
+    want = (f"https://stdemoco.blob.core.windows.net/democo-raw"
+            f"/gdrive/?{FAKE_SAS}")
+    check("shipped client_push.sh drives azcopy at the right per-source target",
+          e2e_run.returncode == 0 and want in e2e_run.stdout
+          and "uploaded 2 source(s)" in e2e_run.stdout)
+    shutil.rmtree(e2e)
     p_bad = subprocess.run(["unzip", "-o", "-P", "wrong-password", "-d", unz,
                             str(zip_path)], capture_output=True, text=True)
     check("zip refuses a wrong password", p_bad.returncode != 0)
@@ -6416,6 +6471,11 @@ def main() -> int:
           "download credentials" in r_txt and "read/list" in r_txt
           and "x-ms-blob-type" not in r_txt
           and "network-rule add" in r_txt)
+    check("read-only credentials keep the same parseable SAS URL field",
+          _client_push_parse(r_txt)
+          == f"https://stdemoco.blob.core.windows.net/democo-raw?{FAKE_SAS}")
+    check("read-only zip omits the push helper (buyers do not upload)",
+          not (Path(r_unz) / "client_push.sh").exists())
     shutil.rmtree(r_unz)
 
     # Ledger/page are offline-testable without az: seed entries directly —

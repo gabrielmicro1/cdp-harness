@@ -130,7 +130,14 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   corpus_sizer_rest.py       # portable stdlib+SAS sizer; runs locally, detached
   discover_company.py        # az discovery for onboarding → config.json
   mint_push_sas.py           # client push SAS: account-key racwl mint (14-day
-                             # default), .sas-ledger.json, reports/sas-tokens.html
+                             # default), .sas-ledger.json, reports/sas-tokens.html;
+                             # the zip bundles sas-credentials.txt + client_push.sh
+  templates/client_push.sh   # the client's azcopy upload helper, shipped inside every
+                             # push zip. VENDORED byte-identical from cdp-platform
+                             # app/templates/client_push.sh (the source of truth) —
+                             # re-copy, never edit here. It parses the credentials
+                             # file's "SAS URL:" line + the next line, so that field
+                             # is a contract, not prose
   offboard_company.py        # offboard/restore/list: move a company to/from
                              #   companies/.archive/ (local only; Azure untouched)
   size_company.py            # single-company sizing CLI (fleet of one)
