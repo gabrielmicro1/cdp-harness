@@ -205,7 +205,8 @@ def _phase_launch(cfg: dict, root: Path, vm: dict, args) -> dict:
         f"AZURE_STORAGE_SAS='{sas}'",
         f"TAG='{tag}'",
         f"OUT_DIR='{WORK_DIR}'",
-        "DEEP_VERIFY='1'",
+        ("DEEP_VERIFY='0'" if getattr(args, "shallow", False)
+         else "DEEP_VERIFY='1'"),
         f"SIZER_WORKERS='{args.workers}'",
         f"LIST_WORKERS='{args.list_workers}'",
     ]
@@ -274,9 +275,15 @@ def _phase_harvest(cfg: dict, root: Path, vm: dict, args) -> dict:
     except ValueError:
         pass
     ver = summary.get("verification") or {}
-    notes = [f"deep verify on VM {vm['name']} ({vm.get('location')}): "
-             f"{ver.get('stream_compressed_bytes', 0) / 1e12:.2f} TB "
-             f"compressed streamed server-side"]
+    if getattr(args, "shallow", False):
+        notes = [f"shallow sizing on VM {vm['name']} ({vm.get('location')}): "
+                 "in-region listing; archives sized from zip central "
+                 "directories / gz trailers — no streaming, so this run "
+                 "carries no verification coverage"]
+    else:
+        notes = [f"deep verify on VM {vm['name']} ({vm.get('location')}): "
+                 f"{ver.get('stream_compressed_bytes', 0) / 1e12:.2f} TB "
+                 f"compressed streamed server-side"]
     run = phases.summary_to_run(
         slug, summary,
         {"metric": metric, "metric_at": vm["tags"].get("used_capacity_at")},
@@ -404,6 +411,11 @@ def main() -> int:
     p.add_argument("--sas-days", type=int, default=1, choices=(1, 2),
                    help="rl SAS expiry (2 for containers whose compressed "
                         "bytes exceed ~a day of streaming)")
+    p.add_argument("--shallow", action="store_true",
+                   help="shallow sizing (DEEP_VERIFY off): in-region "
+                        "listing speed without stream-decompressing "
+                        "every archive. Writes a normal sized run "
+                        "with verification=null.")
     p.add_argument("--workers", type=int, default=16,
                    help="SIZER_WORKERS on the VM")
     p.add_argument("--list-workers", type=int, default=8,

@@ -6492,6 +6492,15 @@ def main() -> int:
     check("diff: matched", _d["matched"] == 1 and _d["matched_bytes"] == 10)
     check("diff: sidecar counted apart from dest_only",
           _d["dest_only"] == 1 and _d["sidecars"] == 1)
+    check("azure_name strips trailing dots per segment",
+          spp.azure_name("A Pvt. Ltd./Docs/f.txt") == "A Pvt. Ltd/Docs/f.txt"
+          and spp.azure_name("plain/path.txt") == "plain/path.txt")
+    _dot_exp = {"Corp Pvt. Ltd./Docs/f.xlsx": (99, "d", "i", "m")}
+    _dot_dest = {"Corp Pvt. Ltd/Docs/f.xlsx": 99}   # what Azure stored
+    _dd = spp.diff_folder(_dot_exp, _dot_dest)
+    check("trailing-dot path is MATCHED, not a phantom gap",
+          _dd["missing"] == [] and _dd["matched"] == 1
+          and _dd["dest_only"] == 0)
 
     check("classify table",
           [spp.classify(s, "delta") for s in
@@ -6508,6 +6517,10 @@ def main() -> int:
     check("widened block ids match a foreign 48-char id set",
           len({len(b[0]) for b in _bp36}) == 1 and len(_bp36[0][0]) == 48
           and [b[1] for b in _bp36] == [b[1] for b in _bp])
+    check("padded vs unpadded 12-char ids decode to different widths",
+          len(base64.b64decode(spp._block_id(0, 8))) == 8
+          and len(base64.b64decode(spp._block_id(0, 9))) == 9
+          and len(spp._block_id(0, 8)) == len(spp._block_id(0, 9)) == 12)
     check("widened ids stay decodable + distinct",
           base64.b64decode(_bp36[0][0]) == b"0" * 36
           and len({b[0] for b in _bp36}) == 3)
@@ -6552,6 +6565,28 @@ def main() -> int:
     check("mapping-suspect: sliver folders exempt",
           not spp.mapping_suspect({"matched": 0, "mismatched": [],
                                    "dest_only": 30}, 500))
+
+    _ord_exp = {"a": (10, "d", "i", "m"), "b": (5_000_000, "d", "i", "m"),
+                "c": (900, "d", "i", "m")}
+    _ord = sorted(["a", "b", "c"], key=lambda r: -_ord_exp[r][0])
+    check("size-desc puts the byte-heavy files first",
+          _ord == ["b", "c", "a"])
+
+    _mdir = tmp / "spmani"
+    _exp5 = {"Documents/a.txt": (10, "d1", "i1", "text/plain"),
+             "Documents/b.bin": (20, "d1", "i2", "application/octet-stream")}
+    spp.write_manifest(_mdir, "SiteX", "https://h/sites/x", _exp5)
+    check("manifest round-trips through load_manifest",
+          spp.load_manifest(_mdir / "SiteX.tsv.gz") == _exp5)
+    _legacy = _mdir / "Legacy.tsv.gz"
+    with gzip.open(_legacy, "wt", encoding="utf-8") as _fh:
+        _fh.write("#site\tLegacy\thttps://h/sites/l\n")
+        _fh.write("Documents/old.txt\t7\td9\ti9\n")     # 4-column, pre-mime
+    _lm = spp.load_manifest(_legacy)
+    check("4-column legacy manifest still loads, mime guessed",
+          list(_lm) == ["Documents/old.txt"]
+          and _lm["Documents/old.txt"][:3] == (7, "d9", "i9")
+          and _lm["Documents/old.txt"][3] == "text/plain")
 
     _pb = spp.PaceBucket(12.0, 16.0)
     _pb.throttled()

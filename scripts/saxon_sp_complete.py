@@ -853,6 +853,11 @@ def cmd_transfer(root: Path, args) -> dict:
         env_extra += f"export WORKERS={args.workers}; "
     if args.copy_threads:
         env_extra += f"export COPY_THREADS={args.copy_threads}; "
+    if args.copy_order:
+        env_extra += f"export COPY_ORDER={args.copy_order}; "
+    if args.reuse_manifest_hours:
+        env_extra += (f"export REUSE_MANIFEST_HOURS="
+                      f"{args.reuse_manifest_hours}; ")
     if args.refresh_sites:
         env_extra += "export REFRESH_SITES=1; "
     if args.allow_no_calibration:
@@ -943,9 +948,19 @@ def cmd_harvest(root: Path, args) -> dict:
     cfg = eng.load_cfg(root, args.slug)
     vm = eng.require_vm(SPEC, cfg, args.slug, args.dry_run)
     run_dir = state_dir(root) / f"run-{common.ts_basic()}"
-    remote = (f"cd {XFER_DIR} && tar czf - "
-              "state.json results.jsonl run-summary.json manifests "
-              "2>/dev/null")
+    # Only tar what EXISTS: run-summary.json is written at the end of a
+    # pass, so naming it unconditionally made tar exit nonzero and killed
+    # every mid-run harvest — the one moment (a deadline, a pass still
+    # copying) when harvesting matters most.
+    # Only tar what EXISTS: run-summary.json is written at the end of a
+    # pass, so naming it unconditionally made tar exit nonzero and killed
+    # every mid-run harvest — the one moment (a deadline, a pass still
+    # copying) when harvesting matters most. `;` not `&&`: ls itself
+    # exits nonzero whenever one of the named files is absent, which is
+    # the normal mid-run case.
+    remote = (f"cd {XFER_DIR}; F=$(ls -d state.json results.jsonl "
+              "run-summary.json progress.json manifests 2>/dev/null); "
+              "tar czf - $F")
     if args.dry_run:
         print(f"DRY-RUN: ssh {eng.ADMIN_USER}@{vm['public_ip']} '{remote}' "
               f"> {run_dir}/")
@@ -1190,6 +1205,20 @@ def main() -> int:
     p.add_argument("--max-rps", dest="max_rps", type=float, default=0.0,
                    help="transfer: adaptive ceiling (default 16)")
     p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--copy-order", dest="copy_order", default=None,
+                   choices=["walk", "size-desc"],
+                   help="transfer: 'size-desc' copies biggest files first "
+                        "— a file costs ~2 paced calls regardless of size, "
+                        "so under a deadline this maximises bytes landed "
+                        "(VSS1: top 25k of 1.06M files = 87%% of bytes). "
+                        "Reorders only; nothing is excluded.")
+    p.add_argument("--reuse-manifest-hours", dest="reuse_manifest_hours",
+                   type=float, default=0.0,
+                   help="transfer: reuse a site's manifest if it is younger "
+                        "than N hours instead of re-walking it (a VSS1-"
+                        "scale re-walk is ~2h before any byte moves). The "
+                        "dest is still re-diffed fresh, so this can only "
+                        "miss items created at SOURCE since that walk.")
     p.add_argument("--copy-threads", dest="copy_threads", type=int,
                    default=0,
                    help="transfer: per-site copy pool size (default 8) — "

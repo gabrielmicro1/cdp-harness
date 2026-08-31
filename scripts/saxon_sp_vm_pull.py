@@ -90,6 +90,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -203,6 +204,20 @@ def plan_sites(mapping: dict, only_sites: set[str] | None,
     return rows
 
 
+def azure_name(rel: str) -> str:
+    """PURE. The name Azure ACTUALLY stores for a given SharePoint path.
+
+    Azure Blob Storage strips a trailing dot from each path segment, so a
+    SharePoint folder legitimately named "Aditya Birla ... Pvt. Ltd."
+    lands as ".../Pvt. Ltd/...". The copy succeeds and a retry correctly
+    409s, but comparing the raw Graph path against a container listing
+    then reports a phantom gap — 204 already-delivered files (4.13 GB) on
+    Org-Presales alone, found 2026-08-30. Compare through this on BOTH
+    sides; keep the ORIGINAL path for building the copy URL (Azure
+    normalises that request itself)."""
+    return "/".join(seg.rstrip(".") for seg in rel.split("/"))
+
+
 def diff_folder(expected: dict[str, tuple], dest: dict[str, int]) -> dict:
     """PURE. Per-file name+size diff of one site folder.
 
@@ -214,9 +229,12 @@ def diff_folder(expected: dict[str, tuple], dest: dict[str, int]) -> dict:
     mystery extras; they are never candidates for anything."""
     missing, mismatched = [], []
     matched = matched_bytes = 0
+    # index the dest under Azure's stored form so a trailing-dot segment
+    # matches the Graph path it came from (see azure_name)
+    dest_norm = {azure_name(k): v for k, v in dest.items()}
     for rel, meta in expected.items():
         size = meta[0]
-        have = dest.get(rel)
+        have = dest_norm.get(azure_name(rel))
         if have is None:
             missing.append(rel)
         elif have != size:
@@ -226,8 +244,9 @@ def diff_folder(expected: dict[str, tuple], dest: dict[str, int]) -> dict:
             matched += 1
             matched_bytes += size
     sidecars = dest_only = dest_only_bytes = 0
+    expected_norm = {azure_name(k) for k in expected}
     for rel, size in dest.items():
-        if rel in expected:
+        if azure_name(rel) in expected_norm:
             continue
         if rel.endswith(".meta.json"):
             sidecars += 1
@@ -322,14 +341,22 @@ def existing_block_id_bytes(base_url: str, sas: str, name: str) -> int:
         root = ET.fromstring(body)
     except ET.ParseError:
         return 8
-    widths = {len(n.text or "") for n in root.iter("Name")}
-    widths.discard(0)
-    if len(widths) != 1:
+    # DECODE a real id — never infer the width from the base64 string
+    # length. "MDAwMDAwMDA=" and "MDAwMDAwMDAw" are both 12 chars but
+    # decode to 8 and 9 bytes; the (len//4)*3 arithmetic returned 9 for
+    # the padded form and Azure kept rejecting the block (ProjectDocs'
+    # two 1.6-1.7 GB mp4s, 2026-08-30).
+    raws = set()
+    for n in root.iter("Name"):
+        try:
+            raws.add(len(base64.b64decode((n.text or "").encode(),
+                                          validate=True)))
+        except Exception:  # noqa: BLE001 — a junk id must not break the probe
+            continue
+    raws.discard(0)
+    if len(raws) != 1:
         return 8
-    b64_len = widths.pop()
-    if b64_len % 4:
-        return 8
-    raw = (b64_len // 4) * 3          # un-padded base64 -> raw bytes
+    raw = raws.pop()
     return raw if 1 <= raw <= 64 else 8
 
 
@@ -963,17 +990,36 @@ def write_manifest(manifests_dir: Path, folder: str, site_url: str,
                    expected: dict[str, tuple]) -> Path:
     """manifests/<Folder>.tsv.gz — verify's authority on the laptop.
     Written atomically on walk completion; a crashed walk leaves no
-    half-manifest."""
+    half-manifest. Column 5 (mime) exists so a reused manifest can copy
+    without re-walking; 4-column manifests from earlier runs still load."""
     manifests_dir.mkdir(parents=True, exist_ok=True)
     path = manifests_dir / f"{folder}.tsv.gz"
     tmp = path.with_suffix(".gz.tmp")
     with gzip.open(tmp, "wt", encoding="utf-8") as fh:
         fh.write(f"#site\t{folder}\t{site_url}\n")
         for rel in sorted(expected):
-            size, drive_id, item_id, _mime = expected[rel]
-            fh.write(f"{rel}\t{size}\t{drive_id}\t{item_id}\n")
+            size, drive_id, item_id, mime = expected[rel]
+            fh.write(f"{rel}\t{size}\t{drive_id}\t{item_id}\t{mime}\n")
     os.replace(tmp, path)
     return path
+
+
+def load_manifest(path: Path) -> dict[str, tuple]:
+    """Read a manifest back into the expected-map shape. A 4-column
+    (pre-mime) manifest guesses the content type from the extension —
+    mime only sets the blob's Content-Type, never which bytes land."""
+    out: dict[str, tuple] = {}
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        for ln in fh:
+            if ln.startswith("#"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 4:
+                continue
+            mime = p[4] if len(p) > 4 and p[4] else (
+                mimetypes.guess_type(p[0])[0] or "application/octet-stream")
+            out[p[0]] = (int(p[1]), p[2], p[3], mime)
+    return out
 
 
 # ── the copy ─────────────────────────────────────────────────────────────────
@@ -1034,7 +1080,12 @@ def copy_file(api: GraphAPI, dest_base: str, sas: str, blob_name: str,
     bucket = api._bucket
 
     def _paced_fresh_url() -> str:
-        bucket.wait()
+        """NO bucket slot of its own: the first call makes no network
+        request at all (the url came with the item GET above) and a
+        re-resolve goes through api.get, which paces itself. Taking a
+        slot here burned one third of the budget on nothing — 3 slots
+        per file for 2 real SharePoint operations (measured on VSS1
+        running alone: 3.9 files/s against a ~20 rps bucket)."""
         return fresh_url()
 
     def _throttle_wait(e: CopyError, sleeps: int) -> int:
@@ -1230,16 +1281,37 @@ def pull_site(api: GraphAPI, row: dict, dest_folder: dict[str, int],
     """One site folder: walk -> manifest -> diff -> (unless DIFF_ONLY /
     gate pending) copy each missing file. Returns the site result row."""
     folder = row["folder"]
-    walk = walk_collection(api, row.get("site_ids") or [])
+    # A re-walk of a monster site costs hours before one byte moves
+    # (VSS1: 122 min for 1.66M items), which made every restart brutally
+    # expensive. REUSE_MANIFEST_HOURS loads a recent manifest instead.
+    # Safe because the DEST is always re-diffed fresh — a reused manifest
+    # can only miss items created at SOURCE since it was written, never
+    # re-copy or overwrite anything; the run summary records the reuse so
+    # verify's authority is never silently stale.
+    mpath = ctx["manifests_dir"] / f"{folder}.tsv.gz"
+    reuse_h = ctx.get("reuse_manifest_hours") or 0
+    walk = None
+    if reuse_h and mpath.exists():
+        age_h = (time.time() - mpath.stat().st_mtime) / 3600.0
+        if age_h <= reuse_h:
+            expected = load_manifest(mpath)
+            if expected:
+                log(f"{folder}: reusing manifest from {age_h:.1f}h ago "
+                    f"({len(expected)} files) — walk skipped")
+                walk = {"expected": expected, "collisions": [],
+                        "drives_walked": -1, "errors": [], "reused": True}
+    if walk is None:
+        walk = walk_collection(api, row.get("site_ids") or [])
+        write_manifest(ctx["manifests_dir"], folder,
+                       row.get("site_url") or "", walk["expected"])
     expected = walk["expected"]
-    write_manifest(ctx["manifests_dir"], folder, row.get("site_url") or "",
-                   expected)
     diff = diff_folder(expected, dest_folder)
     result = {
         "folder": folder, "site_url": row.get("site_url"),
         "calibrate": bool(row.get("calibrate")),
         "webs": len(row.get("site_ids") or []),
         "drives_walked": walk["drives_walked"],
+        "manifest_reused": bool(walk.get("reused")),
         "expected_files": len(expected),
         "expected_bytes": sum(v[0] for v in expected.values()),
         "matched": diff["matched"], "matched_bytes": diff["matched_bytes"],
@@ -1282,7 +1354,17 @@ def pull_site(api: GraphAPI, row: dict, dest_folder: dict[str, int],
     copy_errors: list[dict] = []
     clock = threading.Lock()
     cq: queue.Queue = queue.Queue()
-    for rel in diff["missing"]:
+    # COPY_ORDER=size-desc: biggest files FIRST. A file costs ~2 paced
+    # SharePoint calls whether it is 2 KB or 900 MB, so under a deadline
+    # the byte yield per unit of rate budget is maximised by descending
+    # size. Measured on VSS1's missing set: the top 1,000 files carry 48%
+    # of the bytes and the top 25,000 carry 87%, while the 676,028 files
+    # under 4 KB hold 1%. This only REORDERS work — nothing is excluded,
+    # so an interrupted run simply resumes with the small tail.
+    order = list(diff["missing"])
+    if ctx.get("copy_order") == "size-desc":
+        order.sort(key=lambda rel: -expected[rel][0])
+    for rel in order:
         cq.put(rel)
 
     def copy_worker():
@@ -1444,6 +1526,8 @@ def main() -> int:
     rps = _env_float("RPS_GRAPH", DEFAULT_RPS_GRAPH)
     max_rps = _env_float("MAX_RPS", 16.0)
     copy_threads = int(_env_float("COPY_THREADS", 8))
+    reuse_manifest_hours = _env_float("REUSE_MANIFEST_HOURS", 0.0)
+    copy_order = os.environ.get("COPY_ORDER", "").strip() or "walk"
     workers = int(_env_float("WORKERS", DEFAULT_WORKERS))
     diff_only = os.environ.get("DIFF_ONLY", "").strip() == "1"
     refresh = os.environ.get("REFRESH_SITES", "").strip() == "1"
@@ -1483,7 +1567,8 @@ def main() -> int:
     cal_rows = [r for r in plan if r.get("calibrate")]
     rest_rows = [r for r in plan if not r.get("calibrate")]
     log(f"plan: {len(plan)} site(s) ({len(cal_rows)} calibration), "
-        f"workers={workers}, copy_threads={copy_threads}, rps={rps} "
+        f"workers={workers}, copy_threads={copy_threads}, "
+        f"order={copy_order}, rps={rps} "
         f"(adaptive to {max_rps}), diff_only={diff_only}")
     if not plan:
         log("FATAL: nothing to do (mapping has no action=complete rows "
@@ -1503,6 +1588,8 @@ def main() -> int:
     ctx = {"dest_base": dest_url, "sas": dest_sas,
            "dest_prefix": dest_prefix, "diff_only": diff_only,
            "copy_threads": copy_threads,
+           "reuse_manifest_hours": reuse_manifest_hours,
+           "copy_order": copy_order,
            "manifests_dir": base / "manifests"}
     state = RunState(base)
     results: list[dict] = []
