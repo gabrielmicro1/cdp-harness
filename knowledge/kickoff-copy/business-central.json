@@ -1,0 +1,17 @@
+{
+  "service_id": "business-central",
+  "display_name": "Microsoft Dynamics 365 Business Central",
+  "aliases": [
+    "Business Central",
+    "Dynamics 365 Business Central",
+    "D365 Business Central"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull completed Business Central BACPAC exports from a temporary Azure Blob container.\n\nPlease identify the tenant and environment so we can route the export. Include every customer-controlled company in that environment, and tell us only if a company must be excluded. We will also use the export date, expected file count, and total size for reconciliation.\n\nPlease:\n1. Export the databases to BACPAC files.\n2. Place the completed files in a temporary company-controlled Azure Blob container.\n3. Create a temporary container SAS with read and list permissions and enough time for transfer and validation.\n4. Submit the complete container SAS URL and export scope through the secure CDP platform. Please do not share the SAS URL in Slack.\n\nOnce submitted, let us know here and we'll verify access and begin the pull. After completion, you can revoke the SAS and remove the temporary container.\n\nIf you would prefer to push the BACPAC files instead, let us know.",
+  "notes": [
+    "The customer must attest tenant, environment, company, and export-date scope."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case business-central-bacpac-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

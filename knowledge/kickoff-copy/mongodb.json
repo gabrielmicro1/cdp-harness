@@ -1,0 +1,13 @@
+{
+  "service_id": "mongodb",
+  "display_name": "MongoDB",
+  "aliases": [
+    "Mongo DB"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull MongoDB directly using temporary read-only access.\n\nWe will include every customer-controlled database the temporary read-only user can access. Tell us only if a database or collection must be excluded.\n\nPlease:\n1. Create a temporary MongoDB user with read-only access to only the databases in scope.\n2. Allowlist the Micro1 transfer IP we provide.\n3. Submit the complete MongoDB SRV connection string through the secure CDP platform. Please do not share the connection string or password in Slack.\n\nOnce submitted, let us know the database names and expected collection counts here. We'll verify access and begin the pull. After completion, you can delete the temporary user and remove the IP rule.\n\nIf you would prefer to create and push a native database dump instead, let us know.",
+  "notes": [],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case mongodb-readonly-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

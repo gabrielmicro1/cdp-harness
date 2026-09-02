@@ -1,0 +1,17 @@
+{
+  "service_id": "dropbox-business",
+  "display_name": "Dropbox Business",
+  "aliases": [
+    "Dropbox"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: from a team admin account, go to [dropbox.com/developers/apps](http://dropbox.com/developers/apps) \u2192 Create app \u2192 Scoped access \u2192 Dropbox Business API \u2192 Permissions tab \u2192 tick Team member file access \u2192 create, then copy the app key and secret (or generated access token). That permission level is the one that covers team information, auditing, and acting as any team member, anything less won't see other people's files. Send the credential to us by secure means, never in plaintext email or chat.\n\nPlease let me know if you have questions or would prefer to push this data yourself.",
+  "notes": [
+    "A receipt for one private member namespace proves only that named namespace, not the complete Dropbox Business account.",
+    "Short-lived authorization codes and repeated authorization attempts can overwrite or invalidate earlier platform state.",
+    "Deleted, archived, suspended, or otherwise invisible namespaces require explicit scope and visibility reconciliation."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case dropbox-private-namespace-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

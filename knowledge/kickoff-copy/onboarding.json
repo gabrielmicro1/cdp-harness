@@ -1,0 +1,13 @@
+{
+  "service_id": "onboarding",
+  "display_name": "Onboarding",
+  "aliases": [],
+  "direction": null,
+  "status": "approved",
+  "message": "Please start with the [EDP Instructions]({instructions_url}) tab at the top of this channel. It includes the same-day setup steps, transfer walkthrough, detailed push guide, and instructions for sharing the public IP address of any machine you'll use for uploads.\n\nUnless you tell us otherwise, we will treat every registered service as a complete customer-controlled export rather than asking you to redefine the scope in each thread.\n\nOnce you've reviewed it, please reply in this thread confirming which same-day steps are complete and any questions you have. We'll then provide platform access and continue the setup in each service thread.",
+  "notes": [
+    "Requires the channel's EDP Instructions canvas to be recorded (record-canvas); the plan is blocked until then."
+  ],
+  "source": "ported from cdp-corpus-transfer-plugin drafting_core.render_onboarding (canvas variant)",
+  "updated_at": "2026-09-02T02:21:39Z"
+}

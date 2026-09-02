@@ -1,0 +1,17 @@
+{
+  "service_id": "peopleforce",
+  "display_name": "PeopleForce",
+  "aliases": [
+    "People Force",
+    "PeopleForce HR"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: People \u2192 Directory \u2192 Export to CSV/XLSX (admin rights required, no lower-role permission exists), plus Analytics \u2192 Custom report \u2192 three-dots \u2192 export for employee fields + custom tables, and Attendance \u2192 Menu \u2192 export for timesheets. Each run lands as a .csv or .xlsx download via the notification bar.\n- **We pull it**, Instructions: from an admin account, Settings \u2192 Open API keys (bottom of the page) \u2192 Generate API key \u2192 choose the Company key type, not the Career one, Career keys only see public vacancy data. Send us the key over secure means.\n\nPlease let me know if you would prefer to push this data yourself or have us pull it!",
+  "notes": [
+    "Exports require admin rights; no lower-role permission exists.",
+    "Career-type API keys only expose public vacancy data; only a Company key is usable."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case peopleforce-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

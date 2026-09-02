@@ -23,3 +23,9 @@ scripts/sas-mint/.venv/
 
 # client Slack exports used for schema work; never in git (real workspace data)
 slack-export.zip
+
+# client mailbox extracts staged at the repo root; never in git (real client mail)
+*.mbox
+
+# preserved evidence copies (client meeting transcripts, metadata); never in git
+evidence/

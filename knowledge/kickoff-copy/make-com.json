@@ -1,0 +1,17 @@
+{
+  "service_id": "make-com",
+  "display_name": "Make.com",
+  "aliases": [
+    "Make",
+    "Integromat"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it** -- Instructions: per scenario, open the scenario \u2192 three-dot menu (top right) \u2192 Export blueprint \u2192 a .json file downloads containing all modules, connections, filters, and actions; data store records export via each data store's browse view (or add a quick scenario that dumps them to CSV). One JSON per scenario, done by hand. Blueprints deliberately contain no API secrets or connection credentials, and blueprint export/import is a paid feature\n\nLet me know if you have any questions or would like us to pull this data!",
+  "notes": [
+    "Blueprint export is manual, one JSON per scenario, and is a paid-plan feature.",
+    "Blueprints deliberately exclude API secrets and connection credentials."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case make-blueprint-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

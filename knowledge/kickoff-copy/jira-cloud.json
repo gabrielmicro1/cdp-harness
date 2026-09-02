@@ -1,0 +1,16 @@
+{
+  "service_id": "jira-cloud",
+  "display_name": "Jira Cloud",
+  "aliases": [
+    "Jira"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Settings (gear) \u2192 System \u2192 Backup manager \u2192 Create backup for cloud, ticking Include additional files to get attachments, avatars, and logos, then Download backup file when it finishes. Lands as one .zip on your disk (entities.xml + activeobjects.xml + attachment folders); admin-only, runs at most once per 24h and only keeps one backup at a time (48h between runs if attachments are included).\n- **We pull it**, Instructions: from a site-admin account, go to [id.atlassian.com/manage-profile/security/api-tokens](http://id.atlassian.com/manage-profile/security/api-tokens) \u2192 Create API token \u2192 label it \u2192 Create \u2192 Copy to clipboard (it's shown only once). Paste the token, the admin account's email address, and your site URL ([yourcompany.atlassian.net](http://yourcompany.atlassian.net)) into a one-time link at scrt.link and email us that link.\n\nLet me know if you prefer to push this service or have us pull it!",
+  "notes": [
+    "Cloud backups are admin-only, run at most once per 24h (48h when attachments are included), and only one backup is retained at a time.",
+    "Completion depends on the selected Jira site and admin export scope."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case jira-cloud-backup-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

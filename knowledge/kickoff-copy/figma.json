@@ -1,0 +1,16 @@
+{
+  "service_id": "figma",
+  "display_name": "Figma",
+  "aliases": [
+    "Figma files",
+    "Figma designs"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: Account menu (top-left of the file browser) \u2192 Settings \u2192 Security \u2192 Personal access tokens \u2192 Generate new token \u2192 tick all the read scopes (file content, comments, projects) \u2192 copy it immediately, it's shown only once. Send the token to us over secure means.\n\nFor Figma we typically pull your data. Please let me know if this is your planned method.",
+  "notes": [
+    "Figma Make source is not exposed by the normal API."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case figma-api-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

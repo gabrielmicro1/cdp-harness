@@ -1,0 +1,11 @@
+{
+  "service_id": "progress-check",
+  "display_name": "Progress Check",
+  "aliases": [],
+  "direction": null,
+  "status": "approved",
+  "message": "We will use this thread for overall transfer progress, blockers, and next actions across the registered services.",
+  "notes": [],
+  "source": "ported from cdp-corpus-transfer-plugin drafting_core.render_progress_check",
+  "updated_at": "2026-09-02T02:21:39Z"
+}

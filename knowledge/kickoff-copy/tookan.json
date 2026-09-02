@@ -1,0 +1,14 @@
+{
+  "service_id": "tookan",
+  "display_name": "Tookan",
+  "aliases": [],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Menu \u2192 Tasks \u2192 Export Tasks (top-right) \u2192 choose all tasks / today / custom date range, then repeat at Menu \u2192 Agents \u2192 export icon (top-right, beside Add Agent) and Menu \u2192 Analytics \u2192 set time + team + agent \u2192 export report. Each run lands as a CSV on your disk; a single task can also be pulled as a PDF via the task ID \u2192 Details \u2192 Export Task.\n- **We pull it**, Instructions: log in \u2192 Menu \u2192 Settings \u2192 API Keys \u2192 generate a new key, doing this from the admin/owner account so the key sees every team's tasks rather than one manager's slice. Paste the key into a one-time link at scrt.link and email us that link, not the key itself.\n\nLet me know if you would prefer to push this service yourself, or have us pull it.",
+  "notes": [
+    "A key generated from a manager account only sees that manager's slice of tasks; the admin/owner account is required for full coverage.",
+    "Push-route exports are per-run CSVs; PDF export covers a single task at a time."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case tookan-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

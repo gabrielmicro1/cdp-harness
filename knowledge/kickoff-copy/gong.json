@@ -1,0 +1,15 @@
+{
+  "service_id": "gong",
+  "display_name": "Gong",
+  "aliases": [
+    "Gong call records"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "For Gong, generate the broadest complete export available and push the completed package.\n\nUnless you tell us otherwise, include all retrievable call history, metadata, transcripts, audio, and video.\n\nTell us only about explicit exclusions or artifacts Gong cannot export. Please also capture the expected call count and report every skipped, inaccessible, unsupported, or failed call.\n\nKeep the structured call data, transcripts, and media in clearly labeled folders and place the completed export in `exports/gong/`. Use the CDP platform to add the upload machine's current public IP and download the current credential bundle and `client_push.sh`.\n\nOnce the upload finishes, send the total file count and size here. We'll reconcile the received call records and confirm whether the expected transcripts and media are present.",
+  "notes": [
+    "Verified call-record counts do not prove recording media or complete transcripts."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case gong-call-records-push)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

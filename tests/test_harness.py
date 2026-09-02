@@ -7,7 +7,8 @@ Copies tests/fixtures/companies/ to a temp root and exercises: report +
 dashboard generation, verify-completion (fail, pass, mark-complete,
 cannot-verify), offboard/restore archiving, the copied-forward path,
 status/stall transitions, launch summary parsing, sizer summary compactness,
-and fleet_size.py --dry-run.
+fleet_size.py --dry-run, and the Slack engine (tests/test_slack_engine.py +
+tests/test_import_slack_operator.py, run as subprocesses).
 """
 from __future__ import annotations
 
@@ -42,6 +43,15 @@ import reconcile  # noqa: E402
 
 PASS = 0
 checks = []
+
+
+def _raises(fn, *a) -> bool:
+    """True when fn(*a) raises HarnessError — for guard/refusal assertions."""
+    try:
+        fn(*a)
+    except common.HarnessError:
+        return True
+    return False
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -737,7 +747,11 @@ def main() -> int:
     print("\n— skip-check decision (metric stubbed) —")
     cfg = common.load_config(root, "democo")
     real = phases.read_used_capacity
+    real_ingress = phases.read_ingress
     try:
+        # Both ARM reads are stubbed: skip_check consults UsedCapacity AND
+        # Ingress, and the fixture's subscription id is deliberately fake.
+        phases.read_ingress = lambda c, since, dry_run=False: 0
         phases.read_used_capacity = lambda c, dry_run=False: (
             grown["totals"]["uncompressed_bytes"], "2026-08-13T13:00:00Z")
         # latest run's used_capacity differs from stub → changed
@@ -753,6 +767,70 @@ def main() -> int:
         check("no metric → size to be safe", r["skip"] is False)
     finally:
         phases.read_used_capacity = real
+        phases.read_ingress = real_ingress
+
+    print("\n— skip-check: a stale UsedCapacity must not authorize a skip —")
+    # oneorb, 2026-09-01. ARM re-emits UsedCapacity every hour carrying the
+    # LAST KNOWN value, so metric_at is always ~now and staleness is invisible
+    # from the timestamp. The account's metric froze at 236 MB while 678 GB
+    # sat in the container; because that frozen value had been stamped into
+    # the previous run file, it matched itself and authorized a skip. Two
+    # independent guards, either of which alone would have caught it.
+    cfg = common.load_config(root, "democo")
+    real_uc, real_ing = phases.read_used_capacity, phases.read_ingress
+    try:
+        latest = common.latest_runs(root, "democo", 1)[0]
+        frozen = latest["used_capacity_bytes"]
+
+        # Guard 1 — the hard invariant. Account-level capacity can never be
+        # below the container bytes we ourselves listed; if it is, the metric
+        # is provably stale whatever it claims.
+        phases.read_used_capacity = lambda c, dry_run=False: (frozen, "t")
+        phases.read_ingress = lambda c, since, dry_run=False: 0
+        stale_run = dict(latest)
+        stale_run["method"] = "sized"
+        stale_run["totals"] = dict(latest["totals"],
+                                   compressed_bytes=frozen * 36)  # oneorb's real ratio
+        # must be the NEWEST measured run — that is the one skip_check checks
+        # the metric against.
+        stale_at = common.parse_iso(latest["timestamp"]) + timedelta(minutes=1)
+        stale_run["timestamp"] = common.iso(stale_at)
+        stale_name = f"{common.ts_basic(stale_at)}.json"
+        common.write_json(root / "democo" / "sizing-runs" / stale_name, stale_run)
+        r = phases.skip_check(root, "democo", cfg)
+        check("metric below our own last measurement → no skip",
+              r["skip"] is False, f"reason={r['reason']}")
+        check("stale-metric refusal names the reason",
+              "stale" in r["reason"].lower(), f"reason={r['reason']}")
+        (root / "democo" / "sizing-runs" / stale_name).unlink()
+
+        # Guard 2 — bytes were written since we last looked. Ingress is a
+        # transaction metric (PT1M, near-real-time), so it sees the write the
+        # capacity snapshot missed.
+        latest = common.latest_runs(root, "democo", 1)[0]
+        phases.read_used_capacity = lambda c, dry_run=False: (
+            latest["used_capacity_bytes"], "t")
+        phases.read_ingress = lambda c, since, dry_run=False: 670_117_049_543
+        r = phases.skip_check(root, "democo", cfg)
+        check("ingress since last run → no skip", r["skip"] is False,
+              f"reason={r['reason']}")
+        check("ingress refusal names the bytes written",
+              "written" in r["reason"].lower(), f"reason={r['reason']}")
+
+        # Noise floor: an idle account still logs a few KB (monterey measured
+        # 35 KB over 49h). That must NOT defeat the skip.
+        phases.read_ingress = lambda c, since, dry_run=False: 35_000
+        r = phases.skip_check(root, "democo", cfg)
+        check("sub-floor ingress noise still skips", r["skip"] is True,
+              f"reason={r['reason']}")
+
+        # An unreadable ingress metric must fail SAFE (size), never silently skip.
+        phases.read_ingress = lambda c, since, dry_run=False: None
+        r = phases.skip_check(root, "democo", cfg)
+        check("unreadable ingress → size to be safe", r["skip"] is False,
+              f"reason={r['reason']}")
+    finally:
+        phases.read_used_capacity, phases.read_ingress = real_uc, real_ing
 
     print("\n— sizer: import-safety + listing parse —")
     # Import must not require env vars (module was previously KeyError-on-import).
@@ -7232,6 +7310,541 @@ def main() -> int:
                       for r in out["results"]), json.dumps(out["totals"]))
     finally:
         svp._http, svp._http_nr, svp.Blob.list, svp._sleep = _saved
+
+    # ── helpsy AWS url-list pull (one-off) ──────────────────────────────────
+    # Pure logic only: naming across the four real edge cases in the client's
+    # lists, the classify() truth table, and a scripted copy loop with the
+    # Azure transport stubbed out. No network, no Azure.
+    print("\n— helpsy url pull —")
+    import helpsy_url_pull as hup  # noqa: E402
+
+    P = "https://helpsy-images-public.s3.amazonaws.com"
+    check("helpsy: a plain key becomes aws/<bucket>/<key>",
+          hup.blob_name(f"{P}/000177ff/4089.jpg", "aws")
+          == ("aws/helpsy-images-public/000177ff/4089.jpg", "", ""))
+    check("helpsy: a leading-slash key keeps its empty segment",
+          hup.blob_name(f"{P}//measurmentsV2/DEV45.jpg", "aws")[0]
+          == "aws/helpsy-images-public//measurmentsV2/DEV45.jpg")
+    check("helpsy: a key that is itself a url decodes verbatim",
+          hup.blob_name(f"{P}/https%3A//x.s3.amazonaws.com/TST/14.jpg", "aws")[0]
+          == "aws/helpsy-images-public/https://x.s3.amazonaws.com/TST/14.jpg")
+    check("helpsy: percent-encoded parens decode to the real key",
+          hup.blob_name("https://helpsy-product-data.s3.amazonaws.com/"
+                        "a/2022_04_26.csv%2810%29.csv?X-Amz-Signature=d",
+                        "aws")[0]
+          == "aws/helpsy-product-data/a/2022_04_26.csv(10).csv")
+    check("helpsy: an S3 folder placeholder is excluded, never named",
+          hup.blob_name("https://helpsy-product-data.s3.amazonaws.com/"
+                        "04_26_22/?X-Amz-Signature=d", "aws")
+          == ("", "folder-placeholder", ""))
+    check("helpsy: an unrecognised host is recorded, never guessed at",
+          hup.blob_name("https://example.com/a/b", "aws")[1]
+          == "unrecognised-host")
+    check("helpsy: a backslash key is normalised to the name Azure stores",
+          hup.blob_name(f"{P}/visiON%5Cabc", "aws")
+          == ("aws/helpsy-images-public/visiON/abc", "",
+              "backslash-normalised"),
+          str(hup.blob_name(f"{P}/visiON%5Cabc", "aws")))
+    check("helpsy: a literal '%' in a key is noted, not dropped",
+          hup.blob_name(f"{P}/100%off.jpg", "aws")[2] == "reencode-differs"
+          and hup.blob_name(f"{P}/100%off.jpg", "aws")[0]
+          == "aws/helpsy-images-public/100%off.jpg")
+    check("helpsy: regional and global S3 hosts both resolve their bucket",
+          hup.bucket_of("b.s3.amazonaws.com") == "b"
+          and hup.bucket_of("b.s3.us-west-1.amazonaws.com") == "b"
+          and hup.bucket_of("cdn.example.com") == "")
+    check("helpsy: FILE: lines parse, junk lines do not",
+          hup.parse_line("FILE: https://a/b") == "https://a/b"
+          and hup.parse_line("") is None
+          and hup.parse_line("ftp://a/b") is None)
+    check("helpsy: the presigned deadline is X-Amz-Date + X-Amz-Expires",
+          common.iso(hup.presigned_deadline(
+              "https://b.s3.amazonaws.com/k?X-Amz-Date=20260831T152944Z"
+              "&X-Amz-Expires=172800")) == "2026-09-02T15:29:44Z"
+          and hup.presigned_deadline("https://b.s3.amazonaws.com/k") is None)
+    check("helpsy: presigned-ness is a property of the row",
+          hup.is_presigned("https://b.s3.amazonaws.com/k?X-Amz-Signature=d")
+          and not hup.is_presigned("https://b.s3.amazonaws.com/k"))
+    check("helpsy: a signature is never persisted to our own state",
+          "X-Amz-Signature=%3Credacted%3E" in hup._redact(
+              "https://b.s3.amazonaws.com/k?X-Amz-Date=x&X-Amz-Signature=abc")
+          and "abc" not in hup._redact(
+              "https://b.s3.amazonaws.com/k?X-Amz-Date=x&X-Amz-Signature=abc"))
+    chunked = list(hup.chunk_rows([(f"u{i}", f"n{i}") for i in range(5)], 2))
+    check("helpsy: chunk_rows splits in list order and keeps the tail",
+          [c[0] for c in chunked] == [0, 1, 2]
+          and chunked[0][1] == "u0\tn0\nu1\tn1\n"
+          and chunked[2][1] == "u4\tn4\n")
+    check("helpsy: 409 is 'ok' only when it is BlobAlreadyExists",
+          hup.classify(409, "BlobAlreadyExists", "") == "ok"
+          and hup.classify(409, "CannotVerifyCopySource", "200") == "size-probe")
+    check("helpsy: a source 403 and OUR 403 are different problems",
+          hup.classify(403, "CannotVerifyCopySource", "403") == "source-auth"
+          and hup.classify(403, "AuthorizationFailure", "") == "regrant")
+    check("helpsy: 404 from S3 is a recorded gap, 5xx and 429 are retries",
+          hup.classify(404, "CannotVerifyCopySource", "404") == "skip"
+          and hup.classify(500, "InternalError", "") == "retry"
+          and hup.classify(429, "ServerBusy", "") == "sleep")
+    check("helpsy: the one-off is slug-guarded in code",
+          _raises(hup.guard_slug, "saxon") and hup.guard_slug("helpsy") is None)
+
+    # Scripted copy loop: the transport is stubbed, so this exercises routing,
+    # retry, the large-object fallback and the abort counter only.
+    def helpsy_copy(script, rows=None, concurrency=4):
+        cfg = {"storage_account": "sa", "container": "c"}
+        calls = []
+
+        def fake_put(url, headers, body=b""):
+            name = urllib.parse.unquote(
+                url.split("/c/", 1)[1].split("?", 1)[0])
+            calls.append((name, headers.get("x-ms-source-range", "")))
+            outcome = script.get(name, ("201", "", ""))
+            if isinstance(outcome, list):
+                outcome = outcome.pop(0) if len(outcome) > 1 else outcome[0]
+            return (int(outcome[0]), outcome[1], outcome[2])
+
+        saved = (hup.azure_put, hup.source_size, hup._sleep)
+        hup.azure_put = fake_put
+        hup.source_size = lambda url, presigned: 300 * hup.MIB
+        hup._sleep = lambda _s: None
+        try:
+            c = hup.Counters()
+            g = hup.Guard(cfg)
+            chunk = tmp / "helpsy-chunk"
+            chunk.write_text("".join(
+                f"{u}\t{n}\n" for u, n in (rows or [
+                    (f"{P}/a.jpg", "aws/b/a.jpg"),
+                    (f"{P}/exists.jpg", "aws/b/exists.jpg"),
+                    (f"{P}/gone.jpg", "aws/b/gone.jpg"),
+                    (f"{P}/huge.bin", "aws/b/huge.bin"),
+                    (f"{P}/flaky.jpg", "aws/b/flaky.jpg")])))
+            hup.run_chunk(cfg, "sas=x", chunk, concurrency, c, g)
+            return c, g, calls
+        finally:
+            hup.azure_put, hup.source_size, hup._sleep = saved
+
+    c, g, calls = helpsy_copy({
+        "aws/b/exists.jpg": ("409", "BlobAlreadyExists", ""),
+        "aws/b/gone.jpg": ("404", "CannotVerifyCopySource", "404"),
+        "aws/b/huge.bin": [("409", "CannotVerifyCopySource", "200"),
+                           ("201", "", "")],
+        "aws/b/flaky.jpg": [("503", "ServerBusy", ""), ("201", "", "")],
+    })
+    check("helpsy copy: landed / already-there / since-deleted are distinct",
+          c.completed == 3 and c.skipped == 1 and c.missing == 1
+          and c.failed == 0, json.dumps(c.as_dict()))
+    check("helpsy copy: an oversized source falls back to block staging",
+          c.blocked == 1
+          and [r for n, r in calls if n == "aws/b/huge.bin" and r]
+          == ["bytes=0-268435455", "bytes=268435456-314572799"],
+          str([r for n, r in calls if n == "aws/b/huge.bin"]))
+    check("helpsy copy: a 503 is retried, not counted as a loss",
+          c.throttles == 0 and not g.aborted)
+
+    c, g, _ = helpsy_copy(
+        {f"aws/b/{i}.jpg": ("403", "CannotVerifyCopySource", "403")
+         for i in range(40)},
+        rows=[(f"{P}/{i}.jpg?X-Amz-Signature=d", f"aws/b/{i}.jpg")
+              for i in range(40)], concurrency=1)
+    check("helpsy copy: a dead presigned window aborts the set by name",
+          g.aborted and g.abort_cause == "presigned-expired-or-invalid"
+          and c.completed == 0, g.abort_cause)
+    c, g, _ = helpsy_copy(
+        {f"aws/b/{i}.jpg": ("403", "CannotVerifyCopySource", "403")
+         for i in range(40)},
+        rows=[(f"{P}/{i}.jpg", f"aws/b/{i}.jpg") for i in range(40)],
+        concurrency=1)
+    check("helpsy copy: a revoked public bucket aborts under its own name",
+          g.abort_cause == "public-access-revoked", g.abort_cause)
+
+    miss = io.StringIO()
+    stats, msample, xsample = hup.merge_names(
+        iter(["aws/b/1", "aws/b/2", "aws/b/3"]),
+        iter([("aws/b/1", 10), ("aws/b/3", 30), ("aws/b/9", 90)]), miss)
+    check("helpsy verify: merge-join finds the gap, the extra and the bytes",
+          stats == {"expected": 3, "present": 2, "missing": 1, "extra": 1,
+                    "bytes": 130}
+          and msample == ["aws/b/2"] and xsample == ["aws/b/9"]
+          and miss.getvalue() == "aws/b/2\n", json.dumps(stats))
+
+
+    # ── wallaroo-media takeout link pull (one-off) ────────────────────────
+    import wallaroo_takeout_pull as wtp   # noqa: E402
+    import wallaroo_takeout_vm_pull as wtv  # noqa: E402
+
+    CURL = (
+        "curl 'https://takeout.google.com/settings/takeout/download"
+        "?j=abc123&i=0&user=0' \\\n"
+        "  -H 'accept: text/html,application/xhtml+xml' \\\n"
+        "  -H 'accept-encoding: gzip, deflate, br, zstd' \\\n"
+        "  -H 'cookie: SID=aaa; HSID=bbb; __Secure-1PSID=ccc' \\\n"
+        "  -H 'user-agent: Mozilla/5.0 (Macintosh)' \\\n"
+        "  --compressed\n"
+        "curl 'https://takeout.google.com/settings/takeout/download"
+        "?j=abc123&i=1&user=0' -H 'cookie: SID=aaa' --compressed\n")
+
+    jobs = wtp.parse_curls(CURL)
+    check("takeout: parses multi-line and single-line cURLs together",
+          [j["index"] for j in jobs] == [0, 1], str(jobs)[:200])
+    check("takeout: request headers survive the parse",
+          jobs[0]["headers"].get("cookie", "").startswith("SID=aaa")
+          and jobs[0]["headers"]["user-agent"].startswith("Mozilla"),
+          str(jobs[0]["headers"]))
+    # accept-encoding would make Content-Length describe COMPRESSED bytes,
+    # which silently breaks the on-disk size check that verify rests on.
+    check("takeout: accept-encoding is dropped, not forwarded",
+          "accept-encoding" not in jobs[0]["headers"],
+          str(sorted(jobs[0]["headers"])))
+
+    for bad, label in (("curl 'https://evil.example.com/x'", "foreign host"),
+                       ("curl 'https://google.com.evil.com/x'", "suffix trick"),
+                       ("echo hi", "no curl command")):
+        try:
+            wtp.parse_curls(bad)
+            check(f"takeout: parse refuses {label}", False, "accepted it")
+        except common.HarnessError:
+            check(f"takeout: parse refuses {label}", True, "")
+
+    exp = wtp.expand_parts(jobs[0], 11)
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(exp[7]["url"]).query)
+    check("takeout: --expand-parts walks i= over the range",
+          [j["index"] for j in exp] == list(range(11))
+          and q["i"] == ["7"] and q["j"] == ["abc123"], str(q))
+    try:
+        wtp.expand_parts({"url": "https://takeout.google.com/d?j=a",
+                          "headers": {}, "index": 0}, 3)
+        check("takeout: expand refuses a URL with no i=", False, "accepted")
+    except common.HarnessError:
+        check("takeout: expand refuses a URL with no i=", True, "")
+
+    # A hostile Content-Disposition must not escape the prefix or shadow our
+    # own bookkeeping. Both modules own a copy — they must not drift.
+    hostile = ["../../etc/passwd", "/abs/path.zip", "..\\win.zip", ".hidden",
+               "", None, "x" * 300]
+    check("takeout: hostile filenames fall back to the generated name",
+          all(m.safe_blob_name(b, 3) == "takeout-part-003.zip"
+              for b in hostile for m in (wtp, wtv)),
+          str([(b, wtp.safe_blob_name(b, 3)) for b in hostile]))
+    # A real wallaroo job serves a 137.79 GB Gmail archive called "All mail
+    # Including Spam and Trash-002.mbox": spaces, and not a zip. Naming it
+    # .zip would send the sizer hunting a central directory that is not
+    # there, on 31% of the corpus.
+    check("takeout: Google's spaced .mbox name is kept verbatim",
+          all(m.safe_blob_name(
+              "All mail Including Spam and Trash-002.mbox", 3)
+              == "All mail Including Spam and Trash-002.mbox"
+              for m in (wtp, wtv)), wtp.safe_blob_name(
+                  "All mail Including Spam and Trash-002.mbox", 3))
+    check("takeout: our own bookkeeping names can never be claimed",
+          all(m.safe_blob_name(n, 3) == f"takeout-part-003{e}"
+              for n, e in (("manifest.json", ".json"),
+                           ("progress.json", ".json"))
+              for m in (wtp, wtv)),
+          wtp.safe_blob_name("manifest.json", 3))
+    check("takeout: a rejected name keeps its real extension, not .zip",
+          all(m.safe_blob_name("../evil.mbox", 3)
+              == "takeout-part-003.mbox" for m in (wtp, wtv)),
+          wtp.safe_blob_name("../evil.mbox", 3))
+    check("takeout: a sane filename is kept, identically in both modules",
+          all(wtp.safe_blob_name(n, 3) == n == wtv.safe_blob_name(n, 3)
+              for n in ("takeout-20260831T120000Z-1-011.zip", "a_2.tgz",
+                        "Takeout (1).zip")), "")
+    check("takeout: Content-Disposition filename and filename* both parse",
+          wtp.content_disposition_name('attachment; filename="t-1.zip"')
+          == "t-1.zip"
+          and wtp.content_disposition_name(
+              "attachment; filename*=UTF-8''t%2D2.zip") == "t-2.zip", "")
+
+    # The security-critical bit: the client's Google session cookie must
+    # never ride a redirect off google.com.
+    class _FP:
+        def read(self, *a):
+            return b""
+
+    cookie_results = {}
+    for tgt in ("https://takeout-download.usercontent.google.com/d/x",
+                "https://drive.google.com/y",
+                "https://evil.example.com/z",
+                "https://google.com.evil.com/z"):
+        req = urllib.request.Request("https://takeout.google.com/d?j=a&i=0")
+        req.add_header("cookie", "SID=secret")
+        req.add_header("authorization", "Bearer secret")
+        req.add_header("user-agent", "Mozilla/5.0")
+        new = wtv._CookieGuardRedirect().redirect_request(
+            req, _FP(), 302, "Found", {}, tgt)
+        hdrs = {k.lower() for k in
+                list(new.headers) + list(new.unredirected_hdrs)}
+        cookie_results[tgt] = (
+            "cookie" in hdrs, "authorization" in hdrs, "user-agent" in hdrs)
+    check("takeout: cookie survives a redirect that stays on google.com",
+          cookie_results[
+              "https://takeout-download.usercontent.google.com/d/x"][:2]
+          == (True, True), str(cookie_results))
+    check("takeout: cookie+authorization stripped off google.com",
+          not any(cookie_results[u][0] or cookie_results[u][1]
+                  for u in ("https://evil.example.com/z",
+                            "https://google.com.evil.com/z")),
+          str(cookie_results))
+    check("takeout: non-secret headers survive either way",
+          all(v[2] for v in cookie_results.values()), str(cookie_results))
+
+    # verify: declared == committed, and a pilot must never read as complete
+    TPX = "workspace-export/personal-takeout"
+
+    def tk_manifest(parts, count=11, failed=None):
+        return {"part_count": count, "failed_parts": failed or [],
+                "total_declared_bytes": sum(p.get("declared_bytes") or 0
+                                            for p in parts),
+                "parts": parts}
+
+    tk_parts = [{"index": i, "status": "ok", "blob_name": f"t-{i:03d}.zip",
+                 "declared_bytes": 37_000_000_000} for i in range(11)]
+    tk_blobs = {f"{TPX}/t-{i:03d}.zip": 37_000_000_000 for i in range(11)}
+    check("takeout verify: clean run passes",
+          wtp.compare_manifest_to_blobs(
+              tk_manifest(tk_parts), tk_blobs, TPX)["ok"], "")
+    miss = dict(tk_blobs)
+    del miss[f"{TPX}/t-004.zip"]
+    r = wtp.compare_manifest_to_blobs(tk_manifest(tk_parts), miss, TPX)
+    check("takeout verify: a missing blob fails and is named",
+          not r["ok"] and r["missing_blobs"] == ["t-004.zip"], json.dumps(r))
+    short = dict(tk_blobs)
+    short[f"{TPX}/t-004.zip"] = 100
+    r = wtp.compare_manifest_to_blobs(tk_manifest(tk_parts), short, TPX)
+    check("takeout verify: committed < declared fails",
+          not r["ok"] and r["short_blobs"], json.dumps(r))
+    r = wtp.compare_manifest_to_blobs(
+        tk_manifest(tk_parts[:1]), {f"{TPX}/t-000.zip": 37_000_000_000}, TPX)
+    check("takeout verify: a --limit pilot never reads as complete",
+          not r["ok"] and r["parts_ok"] == 1
+          and r["part_count_expected"] == 11, json.dumps(r))
+    r = wtp.compare_manifest_to_blobs(
+        tk_manifest(tk_parts, failed=[7]), tk_blobs, TPX)
+    check("takeout verify: a failed part fails the run",
+          not r["ok"] and r["failed_parts"] == [7], json.dumps(r))
+
+    # End-to-end sim of the VM copy loop against a fake Google + fake blob
+    # store. The pure functions above are the easy half; this covers the
+    # half that actually moves bytes — resume, the blob-is-the-record skip,
+    # and the pilot's partial manifest.
+    tk_parts_src = {0: (b"A" * 5000, "takeout-20260831T1200Z-001.zip"),
+                    1: (b"B" * 3000, "takeout-20260831T1200Z-002.zip")}
+    tk_cloud: dict = {}
+    tk_calls = {"open": 0, "served": 0}
+    tk_fail_once = {"armed": False}
+
+    class _TkResp:
+        def __init__(self, body, headers):
+            self._b = io.BytesIO(body)
+            self.headers, self.status = headers, 206
+            self.cut = None
+
+        def geturl(self):
+            return "https://takeout-download.usercontent.google.com/download/x"
+
+        def read(self, n=-1):
+            chunk = self._b.read(n)
+            if self.cut is not None:
+                self.cut -= len(chunk)
+                if self.cut <= 0:
+                    raise OSError("simulated connection reset")
+            tk_calls["served"] += len(chunk)
+            return chunk
+
+        def close(self):
+            pass
+
+    def _tk_open(url, headers, offset, timeout=180):
+        tk_calls["open"] += 1
+        i = int(urllib.parse.parse_qs(
+            urllib.parse.urlsplit(url).query)["i"][0])
+        body, name = tk_parts_src[i]
+        r = _TkResp(body[offset:], {
+            "Content-Range": f"bytes {offset}-{len(body) - 1}/{len(body)}",
+            "Content-Length": str(len(body) - offset),
+            "Content-Disposition": f'attachment; filename="{name}"'})
+        if tk_fail_once["armed"] and i == 0 and offset == 0:
+            tk_fail_once["armed"] = False
+            r.cut = 2000                      # die mid-stream
+        return r
+
+    class _TkDest:
+        prefix = "workspace-export/personal-takeout"
+
+        def head(self, name):
+            return len(tk_cloud[name]) if name in tk_cloud else None
+
+        def get_json(self, name):
+            return json.loads(tk_cloud[name]) if name in tk_cloud else None
+
+        def azcopy(self, local, name, overwrite, work):
+            if name in tk_cloud and not overwrite:
+                return
+            with open(local, "rb") as f:
+                tk_cloud[name] = f.read()
+
+    def _tk_run(**kw):
+        stage = tempfile.mkdtemp()
+        links = os.path.join(stage, "links.json")
+        with open(links, "w") as f:
+            json.dump({"jobs": [
+                {"url": "https://takeout.google.com/settings/takeout/"
+                        f"download?j=abc&i={i}", "headers": {}, "index": i}
+                for i in tk_parts_src]}, f)
+        argv = ["x", "--links", links, "--stage", stage, "--parallel", "1"]
+        for k, v in kw.items():
+            argv += [f"--{k}"] + ([str(v)] if v is not True else [])
+        saved_argv, sys.argv = sys.argv, argv
+        try:
+            rc = wtv.main()
+        finally:
+            sys.argv = saved_argv
+        with open(os.path.join(stage, "manifest.json")) as f:
+            man = json.load(f)
+        shutil.rmtree(stage)
+        return rc, man
+
+    _tk_saved = (wtv.open_source, wtv.Dest, wtv.log)
+    wtv.open_source, wtv.Dest = _tk_open, lambda: _TkDest()
+    wtv.log = lambda msg: None      # the puller narrates; the suite should not
+    try:
+        rc, man = _tk_run()
+        check("takeout sim: clean run commits every part byte-exactly",
+              rc == 0 and not man["failed_parts"]
+              and tk_cloud.get("takeout-20260831T1200Z-001.zip")
+              == tk_parts_src[0][0]
+              and man["total_declared_bytes"]
+              == man["total_committed_bytes"] == 8000, json.dumps(man)[:300])
+
+        opens_before = tk_calls["open"]
+        rc, man = _tk_run()
+        check("takeout sim: a re-run touches Google ZERO times",
+              rc == 0 and tk_calls["open"] == opens_before
+              and all(p.get("skipped") == "already-present"
+                      for p in man["parts"]),
+              f"opens {tk_calls['open']} vs {opens_before}")
+
+        tk_cloud.clear()
+        tk_calls.update(open=0, served=0)
+        tk_fail_once["armed"] = True
+        rc, man = _tk_run()
+        check("takeout sim: a mid-stream drop resumes without re-fetching",
+              rc == 0
+              and tk_cloud["takeout-20260831T1200Z-001.zip"]
+              == tk_parts_src[0][0]
+              and tk_calls["open"] == 3        # part0 twice + part1 once
+              and tk_calls["served"] == 8000,  # == clean total: no re-fetch
+              f"opens={tk_calls['open']} served={tk_calls['served']}")
+
+        tk_cloud.clear()
+        rc, man = _tk_run(limit=1)
+        v = wtp.compare_manifest_to_blobs(
+            man, {f"{_TkDest.prefix}/{k}": len(b)
+                  for k, b in tk_cloud.items()}, _TkDest.prefix)
+        check("takeout sim: a pilot's manifest cannot verify as complete",
+              man["partial_run"] and not v["ok"] and v["parts_ok"] == 1
+              and v["part_count_expected"] == 2, json.dumps(v)[:300])
+    finally:
+        wtv.open_source, wtv.Dest, wtv.log = _tk_saved
+
+    # REGRESSION, live incident 2026-08-31: Google answers an invalid
+    # session with 200 + the sign-in PAGE (not an error status), and the
+    # puller committed 12 of those into the client container as
+    # takeout-part-NNN.zip. Status alone can never be the check.
+    class _SigninResp:
+        status = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+
+        def geturl(self):
+            return "https://accounts.google.com/v3/signin/identifier?x=1"
+
+        def read(self, n=-1):
+            return b"<!doctype html><html>"
+
+        def close(self):
+            pass
+
+    def _signin_open(url, headers, offset, timeout=180):
+        return _SigninResp()
+
+    _sg_saved = (wtv.open_source, wtv.log)
+    wtv.open_source, wtv.log = _signin_open, lambda m: None
+    try:
+        stage = tempfile.mkdtemp()
+        prog = wtv.Progress(os.path.join(stage, "progress.json"), 1)
+        try:
+            wtv.download({"url": "https://takeout.google.com/settings/"
+                                 "takeout/download?j=a&i=0",
+                          "headers": {}, "index": 0},
+                         os.path.join(stage, "p.download"), stage, prog,
+                         lambda name, declared: None)
+            ok, why = False, "download() accepted a sign-in page"
+        except wtv.PartError as e:
+            ok = "sign-in" in str(e)
+            why = str(e)[:160]
+        check("takeout: a sign-in page is never committed as an archive",
+              ok, why)
+        # ...and the same for a bare HTML body with no Content-Disposition
+        class _HtmlResp(_SigninResp):
+            headers = {"Content-Type": "text/html"}
+
+            def geturl(self):
+                return "https://takeout.google.com/oops"
+        wtv.open_source = lambda u, h, o, timeout=180: _HtmlResp()
+        try:
+            wtv.download({"url": "https://takeout.google.com/d?j=a&i=0",
+                          "headers": {}, "index": 0},
+                         os.path.join(stage, "q.download"), stage, prog,
+                         lambda name, declared: None)
+            ok2, why2 = False, "download() accepted an HTML body"
+        except wtv.PartError as e:
+            ok2 = "HTML" in str(e)
+            why2 = str(e)[:160]
+        check("takeout: an HTML body is rejected even on the right host",
+              ok2, why2)
+        shutil.rmtree(stage)
+    finally:
+        wtv.open_source, wtv.log = _sg_saved
+
+    # Expansion is 0-based no matter which row the client copied. Deriving
+    # the base from the pasted i= walked 1..12 on the live run: it missed
+    # part 0 and invented a part 12.
+    _j1 = {"url": "https://takeout.google.com/settings/takeout/"
+                  "download?i=1&j=abc", "headers": {}, "index": 1}
+    check("takeout: expansion is 0-based even from an i=1 cURL",
+          [j["index"] for j in wtp.expand_parts(_j1, 12)] == list(range(12)),
+          str([j["index"] for j in wtp.expand_parts(_j1, 12)]))
+    check("takeout: --expand-start still overrides the base",
+          [j["index"] for j in wtp.expand_parts(_j1, 3, start=5)] == [5, 6, 7],
+          "")
+
+    # the one-off guard, and that dry-run never prints a secret
+    proc = run_script("wallaroo_takeout_pull.py", "plan", "croplabel",
+                      "--dry-run", expect_rc=1)
+    check("takeout: slug guard refuses any company but wallaroo-media",
+          "one-off for wallaroo-media" in proc.stdout, proc.stdout[:200])
+    proc = run_script(
+        "wallaroo_takeout_pull.py", "write-links", "wallaroo-media",
+        "--expand-parts", "11", "--dry-run", expect_rc=0,
+        stdin_data="curl 'https://takeout.google.com/settings/takeout/"
+                   "download?j=abc&i=0' -H 'cookie: SID=TOPSECRET'\n")
+    check("takeout: write-links --dry-run never echoes the cookie",
+          "TOPSECRET" not in proc.stdout + proc.stderr
+          and '"parts": 11' in proc.stdout, proc.stdout[-300:])
+
+    # ---- Slack engine (connector-only, snapshot-driven) — its own unittest
+    # modules, run here so one command still covers the whole harness.
+    for mod in ("test_slack_engine.py", "test_import_slack_operator.py"):
+        proc = subprocess.run([sys.executable, str(REPO / "tests" / mod)],
+                              capture_output=True, text=True, input="")
+        check(f"slack: {mod} passes", proc.returncode == 0,
+              proc.stderr[-600:])
+    proc = run_script("slack_engine.py", "validate-library", expect_rc=0)
+    _lib = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    check("slack: committed kickoff library validates with the fixed kinds present",
+          _lib.get("entries", 0) >= 2 and (REPO / "knowledge" / "kickoff-copy" / "onboarding.json").exists()
+          and (REPO / "knowledge" / "kickoff-copy" / "progress-check.json").exists(),
+          proc.stdout[-300:])
 
     shutil.rmtree(tmp)
     failed = [c for c in checks if not c[1]]

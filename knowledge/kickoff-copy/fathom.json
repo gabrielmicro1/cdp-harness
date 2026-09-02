@@ -1,0 +1,18 @@
+{
+  "service_id": "fathom",
+  "display_name": "Fathom",
+  "aliases": [
+    "Fathom Video",
+    "Fathom AI"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "We can pull Fathom directly for you.\n\nPlease create a Fathom API key for a user who can access all recordings in scope, then submit it through the secure CDP platform. Please do not share the key in Slack.\n\nOnce submitted, let us know here. We will verify the visible meeting count and available recordings, transcripts, summaries, action items, and highlights before starting the full pull. Fathom access is user-scoped, so meetings outside that user visibility will not be included.",
+  "notes": [
+    "Fathom API access is user-scoped and does not prove organization-wide coverage.",
+    "Meetings outside the authenticated user's visibility are not included.",
+    "The API may not expose deletions, comments, chapters, folders, playlists, exact sharing ACLs, or actual attendance."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case fathom-user-scoped-api-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

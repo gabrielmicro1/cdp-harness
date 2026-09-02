@@ -1,0 +1,16 @@
+{
+  "service_id": "wordpress",
+  "display_name": "WordPress",
+  "aliases": [
+    "WordPress Intranet",
+    "WP"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "For WordPress, we recommend pushing a complete backup. Rendered pages alone are not enough for a full backup.\n\nPlease:\n1. Export the database for every site in scope.\n2. Export the complete `wp-content` directory, including uploads, themes, and plugins.\n3. Remove live passwords, API keys, and other credentials from any configuration files.\n4. Create tested archives and place them in `exports/wordpress/`.\n5. In the CDP platform, add the upload machine's current public IP and download the current credential bundle and `client_push.sh`.\n6. Run `client_push.sh` against the parent `exports` folder.\n\nOnce the upload finishes, let us know the site list, database and `wp-content` archive counts, and expected total size. We'll verify the received files before marking it complete.",
+  "notes": [
+    "Rendered pages alone are not a full WordPress backup."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case wordpress-full-backup-push)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

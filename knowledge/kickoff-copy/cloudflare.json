@@ -1,0 +1,16 @@
+{
+  "service_id": "cloudflare",
+  "display_name": "Cloudflare",
+  "aliases": [
+    "Cloudflare R2"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: Manage Account \u2192 API Tokens \u2192 Create Token \u2192 Create Custom Token \u2192 tick every Read permission group under Account and Zone, set Resources to All accounts / All zones, the account-token option only appears if you are a Super Administrator, and a user token won't see zones you don't own. Then R2 \u2192 API \u2192 Manage API tokens \u2192 Create token (Object Read) for an Access Key ID + Secret; send all credentials to use over secure means.\n\nLet me know if you would prefer to push this, or if you have any questions!",
+  "notes": [
+    "The account-token option only appears for Super Administrators; a user token cannot see zones the user does not own.",
+    "Pull coverage follows the Read permission groups granted on the token."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case cloudflare-readonly-token-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

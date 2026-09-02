@@ -1,0 +1,17 @@
+{
+  "service_id": "redshift",
+  "display_name": "Redshift",
+  "aliases": [
+    "Amazon Redshift",
+    "AWS Redshift"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: `CREATE USER exporter PASSWORD '<strong>';` then `GRANT USAGE ON SCHEMA <each> TO exporter;` and `GRANT SELECT ON ALL TABLES IN SCHEMA <each> TO exporter;`. Add our egress IPs as an inbound rule on the cluster's security group (Redshift console \u2192 Cluster \u2192 Properties \u2192 Network and security). Put the endpoint host, port, database name, username and password into a one-time link at scrt.link and email us that link.\n\nLet me know if you would prefer to push this data yourself!",
+  "notes": [
+    "Pull coverage follows the exporter user's grants; schemas without USAGE and SELECT are invisible.",
+    "A security group without our egress IPs blocks the pull entirely."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case redshift-readonly-user-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

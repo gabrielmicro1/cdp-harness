@@ -1,0 +1,18 @@
+{
+  "service_id": "monday-com",
+  "display_name": "Monday.com",
+  "aliases": [
+    "Monday",
+    "monday.com"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "For Monday.com, the preferred route is a complete Enterprise account export that preserves boards, items, updates, documents, assets, and relationships.\n\nIf the provider export repeatedly fails and Monday support cannot deliver it, we can review a read-only API fallback for the approved account scope. Please confirm the account, boards, workspaces, expected counts, and exclusions first.\n\nSubmit API access only through the secure CDP platform. Do not share tokens, passwords, authorization codes, or signed asset links in Slack.\n\nWe will reconcile entities and assets separately, retry expired asset URLs, and preserve any persistent source failures in the final receipt.",
+  "notes": [
+    "The API fallback may encounter persistent source 403 responses for individual assets even after URL refresh and retry.",
+    "A successful API exception does not change the default offering from customer-generated export to API pull.",
+    "Only credential-visible boards, workspaces, users, and assets can be transferred."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case monday-export-or-api-fallback)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

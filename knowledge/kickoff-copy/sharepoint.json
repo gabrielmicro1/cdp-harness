@@ -1,0 +1,15 @@
+{
+  "service_id": "sharepoint",
+  "display_name": "SharePoint",
+  "aliases": [
+    "Microsoft SharePoint"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it** -- An admin exports each site collection via Microsoft Purview eDiscovery (native files) or Microsoft Graph.\n\nLet me know if you don't have access to eDiscovery due to subscription tier. There are other methods for the export.",
+  "notes": [
+    "Microsoft export tooling may not expose versions, recycle bins, retention data, or locked former-user content. Every unavailable category must be reported and reconciled."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case sharepoint-current-content-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

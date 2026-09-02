@@ -1,0 +1,15 @@
+{
+  "service_id": "adp-workforce-now",
+  "display_name": "ADP Workforce Now",
+  "aliases": [
+    "ADP"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Reports & Analytics \u2192 Reports Dashboard (or Custom Reports \u2192 Standard) \u2192 run Employee Census, Employee Profile, Payroll History, and Voluntary Deductions \u2192 download each as CSV/XLS; time data separately via Time & Attendance \u2192 Maintenance \u2192 Payroll \u2192 Exports \u2192 New Export. Lands as one file per report on your disk, plus tax form PDFs from Reports & Analytics \u2192 Federal/State/Local Tax Documents \u2192 iReports.\n\nLet me know if you have any questions about this.",
+  "notes": [
+    "Each report is run and downloaded individually; time data and tax documents come from separate areas of the product."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case adp-workforce-now-report-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

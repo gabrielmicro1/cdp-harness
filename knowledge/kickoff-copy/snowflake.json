@@ -1,0 +1,16 @@
+{
+  "service_id": "snowflake",
+  "display_name": "Snowflake",
+  "aliases": [
+    "Snowflake data warehouse"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: Snowsight \u2192 Admin \u2192 Users & Roles \u2192 Users \u2192 + User, create a service user, generate an RSA key pair and paste the public key onto it, then grant it a role with USAGE on every database/schema, SELECT on all tables, and USAGE on one warehouse. Also add our egress IPs to your network policy. Put the account identifier, username, private key, role name and warehouse name into a one-time link at scrt.link and email us that link.\n\nLet me know if you would prefer to push this data yourself!",
+  "notes": [
+    "Pull coverage follows the grants on the service user's role; anything not granted is invisible.",
+    "A network policy without our egress IPs blocks the pull entirely."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case snowflake-service-user-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

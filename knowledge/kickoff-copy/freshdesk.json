@@ -1,0 +1,14 @@
+{
+  "service_id": "freshdesk",
+  "display_name": "Freshdesk",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: as an Account Administrator, Admin \u2192 Account \u2192 Account Details \u2192 Export data \u2192 Export; the download link is emailed to the account admin's registered address and expires, so grab it promptly. For CSV/Excel instead of XML, Tickets \u2192 All tickets \u2192 set filters \u2192 Export, and check Admin \u2192 Account exports for history and re-downloads\n\nLet me know if you would prefer that we pull this data ourselves!",
+  "notes": [
+    "The export download link is emailed to the account admin's registered address and expires.",
+    "The account export is XML; CSV or Excel requires the separate filtered ticket export."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case freshdesk-full-admin-api-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

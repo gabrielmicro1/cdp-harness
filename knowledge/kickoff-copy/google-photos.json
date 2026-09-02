@@ -1,0 +1,18 @@
+{
+  "service_id": "google-photos",
+  "display_name": "Google Photos",
+  "aliases": [
+    "GooglePhotos",
+    "Photos",
+    "Google Photos Takeout"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Google Photos has no organization-wide export, so this one runs per user: each user in scope creates their own Takeout with only Google Photos selected.\n\n- **We pull it**, Instructions: takeout.google.com \u2192 Deselect all \u2192 tick Google Photos \u2192 All photo albums included \u2192 Next step \u2192 Delivery: Add to Drive \u2192 .zip \u2192 50 GB \u2192 Create export, then wait for the mail saying the Takeout folder has landed in your Drive. Then run rclone authorize \"drive\" on your own machine, sign in as that same Google account and grant read access on the consent screen, and send us the token JSON it prints along with the Drive folder link by secure means, never plaintext email, chat or a ticket.\n\nLet me know if you have any questions about the rclone process!",
+  "notes": [
+    "There is no organization-wide Google Photos export; every user in scope must run their own Photos-only Takeout.",
+    "Takeout preparation time scales with library size, and the export must land in Drive before the pull can start."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case google-photos-takeout-drive-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

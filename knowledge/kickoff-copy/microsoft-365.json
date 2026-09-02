@@ -1,0 +1,18 @@
+{
+  "service_id": "microsoft-365",
+  "display_name": "Microsoft 365",
+  "aliases": [
+    "M365",
+    "Office 365",
+    "O365"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it** -- Instructions: purview.microsoft.com \u2192 eDiscovery \u2192 Content Search \u2192 new search \u2192 select all locations (leave the query empty for everything) \u2192 run \u2192 Export \u2192 tick \"Include Teams and Viva Engage conversations\" \u2192 download from Process manager; grab the user roster separately at admin.microsoft.com \u2192 Users \u2192 Active users \u2192 Export users. Lands as one PST per mailbox, native Office files per OneDrive/SharePoint site (folder structure preserved), HTML transcripts for chats, and a users .csv, expect very large downloads on a slow drip. Requires the eDiscovery Manager role, and per-plan/per-form Excel exports cover Planner boards and Forms responses one at a time.\n\nLet me know if you have any questions or would like us to pull this!",
+  "notes": [
+    "Export requires the eDiscovery Manager role and downloads are very large on a slow drip.",
+    "Planner boards and Forms responses export per plan or per form to Excel, one at a time."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case microsoft-365-ediscovery-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -1,0 +1,29 @@
+{
+  "service_id": "google-workspace",
+  "display_name": "Google Workspace",
+  "aliases": [
+    "Google",
+    "Google Calendar",
+    "Google Chat",
+    "Google Docs",
+    "Google Drive",
+    "Google Gmail",
+    "Gmail",
+    "Google Meet",
+    "Google Sheets",
+    "Google Slides",
+    "Google Takeout",
+    "Google Workspace export",
+    "Google organization export",
+    "Google Takeout org export"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Organization Wide Export\n\n- **We pull it**, Instructions: as a super admin (account 30+ days old, 2SV on), admin.google.com \u2192 Data \u2192 Data import & export \u2192 Data Export \u2192 Set up new export \u2192 Start export \u2192 wait for the completion email (48\u201372 hrs, up to 14 days) \u2192 Access archive \u2192 copy the bucket name out of the URL (the takeout-export-<uuid> string). Then run rclone authorize \"google cloud storage\" on any machine with a browser, sign in as that same super admin and approve read-only access, it prints a one-line JSON token between the ---> and <---End paste markers, and send that JSON plus the bucket name to us by secure means, never plaintext email or chat; once we confirm the copy is complete, revoke it at myaccount.google.com \u2192 Security \u2192 Third-party access.\n\nThis export process can take a few days, so please complete it as soon as possible. If you are doing this for the google drive of a single user, the process might be a bit different. Happy to answer any questions.",
+  "notes": [
+    "Google product names identify logical scope but do not determine the transfer route by themselves.",
+    "Workspace and Takeout exports can bundle multiple products and may report overlapping totals."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case google-workspace-family-seen-case)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

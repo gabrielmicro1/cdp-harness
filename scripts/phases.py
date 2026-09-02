@@ -101,6 +101,57 @@ def read_used_capacity(cfg: dict, dry_run: bool = False):
     return None, None
 
 
+# Bytes of account Ingress below which we treat the window as "no writes".
+# A genuinely idle account still logs a few KB of transaction ingress
+# (monterey-financial, 19 days at zero blobs: 35 KB total over 49 h, max 8 KB
+# in any hour). Active accounts are 5-6 orders of magnitude above this
+# (bacancy 2.42 GB/25 h, helpsy 12.4 TB/49 h), so 1 MB separates them with
+# enormous margin.
+INGRESS_FLOOR_BYTES = 1_000_000
+
+
+def read_ingress(cfg: dict, since: str, dry_run: bool = False):
+    """Total bytes WRITTEN to the account since `since` (ISO-8601 Z) → int,
+    or None when the metric can't be read.
+
+    Ingress is a TRANSACTION metric: PT1M granularity, emitted as writes
+    happen. UsedCapacity is a CAPACITY SNAPSHOT that ARM re-emits every hour
+    carrying the last known value — so it can be many hours stale while its
+    timestamp reads as current. See skip_check for why that distinction is
+    load-bearing.
+
+    Both --start-time AND --end-time are passed: az returns a single bucket
+    for the whole window when --end-time is omitted, which would silently
+    collapse the sum."""
+    end = common.iso(common.utc_now())
+    data = common.az_json([
+        "monitor", "metrics", "list",
+        "--resource", sa_resource_id(cfg),
+        "--metric", "Ingress", "--interval", "PT1H",
+        "--start-time", since, "--end-time", end,
+        "--aggregation", "Total",
+    ], dry_run=dry_run)
+    if data is None:
+        return None
+    try:
+        points = data["value"][0]["timeseries"][0]["data"]
+    except (KeyError, IndexError):
+        return None
+    return int(sum(pt.get("total") or 0 for pt in points))
+
+
+def _last_measured_run(root: Path, slug: str):
+    """The most recent run that actually LISTED the container (method
+    "sized"), not one that copied numbers forward. That run's timestamp is
+    the last moment we truly know the container's contents, so it is the
+    correct start of the ingress window: a chain of copied-forward runs must
+    not keep sliding the window forward past writes nobody ever looked at."""
+    for run in common.latest_runs(root, slug, 50):
+        if run.get("method") == "sized" and "totals" in run:
+            return run
+    return None
+
+
 def skip_check(root: Path, slug: str, cfg: dict, dry_run: bool = False,
                force: bool = False) -> dict:
     """Decide launch vs copy-forward. Unchanged metric AND a previous run with
@@ -120,11 +171,47 @@ def skip_check(root: Path, slug: str, cfg: dict, dry_run: bool = False,
     if prev is None or "totals" not in prev:
         return {"skip": False, "metric": metric, "metric_at": metric_at,
                 "reason": "no previous sizing run"}
-    if prev.get("used_capacity_bytes") == metric:
-        return {"skip": True, "metric": metric, "metric_at": metric_at,
-                "reason": f"UsedCapacity unchanged ({metric} bytes)"}
-    return {"skip": False, "metric": metric, "metric_at": metric_at,
-            "reason": f"UsedCapacity changed {prev.get('used_capacity_bytes')} → {metric}"}
+    if prev.get("used_capacity_bytes") != metric:
+        return {"skip": False, "metric": metric, "metric_at": metric_at,
+                "reason": f"UsedCapacity changed {prev.get('used_capacity_bytes')} → {metric}"}
+
+    # The metric is unchanged — but "unchanged" is exactly what a FROZEN
+    # metric also looks like, and a frozen one gets stamped into the run file
+    # and then matches itself indefinitely. oneorb, 2026-09-01: UsedCapacity
+    # froze at 236 MB at 16:00Z and still read 236 MB at 00:00Z while 678 GB
+    # sat in the container; the 670 GB S3 ingest landed at ~19:53Z inside that
+    # blind window and the daily brief published 2.1% instead of 196.5%.
+    # metric_at is no defence: ARM re-emits the stale value hourly under a
+    # current timestamp. So two independent guards must also pass.
+
+    # Guard 1 — hard invariant. UsedCapacity is ACCOUNT-level and the
+    # container is a subset of the account, so the metric can never honestly
+    # sit below the compressed bytes we ourselves listed. If it does, it is
+    # stale (or data was deleted) and either way we must look.
+    measured = _last_measured_run(root, slug)
+    prev_compressed = (measured or {}).get("totals", {}).get("compressed_bytes")
+    if prev_compressed and metric < prev_compressed:
+        return {"skip": False, "metric": metric, "metric_at": metric_at,
+                "reason": (f"stale UsedCapacity: metric {metric} B is below the "
+                           f"{prev_compressed} B we listed on "
+                           f"{(measured or {}).get('timestamp')} — sizing")}
+
+    # Guard 2 — did anything actually get WRITTEN since we last looked?
+    # Ingress answers that directly and in near-real-time, where the capacity
+    # snapshot only answers it eventually.
+    since = (measured or prev).get("timestamp")
+    ingress = read_ingress(cfg, since, dry_run=dry_run) if since else None
+    if since is None or ingress is None:
+        return {"skip": False, "metric": metric, "metric_at": metric_at,
+                "reason": "ingress unreadable — sizing to be safe"}
+    if ingress > INGRESS_FLOOR_BYTES:
+        return {"skip": False, "metric": metric, "metric_at": metric_at,
+                "reason": (f"{ingress} bytes written since {since} despite "
+                           f"UsedCapacity unchanged — sizing")}
+
+    return {"skip": True, "metric": metric, "metric_at": metric_at,
+            "reason": (f"UsedCapacity unchanged ({metric} bytes) and "
+                       f"{ingress} bytes written since {since}")}
 
 
 def write_copied_forward_run(root: Path, slug: str, metric, metric_at) -> Path:

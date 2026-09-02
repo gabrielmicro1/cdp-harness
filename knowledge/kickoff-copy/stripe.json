@@ -1,0 +1,13 @@
+{
+  "service_id": "stripe",
+  "display_name": "Stripe",
+  "aliases": [],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it** -- Create a read-only restricted API key (Developers \u2192 API keys \u2192 Create restricted key, read access) and submit it in the portal (encrypted, never Slack or email). We pull every resource, charges, customers, invoices, subscriptions, payouts, disputes, balance transactions and more, per-resource via the API, so nothing to export by hand.\n\nLet me know if you have any questions about this process, or would like to push it yourself!",
+  "notes": [
+    "Pull coverage follows the read access granted on the restricted key."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case stripe-restricted-key-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

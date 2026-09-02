@@ -1,0 +1,13 @@
+{
+  "service_id": "amplitude",
+  "display_name": "Amplitude",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Settings \u2192 Organization settings \u2192 Projects \u2192 [project] \u2192 General \u2192 Export Data \u2192 pick a date range. Lands as a .zip of gzipped newline-delimited JSON; repeat per project and per date window\n\nLet me know if you have any questions on this process or want us to pull this data!",
+  "notes": [
+    "Exports run one project and one date window at a time."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case amplitude-project-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -54,6 +54,34 @@
       "note": "read-only download token for client Titan (data buyer), requested by Gabe 2026-08-29",
       "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/song-division-usa-h/song-division-usa-h-read-sas-20260829T222834Z.zip",
       "fingerprint": "3d63d4964b70"
+    },
+    {
+      "id": "oneorb-20260831T154303Z",
+      "slug": "oneorb",
+      "storage_account": "oneorbproda79818",
+      "container": "oneorb-raw",
+      "permissions": "racwl",
+      "signing": "account-key",
+      "created_at": "2026-08-31T15:43:03Z",
+      "expires_at": "2026-09-14T15:43:03Z",
+      "days": 14,
+      "note": "Gabe: initial client push credentials so oneorb can upload their corpus",
+      "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/oneorb/oneorb-push-sas-20260831T154303Z.zip",
+      "fingerprint": "36f455004a26"
+    },
+    {
+      "id": "gr0-20260831T160939Z",
+      "slug": "gr0",
+      "storage_account": "gr0prodc8d1de",
+      "container": "gr0-raw",
+      "permissions": "racwl",
+      "signing": "account-key",
+      "created_at": "2026-08-31T16:09:39Z",
+      "expires_at": "2026-09-14T16:09:39Z",
+      "days": 14,
+      "note": "initial client push token for GR0 corpus upload, requested by Gabe 2026-08-31",
+      "zip": "/Users/gabe/Documents/micro1/repos/cdp/cdp-harness/companies/gr0/gr0-push-sas-20260831T160939Z.zip",
+      "fingerprint": "0aa78d88f17f"
     }
   ]
 }

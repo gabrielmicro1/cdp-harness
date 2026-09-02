@@ -1,0 +1,16 @@
+{
+  "service_id": "outsystems",
+  "display_name": "OutSystems",
+  "aliases": [
+    "OutSystems Cloud"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Service Center (https://<env>/ServiceCenter) \u2192 Factory \u2192 Applications \u2192 open each app \u2192 Download for a .oap package per app, or Service Studio \u2192 Module menu \u2192 Export \u2192 Save As for a single .oml; for table data, Service Studio \u2192 Data tab \u2192 right-click entity \u2192 View Data \u2192 export to Excel, per entity. Lands as .oap/.oml app packages plus one .xlsx per entity on your disk, there is no self-service full-database download on OutSystems Cloud.\n- **We pull it**, Instructions: file a ticket with OutSystems Support for Direct Database Access with a read-only database user, choosing IP allowlisting and giving them our egress IPs; they return a file with the database address and username and send the password via SMS. Also create a LifeTime token via LifeTime console \u2192 User Management \u2192 Service Accounts \u2192 New Service Account (read-only role), then paste the DB address, username, password, and token into a one-time link at scrt.link and email us that link.\n\nLet me know if you would prefer to push this one or have us pull it!",
+  "notes": [
+    "No self-service full-database download exists on OutSystems Cloud; the pull route depends on an OutSystems Support ticket.",
+    "Push-route table data is exported per entity to Excel, not as raw database files."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case outsystems-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -1,0 +1,19 @@
+{
+  "service_id": "bitbucket",
+  "display_name": "BitBucket",
+  "aliases": [
+    "Bitbucket",
+    "Bitbucket Cloud",
+    "Bitbucket repositories",
+    "Bitbucket workspace"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Per repo, git clone --mirror https://bitbucket.org/<workspace>/<repo>.git for full commit history, all refs, and branch tracking; for issues, Repository settings \u2192 Issues \u2192 Import & export \u2192 Export. Lands as one bare git repo folder per repository plus a .zip of issue JSON + attachments per repo. Atlassian Support.\n- **We pull it**, Instructions: Settings \u2192 Atlassian account settings \u2192 Security \u2192 Create and manage API tokens \u2192 Create API token with scopes \u2192 name it, set an expiry, select Bitbucket as the app, tick the read scopes for repositories, pull requests, issues, wikis, and account (create it from a workspace admin account or it won't see everything). Copy the token immediately, it's displayed only once, and send it to us over secure means along with your Atlassian account email.\n\nWe can pull this data automatically or you push it. Please let me know which you prefer!",
+  "notes": [
+    "Mirror clones cover git history only; issues, pull request comments, wikis, and attachments need the issue export or the API pull.",
+    "Bitbucket Cloud has no single built-in whole-workspace export."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case bitbucket-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -1,0 +1,17 @@
+{
+  "service_id": "miro",
+  "display_name": "Miro",
+  "aliases": [
+    "Miro boards",
+    "RealtimeBoard"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Per board: open board \u2192 three dots (\u22ee) \u2192 Board \u2192 Download board backup, which drops an `.rtb` file on your disk (1 GB limit per board, one board per run); Boards \u2192 Export as PDF/image/CSV gets you a visual copy. On Enterprise only, an eDiscovery Admin can bulk it: Admin console \u2192 Enterprise Guard \u2192 eDiscovery \u2192 Cases \u2192 Exports \u2192 Download boards, landing as one archive (auto-split above 50 GB) with up to 1,000 boards per job, downloadable for 14 days. [Miro + 4](https://help.miro.com/hc/en-us/articles/360017572774-How-to-save-board-backup)\n- **We pull it**, Instructions: Profile avatar \u2192 Settings \u2192 Your apps \u2192 Create new app (in a Developer team) \u2192 tick the `boards:read` scope \u2192 Install app \u2192 copy the access token, then send it to us over secure means. If you're on Enterprise, instead log in as Company Admin and grab the Discovery access token from the Enterprise integrations admin console, that one reaches everything; send that over secure means.\n\nPlease let me know if you would prefer we pull the data or you push it!",
+  "notes": [
+    "Board backups are capped at 1 GB per board and eDiscovery exports at 1,000 boards per job.",
+    "Both routes are partial: exports and the API each omit some board data."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case miro-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

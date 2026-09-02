@@ -1,0 +1,18 @@
+{
+  "service_id": "micro1-standard-upload",
+  "display_name": "Micro1 Standard Upload",
+  "aliases": [
+    "client push",
+    "standard upload",
+    "client_push.sh"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "Yes, you can push the completed exports through the secure CDP platform.\n\nPlease:\n1. Create one parent folder, such as `exports`.\n2. Inside it, create one folder for each service and place the correct files or ZIP archives in each folder.\n3. In the CDP platform, add the upload machine's current public IP and download the current credential bundle and `client_push.sh`.\n4. Run `client_push.sh` against the parent folder.\n\nOnce the upload finishes, let us know which services were included and whether any files failed. We'll verify the received files and bytes before marking them complete.",
+  "notes": [
+    "Immediate child folder names determine destination service prefixes.",
+    "A successful upload does not prove that the provider export was complete."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case micro1-standard-upload-push)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

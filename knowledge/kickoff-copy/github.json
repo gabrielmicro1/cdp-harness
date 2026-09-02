@@ -1,0 +1,17 @@
+{
+  "service_id": "github",
+  "display_name": "GitHub",
+  "aliases": [
+    "Git Hub",
+    "GitHub repositories",
+    "GitHub organization"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**: Open the GitHub source in the CDP platform, authenticate to the correct account, and select the organization and repositories in scope. Nothing needs to be pasted into Slack.\n\nOnce connected, let us know here and we will start pulling the data!",
+  "notes": [
+    "Repository cloning alone does not prove coverage of issues, pull requests, releases, wikis, LFS objects, or organization metadata."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case github-platform-seen-case)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

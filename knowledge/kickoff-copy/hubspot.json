@@ -1,0 +1,15 @@
+{
+  "service_id": "hubspot",
+  "display_name": "HubSpot",
+  "aliases": [
+    "HubSpot CRM"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: For each object, CRM \u2192 Contacts (then Companies, Deals, Tickets, Calls, each custom object) \u2192 open the All [records] view \u2192 Export \u2192 pick CSV or XLSX \u2192 Include all properties \u2192 Export. Repeat per object; each one lands as an emailed download link that expires after 30 days, capped at 1 million records per export.\n- **We pull it**, Instructions: From a Super Admin account, Settings (gear icon) \u2192 Integrations \u2192 Private Apps (now labeled Legacy Apps in some portals) \u2192 Create a private app \u2192 Scopes tab \u2192 tick every read scope (CRM objects, files, automation, marketing email, forms) \u2192 Create app \u2192 Auth tab \u2192 Show token \u2192 Copy. Send us that access token over secure means.\n\nLet me know if you would prefer to push this data to us or have us pull it for you!",
+  "notes": [
+    "The verified precedent proves contacts, not a whole-account export."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case hubspot-object-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

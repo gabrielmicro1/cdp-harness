@@ -1,0 +1,15 @@
+{
+  "service_id": "salesforce",
+  "display_name": "Salesforce",
+  "aliases": [
+    "Salesforce CRM"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: from a System Administrator account, Setup \u2192 Quick Find \"App Manager\" \u2192 New External Client App \u2192 API (Enable OAuth Settings) \u2192 Enable OAuth \u2192 move over the api, refresh_token/offline_access and full scopes \u2192 Create, then Settings \u2192 OAuth Settings \u2192 Consumer Key and Secret. Paste the consumer key, consumer secret, and your My Domain login URL into a one-time link at scrt.link and email us that link.\n\nPlease let me know if you have any questions about this pull, or if you would rather push it yourself!",
+  "notes": [
+    "Pull coverage follows the API user's visibility and the granted scopes."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case salesforce-external-client-app-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -1,0 +1,17 @@
+{
+  "service_id": "google-cloud-storage",
+  "display_name": "Google Cloud Storage",
+  "aliases": [
+    "GCS",
+    "Google cloud bucket",
+    "Google Cloud bucket"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull the completed export directly from Google Cloud Storage.\n\nBefore we start, please reply with:\n- The complete `gs://` bucket and export path\n- Whether the bucket is owned by your company or was created by Google for a Workspace export\n- The expected object count and total size, if known\n\nIf the bucket is company-owned, we'll provide a Micro1 transfer identity for temporary read-only access. Submit the complete GCS path through the secure CDP platform once we confirm the route.\n\nIf Google created the bucket and you cannot change its access, let us know before copying anything so we can confirm the correct next step. If you would prefer to push the export instead, let us know.",
+  "notes": [
+    "Google-managed Workspace Export buckets may require a temporary company-owned bucket."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case gcs-readonly-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

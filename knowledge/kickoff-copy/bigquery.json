@@ -1,0 +1,16 @@
+{
+  "service_id": "bigquery",
+  "display_name": "BigQuery",
+  "aliases": [
+    "Google BigQuery"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: Cloud console \u2192 IAM & Admin \u2192 Service Accounts \u2192 Create service account \u2192 grant it BigQuery Data Viewer and BigQuery Job User at project level \u2192 Keys \u2192 Add key \u2192 Create new key \u2192 JSON. If your org policy blocks key creation, tell us and hand over a Workload Identity binding instead. Paste the JSON key into a one-time link at scrt.link and email us that link.\n\nLet me know if you would prefer to push this data yourself!",
+  "notes": [
+    "Pull coverage follows the service account's project-level grants; datasets outside them are invisible.",
+    "Org policies that block service-account keys require a Workload Identity binding instead."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case bigquery-service-account-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

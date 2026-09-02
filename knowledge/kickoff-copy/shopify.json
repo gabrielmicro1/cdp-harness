@@ -1,0 +1,14 @@
+{
+  "service_id": "shopify",
+  "display_name": "Shopify",
+  "aliases": [],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Run each list export separately, Products \u2192 Export \u2192 All products, then the same on Orders, Customers, Discounts, Inventory, and Online Store \u2192 Themes \u2192 \u22ef \u2192 Download theme file. Anything over 50 records is emailed to the store owner as a link instead of downloading, so you end up with a pile of CSVs plus a theme .zip.\n- **We pull it**, Instructions: Settings \u2192 Apps \u2192 Develop apps \u2192 Build apps in Dev Dashboard \u2192 Create app \u2192 in Access, tick the read-only scopes (read_products, read_orders and read_all_orders, read_customers, read_content, read_themes, read_files, read_discounts, read_inventory, read_metaobjects) \u2192 Release \u2192 Installs \u2192 Install app. Then copy the app's client ID and client secret, paste both into a one-time link at scrt.link, and email us that link.\n\nLet me know if you would like to push this to us or have us pull it for you!",
+  "notes": [
+    "Admin exports over 50 records are emailed to the store owner as links rather than downloading directly.",
+    "Pull coverage follows the granted read-only scopes."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case shopify-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

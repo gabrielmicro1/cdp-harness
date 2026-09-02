@@ -1,0 +1,17 @@
+{
+  "service_id": "aws-s3",
+  "display_name": "AWS S3",
+  "aliases": [
+    "S3",
+    "AWS bucket",
+    "S3 bucket"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull directly from the S3 bucket and prefix in scope.\n\nBefore we start, please confirm the AWS region, exact bucket and prefix, expected object count, and total size.\n\nPlease:\n1. Create temporary read-only access limited to the required bucket and prefix, including object listing and object read permissions.\n2. Submit the bucket, prefix, region, and temporary access details through the secure CDP platform. Please do not share credentials or presigned URLs in Slack.\n\nOnce submitted, let us know here and we'll verify access and begin the pull. We'll compare source and destination objects and bytes before completion, after which you can revoke the temporary access.\n\nIf you would prefer to push the files instead, let us know.",
+  "notes": [
+    "Transport proof does not prove logical archive completeness."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case aws-s3-readonly-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

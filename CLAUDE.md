@@ -79,10 +79,15 @@ companies/                   # ALL runtime state; gitignored (local only)
     reports/                 # per-company HTML reports + nudge drafts
     blob-index.tsv.gz        # per-blob sizing cache (zip/gz rows, ETag-keyed);
                              # rebuilt by each harvest — the incremental-run seed
+    slack/                   # Slack engine state: channel.json (registration,
+                             #   parents, high-water marks), snapshot.json (merged
+                             #   normalized channel read), drafts.json (receipts)
   .fleet-state.json          # transient in-flight fleet state; gitignored
   .sas-ledger.json           # client push-SAS ledger (metadata only, never
                              # tokens); written by mint_push_sas.py; gitignored
   .sizer-work/               # local sizer work files (<slug>-sizer.*); gitignored
+  .voice/                    # harvested sent-message corpus (messages.jsonl),
+                             #   reviewed style.md, harvest-state.json; gitignored
   .archive/<slug>/           # offboarded companies (full state, intact); the dot
                              # prefix hides them from list_companies -> dashboard
                              # and every fleet loop; restore moves them back
@@ -97,6 +102,10 @@ companies/                   # ALL runtime state; gitignored (local only)
   verify-completion/SKILL.md
   deep-verify/SKILL.md                     # stream-measure every archive on an in-region VM
   daily-brief/SKILL.md
+  slack-kickoff/SKILL.md                   # one private draft per service thread (connector-only)
+  slack-kickoff/references/read-protocol.md  # the shared connector→snapshot read steps
+  slack-inbox/SKILL.md                     # what needs a reply + draft it (per company or --all)
+  harvest-voice/SKILL.md                   # build/refresh the user's sent-message voice store
   mint-sas/SKILL.md                        # client push SAS (racwl, 14-day default) + ledger + tokens page
   gcs-azure-transfer/SKILL.md              # GCS export → <slug>-raw via transfer VM
   gcs-azure-transfer/references/commands.md
@@ -175,6 +184,16 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   saxon_sp_vm_pull.py        # VM-side one-off: Graph delta walk → per-file diff → create-only
                              #   server-side copy of MISSING files into the client's own sharepoint/
                              #   prefix (calibration-gated; pushed like teams_vm_pull.py)
+  helpsy_url_pull.py         # ONE-OFF (helpsy only, slug-guarded): copies an S3
+                             #   corpus from two client-supplied URL LISTS already
+                             #   sitting in the container; laptop-local, Put Blob
+                             #   From URL, no VM
+  wallaroo_takeout_pull.py   # ONE-OFF (wallaroo-media only, slug-guarded): Google
+                             #   Takeout DOWNLOAD LINKS → blob; engine VM lifecycle +
+                             #   cURL parsing, probe, laptop-side verify
+  wallaroo_takeout_vm_pull.py # VM-side one-off: resumable urllib download of each
+                             #   archive part → size check → azcopy → delete local
+                             #   (pushed like saxon_sp_vm_pull.py)
   qwilr_transfer.py          # Qwilr REST → blob REST ingest; local, standalone
   qwilr_csv_pull.py          # Qwilr support-CSV → blob ingest (API-less fallback):
                              #   fetches each page's public/collaborator HTML +
@@ -182,9 +201,20 @@ scripts/                     # the deterministic layer (python3, stdlib only)
   vimeo_transfer.py          # Vimeo → blob via Put-Block-From-URL server-side copy; local, standalone
   zoom_transfer.py           # Zoom recordings → blob via Put-Block-From-URL server-side copy; local, standalone
   bootstrap-vm.sh            # transfer-VM bootstrap (rclone+azcopy+tmux), ssh-piped
+  slack_engine.py            # Slack engine (connector-only, snapshot-driven): registration,
+                             #   snapshot ingest, parent discovery, manifest reconcile,
+                             #   kickoff plan, draft receipts, inbox, voice store; never
+                             #   talks to Slack — see docs/superpowers/specs/2026-09-01-slack-engine-design.md
+  import_slack_operator.py   # ONE-OFF: seed knowledge/kickoff-copy/ from the
+                             #   corpus-transfer-slack-operator plugin catalog + import
+                             #   its live registrations into companies/<slug>/slack/
   gen_report.py              # per-company HTML report
   gen_dashboard.py           # fleet index.html
   verify_completion.py       # completion checklist
+knowledge/
+  kickoff-copy/              # COMMITTED kickoff library: one JSON per service
+                             #   (aliases, direction, message, status, notes);
+                             #   onboarding.json + progress-check.json are the fixed kinds
 reports/
   index.html                 # generated fleet dashboard (my working view)
   sas-tokens.html            # generated push-SAS tokens page (mint_push_sas.py page)
@@ -192,7 +222,10 @@ tests/
   fixtures/companies/democo/ # fake company for offline validation
   fixtures/slack-export-mini.zip        # SYNTHETIC Slack export (schema, never client data);
   fixtures/make_slack_export_mini.py    #   regenerate with the generator beside it
+  fixtures/slack/            # synthetic channel snapshot for the Slack engine tests
   test_harness.py            # runs all offline validation; python3 tests/test_harness.py
+  test_slack_engine.py       # Slack engine unit tests (also run by test_harness.py)
+  test_import_slack_operator.py  # one-off seed/import tests (also run by test_harness.py)
 ```
 
 Ownership: `size_company.py` and `fleet_size.py` are thin CLIs over
@@ -548,11 +581,50 @@ Before launching, read the storage account's `UsedCapacity` metric via
 latest datapoint equals the `used_capacity_bytes` recorded in the last sizing
 run, write a new run file with `method: "copied-forward"` copying the last
 run's numbers, and skip the launch. Webspiders' 45-minute listing should only
-happen on days webspiders actually pushed. Caveats: the metric is
-**account-level** (includes `-scrubbed` etc. — a scrub run can force one
-redundant re-size; harmless) and lags up to ~an hour; both errors are in the
-safe direction (a false "changed" just re-sizes; a same-hour push is caught the
-next morning). No previous sized run → always launch.
+happen on days webspiders actually pushed. No previous sized run → always
+launch. The metric is **account-level** (includes `-scrubbed` etc. — a scrub
+run can force one redundant re-size; harmless).
+
+**UsedCapacity alone is NOT a safe change detector, and its staleness is
+invisible.** It is a capacity SNAPSHOT that ARM re-emits every hour carrying
+the *last known* value, so `metric_at` always reads as current no matter how
+old the number is — you cannot detect staleness from the timestamp. Refresh is
+best-effort and irregular: helpsy's moved every 2-3 h while oneorb's froze for
+8+ h. The failure this produces is silent and self-perpetuating: a frozen value
+gets stamped into the run file as `used_capacity_bytes`, and the next run
+compares the same frozen value against itself, matches, and copies forward —
+indistinguishable from a healthy skip. On 2026-09-01 oneorb's metric froze at
+236 MB at 16:00Z; a 670 GB S3 ingest landed at ~19:53Z; the 23:09Z fleet run
+skipped it and the daily brief published **2.1% complete for a container
+holding 678 GB (196.5%)**.
+
+So a skip now requires the unchanged metric **plus two independent guards**
+(`phases.skip_check`); any one failing means launch:
+
+1. **The hard invariant.** UsedCapacity is account-level and the container is a
+   subset of the account, so the metric can never honestly sit *below* the
+   `totals.compressed_bytes` we ourselves listed in the last `method: "sized"`
+   run. If it does, it is stale (or data was deleted) and we must look either
+   way. This is free — the number is already in the run file.
+2. **Ingress since we last looked.** `Ingress` is a TRANSACTION metric (PT1M
+   granularity, emitted as writes happen), so it sees what the capacity
+   snapshot misses: on oneorb it recorded 8.37 GB at 15:22Z and 422.8 + 247.8
+   GB at 18:22Z/19:22Z while UsedCapacity sat at 0.236 GB. The window starts at
+   the last **measured** run (`_last_measured_run`), never the last
+   copied-forward one, so a chain of skips cannot slide the window past writes
+   nobody ever looked at. Below `INGRESS_FLOOR_BYTES` (1 MB) counts as no
+   writes: a genuinely idle account still logs a few KB (monterey-financial,
+   19 days at zero blobs, logged 35 KB over 49 h), while active accounts run
+   5-6 orders of magnitude above it (bacancy 2.42 GB/25 h, helpsy 12.4 TB/49 h).
+   An unreadable Ingress metric fails safe (size).
+
+Both `az monitor metrics list` calls for Ingress pass `--start-time` AND
+`--end-time`: with `--end-time` omitted az collapses the whole window into a
+single bucket, which would silently zero the sum.
+
+Errors remain in the safe direction — a false "changed" just costs one
+listing — but "safe" now means *we looked*, not *the metric agreed with
+itself*.
 
 ### The vm block is informational
 
@@ -1041,6 +1113,145 @@ duplicate the corpus); `transfer --diff-only` is the mandated first pass.
 Size mismatches and dest-only files are recorded, never touched. The
 census artifacts live in `companies/saxon/reports/sharepoint-census-20260827/`.
 
+**The helpsy URL-list pull (one-off, not a family).**
+`scripts/helpsy_url_pull.py` copies an S3 corpus the client delivered as two
+gzipped URL LISTS uploaded into their own container (helpsy only,
+slug-guarded) — `aws/presigned-urls.txt.gz` (1,263 SigV4 urls,
+`X-Amz-Expires=172800`, four buckets) and `aws/public-urls.txt.gz` (1,721,773
+anonymous urls, three buckets), each line `FILE: <url>`, no sizes and no
+manifest. **No VM, and the reason generalises:** `Put Blob From URL` is a
+SERVER-SIDE copy, so whoever drives it only issues one small control call per
+object and the bytes never transit them — a VM buys unattended runtime, never
+throughput. So this rides the qwilr/vimeo/zoom laptop shape
+(`phases.ip_rule_ensure`, racwl container SAS held in-process, create-only
+`If-None-Match: *`, no state file), reusing `s3_flat.py`'s per-thread
+keep-alive connection pool as the transport (measured live: ~1,140 objects/s
+at concurrency 256, so 1.72M objects is ~26 min). Dest is
+`aws/<bucket>/<percent-decoded key>` — INSIDE the client's own prefix, so the
+saxon discipline applies: **zero bookkeeping blobs in the container**, every
+byte of run state local under `companies/helpsy/aws-pull/`. The copy SOURCE is
+always the list line verbatim (already encoded); only the NAME is decoded.
+Because there is no census, the large-object route is lazy: a refusal from
+Azure while S3 itself answered fine (`x-ms-copy-source-status-code` 200/206)
+triggers ONE size probe for that object and, above 256 MiB, a block-staged
+redo — which is also why a 409 counts as "already landed" ONLY when its code
+is `BlobAlreadyExists` (an oversized source can answer 409 too, and reading
+that as success would silently drop the object). `classify()` keys on the
+copy-source status (the slack rule — two servers can refuse us): a source 403
+is `presigned-expired-or-invalid` / `public-access-revoked` and aborts the SET
+after 25 CONSECUTIVE, never on the first (one odd object must not kill a
+1.7M-object run, and 1.7M logged failures must not scroll past a revoked
+policy); a source 404 is a recorded gap; OUR 403 is the firewall and re-runs
+`ip_rule_ensure` (helpsy sits in a `rg-corpus-*-prod` RG, where the
+provisioner is known to strip rules). Verify is a streaming merge-join of the
+sorted expected names against the container listing and asserts **presence,
+not source bytes** — the lists declare no sizes, so the byte figure is the
+CONTAINER's. Ground truth from the real lists, all live-probed: 8 presigned
+keys are S3 folder placeholders (excluded — a blob name may not end in `/`);
+175 public keys ARE urls (`https%3A//helpsy-images-public.s3...`) and 1 has a
+leading slash, all of which resolve 200 and are named verbatim (legal only
+because the account has no hierarchical namespace); zero name collisions
+across the seven buckets; and no redirects anywhere, which matters because
+Azure's copy does not follow them. `expected-data-sizes.json` needs no change:
+the `"aws"` service already matches the `aws` top-level prefix by name.
+
+**The wallaroo-media Takeout link pull (one-off, not a family).**
+`scripts/wallaroo_takeout_pull.py` + `scripts/wallaroo_takeout_vm_pull.py`
+ingest a personal-account Google Takeout the client requested as **"send
+download link"** rather than "export to Drive" (wallaroo-media only,
+slug-guarded): **442.30 GB across 12 files** (measured 2026-08-31; the client
+had said 412 GB / 11 — probe caught both) existing only behind authenticated
+Takeout download URLs, so there is no bucket to rclone and no OAuth token to
+mint. **Takeout ground truth, all measured live and each driving code:**
+`i=` indexes the ARCHIVES of a job, NOT the parts of one archive — the server
+keys off `j=`+`i=` and REWRITES the filename, so the name in the URL path is
+ignored (i=0 asked for `…-5-001.zip`, i=1 returned `…-1-001.zip`) and ONE
+cURL enumerates the whole job; past the last index Google answers HTTP
+**500**, not 404, which is how the end of the list is found; the client may
+paste the POST-redirect `takeout-download.usercontent.google.com/download/…`
+URL instead of the `takeout.google.com/settings/…` one and both work, both
+answering 206 so resume is real; and the files are NOT all zips — a job can
+serve a raw `All mail Including Spam and Trash-002.mbox` (137.79 GB on
+wallaroo, 31% of the corpus), **spaces in the name and no archive at all**,
+so the name whitelist tolerates spaces and the fallback preserves the real
+extension (naming an mbox `.zip` would send the sizer hunting a central
+directory that does not exist). The client copies the download
+requests out of Chrome DevTools as cURL commands; the VM
+(`xfer-takeout-wallaroo-media`, engine lifecycle verbatim) downloads and
+uploads them into `workspace-export/personal-takeout/` — a second-level
+folder inside the existing Workspace-export prefix, so it reconciles against
+the declared gdrive/gmail services with **no `expected-data-sizes.json`
+change** while staying its own `sources_l2` row. **The credential is the
+sharp edge:** a Chrome "Copy as cURL" carries the client's full Google
+SESSION COOKIES, i.e. the whole account, not a scoped token — heavier than
+anything else this harness handles. It rides stdin → ssh stdin → a 600 file
+on the VM and dies with the VM (never argv, tags, logs, or a laptop file);
+both sides strip `Cookie`/`Authorization` on any redirect leaving
+`google.com` (deliberate duplication, the zoho/teams TokenBox precedent);
+and the client instructions scope it further with an **Incognito window**
+whose session dies when they close it — which makes "close the window" the
+real end of the engagement, and therefore an actual message rather than a
+teardown side effect. **The failure mode that cost real blobs (2026-08-31, first live run):**
+Google answers an invalid session with **HTTP 200 and the sign-in PAGE**, not
+an error status — so a status-only check reads it as success. The VM smoke
+test passed on a 200, the puller never inspected what came back, and twelve
+~1.2 MB sign-in HTML documents were committed as `takeout-part-NNN.zip`
+before anything noticed. Every layer now proves it received a FILE: the
+final host must not be `accounts.google.com`, the Content-Type must not be
+`text/html`, and a response with no `Content-Disposition` is refused before
+a byte is written. Two further lessons from the same run: the
+`takeout.google.com` URL carries a **`rapt=` re-auth proof token** (Takeout
+downloads sit behind a "verify it's you" gate) which expires fast, while the
+post-redirect `usercontent` URL is already past that gate but lives only
+~20-30 minutes — so **either form gives roughly a 20-30 minute window per
+client interaction**, and a 442 GB corpus is therefore a MULTI-ROUND
+engagement, not one shot. And a prior `manifest.json` in the destination is
+the resume record, so a pass that committed the WRONG bytes poisons the next
+one (its names still resolve): `--ignore-prior` exists for exactly that, and
+is required until such blobs are removed.
+
+`probe` is the day-one gate and runs before any
+billable resource: exactly ONE 1-byte ranged GET per link, body never read,
+reporting each part's real size, its `Content-Disposition` filename, and
+whether the link is `open` / `auth-expired` (dead session; the client must
+re-copy, a retry cannot fix it) / `link-expired` (archives lapse ~a week
+after export, so a fresh one is days of client time) / `no-range-support`
+(resume unavailable, an interrupted part restarts from zero). Since the URLs
+differ only in `i=`, `--expand-parts N` clones one cURL across the index
+range, but the base is never guessed — it must be the FIRST part (i=0 or 1)
+or an explicit `--expand-start` — and `--probe-all` proves every generated
+link before a VM exists. `write-links` repeats the 1-byte test **from the
+VM**, which is not redundant: probe ran from the laptop's IP, and Google can
+treat the same cookie differently from a datacenter IP. **Transport is
+stage-then-azcopy, deliberately not a stream-through and not server-side
+copy**: Azure's `x-ms-copy-source-authorization` only speaks `Bearer` so it
+cannot carry a Cookie (the zoho wall), and staging decouples the two legs so
+an upload hiccup never costs a *download* — downloads are the scarce,
+expiring, allowance-limited resource. Per part: resumable `urllib` download
+(Range on every attempt; a 200 answer means Range was ignored, so the partial
+is discarded rather than concatenated), on-disk size checked against Google's
+declared `Content-Length`, azcopy `--overwrite=false` (client-side
+no-overwrite, the s3/github honesty — NOT `If-None-Match`), committed blob
+length confirmed, then the local copy deleted. **The blob's existence is the
+resume record** (azcopy commits atomically); because Takeout filenames come
+from `Content-Disposition` and are not derivable, the previous run's uploaded
+`manifest.json` is read at startup as the index→name map, and failing that
+`download()` aborts the instant the response headers reveal the part already
+landed — so a resume reads zero body bytes and needs no local state. Disk:
+`default_os_disk_gb=1024`, because the image default ~30 GB would not hold
+the 137.79 GB mbox; peak staging is the `parallel` biggest files at once
+(~298 GB at the default 4) and 1 TB holds the whole 442 GB export anyway, so
+deletion is an optimization rather than load-bearing. Verify runs on the **LAPTOP** via
+`phases.ip_rule_ensure` + an `rl` SAS and makes a **real source-truth claim**
+(unlike the github/zoho staged→container-only certification): Google declared
+each part's byte length, only a size-matching file was uploaded, and the
+committed blob length is compared against that same number — declared ==
+staged == committed, with the link set's part COUNT as the completeness bar,
+so a `--limit` pilot can never read as complete. `manifest.json` rides
+`--overwrite=true` for exactly that reason (the github pilot-poisons-verify
+fix). Out of scope: unzipping (parts land as `.zip`, which the sizer measures
+exactly via central directories) and any second export.
+
 **The VM-less ingests: qwilr, vimeo and zoom.** A Qwilr corpus is small JSON pulled from
 Qwilr's REST API (`api.qwilr.com/v1`, account-wide bearer token — no
 read-only scope exists; client revokes it after the engagement), so
@@ -1113,6 +1324,49 @@ of scope. S2S apps are account-bound — an org with several Zoom accounts
 (song-division) gets one app + one full cycle per account, sub-prefixed
 `--dest-prefix zoom-export/<label>` so verify stays per-account. Driven
 by the `zoom-azure-transfer` skill.
+
+## Slack (connector-only, draft-only)
+
+The client-Slack side lives in this repo: `scripts/slack_engine.py` plus the
+`slack-kickoff`, `slack-inbox`, and `harvest-voice` skills. It replaced the
+harness's handoff to the external `corpus-transfer-slack-operator` plugin
+(2026-09-01); that plugin stays installed but nothing here reads or writes
+its state. Rules, in priority order:
+
+1. **The only Slack write is `slack_send_message_draft`.** No skill calls
+   send, schedule, edit, delete, react, canvas, or conversation tools. Drafts
+   land in the user's Slack Drafts; the user sends.
+2. **Python never talks to Slack.** There are no Slack tokens in this repo.
+   Skills read through the Claude Slack connector, transcribe a normalized
+   snapshot (`companies/<slug>/slack/snapshot.new.json`, shape in
+   `.claude/skills/slack-kickoff/references/read-protocol.md`), and the
+   engine does everything after that: validation, merge, high-water marks,
+   parent discovery (bot-authored exact `[Label]` posts from the "Company
+   Transfer Setup" workflow), reconcile against `expected-data-sizes.json`
+   (an optional `"slack_label"` on a declaration pins a thread whose label
+   differs from the manifest name), kickoff planning, receipts, inbox, and
+   the voice store. Discovery only: the engine never creates parents.
+   `inbox` knows three kinds of author: the owner, registered teammates
+   (`teammate_user_ids` in `channel.json`, set at `register --teammates`
+   or later with `set-teammates`), and everyone else (clients). A
+   teammate-last conversation is not waiting on the owner and teammate
+   messages are never "unanswered", but only the owner's own reply or an
+   ack clears earlier client messages (2026-09-02: a fleet inbox listed
+   ~20 of 52 items a colleague had already answered).
+3. **Kickoff copy is data**: `knowledge/kickoff-copy/<service_id>.json`,
+   committed, one message per service, `status: approved|draft`; only
+   approved entries are planned. Load-time gate (blocking): required
+   fields, no em dash, no credential-shaped text, under 40k chars, unique
+   aliases. Seeded 2026-09-01 from the plugin's PR #25 catalog (53
+   services) plus the two fixed kinds. Editing copy is an ordinary commit.
+4. **Voice examples never supply facts.** `companies/.voice/` (gitignored)
+   holds the user's harvested sent messages with the message each answered,
+   tagged by intent/service, and a reviewed `style.md`; `voice-select`
+   returns tone examples only. Facts come from the thread, harness state,
+   the library, and the service knowledge base.
+5. **Never retry an unknown draft outcome** (a second attempt can duplicate
+   a draft). `draft_already_exists` and `not_in_channel` are recorded
+   outcomes; failure isolation applies per thread.
 
 ## Learned the hard way (from real croplabel / webspiders / latchel runs)
 

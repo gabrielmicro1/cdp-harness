@@ -1,0 +1,21 @@
+{
+  "service_id": "ringcentral",
+  "display_name": "RingCentral",
+  "aliases": [
+    "RingEX",
+    "RingCentral RingEX"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull the RingEX data directly for you.\n\nPlease:\n1. Sign in to the [RingCentral Developer Console](https://developers.ringcentral.com/console) as an admin.\n2. Create a REST API app using JWT authentication and name it \"Micro1 Export.\"\n3. Add these permissions: `ReadAccounts`, `ReadCallLog`, `ReadCallRecording`, `ReadMessages`, `ReadAuditTrail`, `TeamMessaging`, and `Video`.\n4. Make the app private and restricted to your RingCentral account.\n5. Go to your profile \u2192 Credentials, create a JWT credential, and restrict it to the Micro1 Export app.\n6. Submit the Client ID, Client Secret, and JWT through the secure CDP platform. Please do not share them in Slack.\n\nOnce submitted, let us know here and we'll verify access and handle the pull. After completion, you can revoke the JWT and delete the temporary app.",
+  "notes": [
+    "Only data still retained and exposed by supported RingEX APIs or exports can be pulled.",
+    "RingCX is not included.",
+    "Audit history is limited to 180 days or 10,000 records per account.",
+    "RingCentral Video recordings are generally retained for one year, and private meeting chat is not exposed through the history API.",
+    "The `TeamMessaging` and `Video` scopes are broader than read-only, so each requires explicit approval and application-level operation restrictions.",
+    "No single supported API provides a guaranteed complete or restorable RingEX configuration backup."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case ringcentral-ringex-jwt-pull-seen-case)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

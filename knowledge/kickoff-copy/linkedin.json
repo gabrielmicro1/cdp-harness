@@ -1,0 +1,14 @@
+{
+  "service_id": "linkedin",
+  "display_name": "LinkedIn",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: desktop web only \u2192 Me \u2192 Settings & Privacy \u2192 Data privacy \u2192 Get a copy of your data \u2192 Download larger data archive \u2192 Request archive (password confirm). Two emails arrive, a partial archive within minutes, the complete one within about 24 hours, each with a Download archive button live for 72 hours, landing a Complete_LinkedInDataExport_<date>.zip of CSVs plus media folders\n\nLet me know if you have any questions on this!",
+  "notes": [
+    "The request is available on desktop web only and the complete archive takes about 24 hours.",
+    "Each download link is live for 72 hours."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case linkedin-data-archive-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

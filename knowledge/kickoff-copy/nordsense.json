@@ -1,0 +1,16 @@
+{
+  "service_id": "nordsense",
+  "display_name": "Nordsense",
+  "aliases": [
+    "Nordsense platform"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Platform (web app) \u2192 Containers \u2192 Container List \u2192 filter + pick your columns, and Insights \u2192 Pickup Insights \u2192 switch graph to table view, then save each view/report from your browser. What lands on disk is per-view report files, the platform presents data as graphs and tables, but there's no documented one-click workspace-wide export, and raw 15-minute sensor readings aren't downloadable from the UI.\n\nPlease let me know if you have any questions. Place this data in a folder named Nordsense",
+  "notes": [
+    "No documented one-click workspace-wide export; reports are saved per view.",
+    "Raw 15-minute sensor readings are not downloadable from the UI."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case nordsense-view-report-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

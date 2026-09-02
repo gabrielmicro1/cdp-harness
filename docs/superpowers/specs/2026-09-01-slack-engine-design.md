@@ -1,7 +1,7 @@
 # Slack engine design
 
 Date: 2026-09-01
-Status: approved design, not yet implemented
+Status: approved design, implemented 2026-09-01 (see tests/test_slack_engine.py)
 
 ## Goal
 
@@ -24,7 +24,7 @@ onboarding handoff, and serves several skills from one code path:
 | --- | --- |
 | Slack access surface | Connector only. No tokens, no Slack Web API from Python. |
 | Thread parents | Discovery only. The "Company Transfer Setup" Slack workflow still posts them; the engine never posts. |
-| Kickoff copy library | Seeded from the plugin's origin/main `support-cases.json`, simplified to one message per service. |
+| Kickoff copy library | Seeded from the plugin's `support-cases.json`, simplified to one message per service. At implementation time origin/main held 24 services and the open PR #25 branch held 53 (a superset carrying the user's own copy), so the seed came from PR #25's catalog, version 2026-09-01.1. |
 | Draft-vs-sent feedback loop | None. The library changes only by explicit edit in session. |
 | Style mimicry | A harvested, tagged corpus of the user's sent messages plus a distilled, user-reviewed style guide. |
 | Engine shape | Snapshot-driven: skills transcribe a normalized channel read to disk, Python does everything after that. |
@@ -85,7 +85,8 @@ stdout, and exit nonzero with a one-line JSON error on bad input.
 
 | Command | Purpose |
 | --- | --- |
-| `register <slug> --channel-url --owner-user-id --company-name --channel-type public\|private\|slack_connect` | Create `channel.json`. Refuses if the channel id is already registered to another slug. Idempotent for the same slug. |
+| `register <slug> --channel-url --owner-user-id --company-name --channel-type public\|private\|slack_connect [--teammates U1,U2]` | Create `channel.json`. Refuses if the channel id is already registered to another slug. Idempotent for the same slug: an existing registration is returned unchanged, so the colleague list is edited with `set-teammates`, not by re-registering. |
+| `set-teammates <slug> --teammates U1,U2` | Replace the registration's list of micro1 colleagues in the channel (`--teammates ""` clears it). Refuses the owner's id and anything that is not a Slack user id. |
 | `record-canvas <slug> --canvas-id --title --permalink [--replace]` | Record the EDP Instructions canvas reference (title, file id, permalink only). |
 | `read-plan <slug>` | What the skill must read: channel id, channel high-water mark, known threads with their last-seen reply ts. |
 | `ingest <slug> <snapshot-file>` | Validate, merge into stored snapshot, advance high-water marks, run parent discovery, print the reconcile result. |
@@ -96,6 +97,7 @@ stdout, and exit nonzero with a one-line JSON error on bad input.
 | `ack <slug> --thread-ts` | Mark a conversation handled without a draft. |
 | `validate-library` | Load every kickoff entry and run the content checks. |
 | `voice-harvest <slug>` | Append the owner's messages from the snapshot to the voice store. |
+| `voice-untagged [--limit]` | Harvested rows still without tags, oldest first, with the message each answered. |
 | `voice-tag --ts --channel-id --tags` | Write tags onto a harvested row. |
 | `voice-select --intent --service --context-file [--limit 5]` | Style guide + best examples for a draft. |
 
@@ -115,6 +117,7 @@ Timestamps are ISO-8601 UTC except Slack `ts` values, which stay in Slack's
   "channel_url": "https://micro1-companies.slack.com/archives/C0BSRM7D4F5",
   "channel_type": "slack_connect",
   "owner_user_id": "U0BEK4RNLE5",
+  "teammate_user_ids": ["U0BAZSC7QDC", "U0BSKH5HBRC"],
   "instructions_canvas": {"canvas_id": "F0BUAGREL64", "title": "EDP Instructions",
                           "permalink": "https://micro1-companies.slack.com/docs/T0B8VHRABR7/F0BUAGREL64"},
   "parents": [
@@ -134,6 +137,10 @@ Timestamps are ISO-8601 UTC except Slack `ts` values, which stay in Slack's
 `service_id` on a parent is the matched kickoff-library id, or null when
 nothing matched. `acked` maps a conversation's parent ts (or a top-level
 message's own ts) to the newest message ts the user has handled.
+`teammate_user_ids` lists the micro1 colleagues who also answer in the
+channel (deduplicated, order kept, never the owner); registrations written
+before 2026-09-02 lack the key and read as an empty list. Anyone not the
+owner, a teammate, or a bot is a client.
 
 ### `companies/<slug>/slack/snapshot.json`
 
@@ -197,8 +204,13 @@ shows up as "drafted from older copy" without keeping message bodies.
 - `message` may use `{company_name}` and `{instructions_url}`.
 - `onboarding.json` and `progress-check.json` are fixed entries with
   `service_id` equal to their kind.
+- Route sections: a line opening with "You push it" or "We pull it" is a
+  route line and must read `- **You push it**` / `- **We pull it**` followed
+  by the rest of the line, with no (partial)/(full) qualifier
+  (`normalize_route_sections` produces that form; added 2026-09-01 after
+  the user asked for bold bullet route sections in Slack).
 - Load-time checks, all blocking: required fields present, status valid,
-  no em dash, no secret-shaped string (the plugin's pattern: Slack tokens,
+  route lines in the form above, no em dash, no secret-shaped string (the plugin's pattern: Slack tokens,
   AWS keys, bearer tokens, signed query strings, Stripe keys,
   `password:`/`api key:` style pairs), message under 40,000 characters,
   aliases unique across the library.
@@ -298,15 +310,33 @@ Library edits are ordinary commits in this repo.
 
 A conversation is a parent thread (parent plus replies) or a top-level
 message with no replies. `inbox` flags a conversation when its newest
-message is human, not the owner, and newer than both the owner's last
-message in that conversation and its `acked` mark. Conversations whose
-parent carries a `white_check_mark` reaction are excluded. Each item
-carries: parent ts, service label and id when it is a service thread,
-last author, age, `mentioned` (the owner's `<@id>` appears in any
-unanswered message), and the last five messages as context. Sort:
+message is human, not from the owner or a registered teammate, and newer
+than both the owner's last message in that conversation and its `acked`
+mark. Conversations whose parent carries a `white_check_mark` reaction are
+excluded. Each item carries: parent ts, service label and id when it is a
+service thread, last author, age, `mentioned` (the owner's `<@id>` appears
+in any unanswered message), and the last five messages as context. Sort:
 mentioned first, then oldest waiting. `inbox --all` loops registered
 companies and prints one list with the slug on each item; it is the hook
 the daily brief can call later.
+
+Teammate semantics (added 2026-09-02, after a fleet run listed 52 items of
+which about 20 had a micro1 colleague as last author, i.e. were waiting on
+the client, not the owner). Two rules, deliberately asymmetric:
+
+1. A teammate's message means the ball is in the client's court. A
+   conversation whose newest message is a teammate's is not listed, and
+   teammate messages are never counted in `unanswered`.
+2. A teammate answering is not the owner answering. The floor that clears
+   earlier client messages (and with them `mentioned` and
+   `waiting_since_ts`) is only the owner's own last message or an `ack`.
+
+So client asks with an @-mention, teammate replies, client asks again:
+listed, `unanswered` 2, `mentioned` true, waiting since the first client
+message. The owner decides whether the colleague's answer settled it, by
+replying or acking. An unregistered colleague is a client; the fix for a
+colleague showing up as `last_author` is `set-teammates`, not one ack per
+thread.
 
 Skill steps:
 
@@ -386,15 +416,20 @@ no longer referenced.
 duplicate label, client replies, owner replies, a mention, a
 `white_check_mark` parent) and a democo `channel.json`. Covered:
 
-- register idempotency and conflict; canvas record/replace
+- register idempotency and conflict; teammate list validation
+  (dedupe, owner refused, bad id refused) and `set-teammates`; canvas
+  record/replace
 - snapshot validation (reject bad shape), merge by ts, high-water marks
 - parent discovery, duplicate-label ambiguity, service matching ladder
 - reconcile against democo's `expected-data-sizes.json`, including
   `slack_label`
 - kickoff-plan: planned, missing, already-drafted, blocked, `--force`
 - record-draft receipts and hashing
-- inbox: ordering, mention priority, owner-replied exclusion, ack,
-  check-mark exclusion, `complete: false` partial flag, `--all`
+- inbox: ordering, mention priority, owner-replied exclusion,
+  teammate-last exclusion, the owner-only floor (client, teammate, client
+  stays listed with both client lines unanswered), an unregistered
+  colleague still reads as a client, a pre-teammate `channel.json` still
+  loads, ack, check-mark exclusion, `complete: false` partial flag, `--all`
 - validate-library: every blocking check, including the seeded entries
 - voice: harvest idempotency, `replied_to` resolution, redaction, tag
   write, select scoring and exclusion

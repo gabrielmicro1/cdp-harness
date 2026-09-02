@@ -1,0 +1,17 @@
+{
+  "service_id": "azure-storage",
+  "display_name": "Azure Storage",
+  "aliases": [
+    "Azure Blob Storage",
+    "AzureStorage"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: Entra ID \u2192 App registrations \u2192 New registration \u2192 Certificates & secrets \u2192 New client secret, then Storage account \u2192 Access control (IAM) \u2192 Add role assignment \u2192 grant that app Storage Blob Data Reader, Storage File Data Privileged Reader, Storage Table Data Reader, Storage Queue Data Reader, and Reader. Send the tenant ID, client ID, secret and storage account name to us by secure means, never plaintext email or chat; if the account has a firewall, also allowlist our egress IPs under Networking.\n\nLet me know if you would prefer to push this!",
+  "notes": [
+    "Pull coverage follows the data roles granted to the app registration.",
+    "A storage firewall without our egress IPs blocks the pull entirely."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case azure-storage-app-registration-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

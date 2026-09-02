@@ -1,0 +1,13 @@
+{
+  "service_id": "vimeo",
+  "display_name": "Vimeo",
+  "aliases": [],
+  "direction": "pull",
+  "status": "approved",
+  "message": "- **We pull it**, Instructions: [developer.vimeo.com](http://developer.vimeo.com) \u2192 Create an app \u2192 Generate Access Token \u2192 choose Authenticated (you) \u2192 tick the public, private and video_files scopes \u2192 Generate, then copy the token immediately (it's shown once). Do it from the account owner / team admin login or it won't see everyone's videos, and send the token to us by secure means, never plaintext email, chat, or a ticket.\n\nPlease let me know if you have any questions about this process! You can also push the data to us if you have already started going down that route.",
+  "notes": [
+    "The video_files scope is plan-gated, and a non-owner token cannot see other members' videos."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case vimeo-access-token-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

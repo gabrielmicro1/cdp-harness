@@ -1,0 +1,14 @@
+{
+  "service_id": "zapier",
+  "display_name": "Zapier",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Settings \u2192 Security and data \u2192 Data management \u2192 Download my account data\u2192 Export my data; separately, Zap History \u2192 filter \u2192 Export, and Tables \u2192 open table \u2192 toolbar menu \u2192 Download. Lands as an emailed .ZIP of JSON + CSV, plus one CSV per table straight to disk.\n\nLet me know if you have any questions on this process!",
+  "notes": [
+    "The account export arrives as an emailed ZIP rather than a direct download.",
+    "Tables export one CSV per table."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case zapier-account-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

@@ -1,0 +1,11 @@
+{
+  "service_id": "notion",
+  "display_name": "Notion",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: As a workspace admin, Settings \u2192 General \u2192 Export all workspace content \u2192 pick Markdown & CSV or HTML \u2192 Export. Notion emails you a download link (expires in 7 days; big workspaces can take up to 30 hours) pointing to a .zip of Markdown/HTML pages, CSV databases, and uploaded files.",
+  "notes": [],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case notion-workspace-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

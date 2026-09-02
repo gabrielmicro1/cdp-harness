@@ -1,0 +1,17 @@
+{
+  "service_id": "slack",
+  "display_name": "Slack",
+  "aliases": [
+    "Slack export",
+    "Slack workspace"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "Free/Pro\nWe will sponsor your upgrade to Business+\n\nBusiness+\n- **You push it**, Instructions: one-time setup first: Admin in sidebar \u2192 Workspace settings \u2192 Security \u2192 Import & export data \u2192 Export tab \u2192 submit an application link \u2192 request the \"All channels and conversations\" export type (needs Primary Owner sign-off; Slack support reviews it within a couple of business days). Once approved: same page \u2192 Export tab \u2192 choose All channels and conversations \u2192 pick date range \u2192 Start Export, and a .zip of JSON (now including private channels and DMs) lands via emailed link, still file links only, no file bodies.\n\nAs above, if you don't have a Business+ subscription, let us know ASAP and we will sponsor you.",
+  "notes": [
+    "The All channels and conversations export requires Business+ or Enterprise, Primary Owner sign-off, and Slack support approval.",
+    "Exports contain attachment file links only, not file bodies."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case slack-export-seen-case)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

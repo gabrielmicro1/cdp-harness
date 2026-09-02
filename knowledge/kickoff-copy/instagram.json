@@ -1,0 +1,14 @@
+{
+  "service_id": "instagram",
+  "display_name": "Instagram",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Instagram \u2192 Settings \u2192 Accounts Center \u2192 Your information and permissions \u2192 Export your information \u2192 Create export \u2192 pick the profile \u2192 Export to device \u2192 set All time, JSON, highest media quality \u2192 Start export, then confirm with your password. Instagram may take up to 30 days to prepare it and the finished download stays available for only four days, it lands as a .zip via an emailed link.\n\nLet me know if you have any questions about this!",
+  "notes": [
+    "Instagram can take up to 30 days to prepare the export.",
+    "The finished download stays available for only four days."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case instagram-account-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

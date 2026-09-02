@@ -1,0 +1,18 @@
+{
+  "service_id": "exchange-outlook",
+  "display_name": "Exchange and Outlook",
+  "aliases": [
+    "Exchange",
+    "Outlook",
+    "Microsoft Exchange",
+    "Outlook/Exchange"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "* An admin exports mailboxes via Microsoft Purview eDiscovery (as PST or individual messages), or a PST export per mailbox. Needs the Purview eDiscovery admin role.\n\nLet me know if you have any questions about this process!",
+  "notes": [
+    "Export requires the Purview eDiscovery admin role."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case exchange-outlook-ediscovery-pst-push)",
+  "updated_at": "2026-09-02T02:23:36Z"
+}

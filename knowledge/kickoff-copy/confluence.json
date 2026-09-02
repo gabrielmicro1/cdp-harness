@@ -1,0 +1,18 @@
+{
+  "service_id": "confluence",
+  "display_name": "Confluence",
+  "aliases": [
+    "Confluence Cloud",
+    "Atlassian Confluence",
+    "Confluence wiki"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it** - Instructions: Confluence administration (gear icon, top nav) \u2192 Settings \u2192 Data management \u2192 Backup manager \u2192 tick Backup attachments \u2192 Create backup for cloud, then download when it finishes. Lands as a zipped XML site backup on your disk - note only one backup file is stored at a time, and a new one overwrites the old.\n- **We pull it** - Instructions: from a site-admin Atlassian account, go to id.atlassian.com \u2192 Security \u2192 Create and manage API tokens \u2192 Create API token, and copy the token. Send us the token over secure means, along with the account's email address and your site URL.\n\nWe can either pull your data automatically or you can push it. Which method will you be doing?",
+  "notes": [
+    "Only one site backup is stored at a time; a new backup overwrites the previous one.",
+    "Both routes are partial: the site backup and the REST API each omit some site data."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case confluence-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

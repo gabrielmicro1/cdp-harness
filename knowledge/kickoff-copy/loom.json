@@ -1,0 +1,17 @@
+{
+  "service_id": "loom",
+  "display_name": "Loom",
+  "aliases": [
+    "Loom videos",
+    "Loom workspace"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Library \u2192 open each video \u2192 \u22ef menu above the player \u2192 Download (paid plans only, Business/Business+ AI/Enterprise; one video per click, lands as an .mp4). For workspace metadata: Workspace settings \u2192 Data tab \u2192 Export CSV for Engagement Insights and activity logs, and Members view \u2192 Export for the member list.",
+  "notes": [
+    "Video downloads require a paid plan and are one video per click; there is no bulk export.",
+    "Engagement Insights and activity logs export as CSV summaries, not raw event data."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case loom-download-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

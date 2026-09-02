@@ -1,0 +1,17 @@
+{
+  "service_id": "quickbooks-online",
+  "display_name": "QuickBooks Online",
+  "aliases": [
+    "QuickBooks",
+    "QBO"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Settings \u2699 \u2192 Export data \u2192 set date range \u2192 toggle Reports and Lists tabs \u2192 Export to Excel, then separately Settings \u2699 \u2192 Attachments \u2192 select all \u2192 Batch actions \u2192 Export, and Settings \u2699 \u2192 Audit Log \u2192 Export to CSV. Lands as a .zip of Excel workbooks, a .zip of attachment files, and a flat CSV, three separate runs, all from an admin login.\n\nPlease place this into a folder named Quickbooks inside of the main folder you are pushing. Let me know if you have any questions on this!",
+  "notes": [
+    "The export runs as three separate jobs and requires an admin login.",
+    "Native QuickBooks exports are narrower than an API pull."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case quickbooks-oauth-pull)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

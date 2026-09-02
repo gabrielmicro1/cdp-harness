@@ -1,0 +1,16 @@
+{
+  "service_id": "zoom",
+  "display_name": "Zoom",
+  "aliases": [
+    "Zoom cloud recordings",
+    "Zoom recordings"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "Yes, we can pull the Zoom recordings directly for you.\n\nPlease:\n1. Sign in to the [Zoom App Marketplace](https://marketplace.zoom.us/) as the account owner or admin.\n2. Go to Developer \u2192 Develop \u2192 Build an app.\n3. Select Server-to-Server OAuth and create an app named \"Micro1 Export.\"\n4. Complete the required app information.\n5. Under Scopes, add View all user recordings (`recording:read:admin`).\n6. Activate the app.\n7. Submit the Account ID, Client ID, and Client Secret through the secure CDP platform. Please do not share them in Slack.\n\nOnce submitted, let us know here and we'll verify access and handle the full pull. After completion, you can deactivate the app :))\n\nIf you would prefer to download and push a small recording set instead, let us know.",
+  "notes": [
+    "Manual download is practical only for small recording scopes."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case zoom-recordings-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

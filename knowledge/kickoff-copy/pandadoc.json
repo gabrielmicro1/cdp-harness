@@ -1,0 +1,18 @@
+{
+  "service_id": "pandadoc",
+  "display_name": "PandaDoc",
+  "aliases": [
+    "Panda Doc"
+  ],
+  "direction": "pull",
+  "status": "approved",
+  "message": "We can pull PandaDoc directly for you.\n\nPlease submit a production PandaDoc API key through the secure CDP platform for each workspace in scope. The key should belong to a user who can see all required documents. Please also confirm the expected document count and whether more than one workspace exists. Do not share the key in Slack.\n\nOnce submitted, let us know here. We will verify the visible scope before pulling the documents, PDFs, metadata, and attachments.",
+  "notes": [
+    "Credential-visible API enumeration does not prove archived-document visibility or full workspace coverage without separate attestation.",
+    "Document enumeration can succeed while individual PDF or attachment materialization fails.",
+    "Quarantined or inaccessible source windows must remain explicit exceptions.",
+    "Do not describe the API result as a guaranteed full-workspace export unless every document state is reconciled."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case pandadoc-count-validated-export-or-api-pull)",
+  "updated_at": "2026-09-02T02:20:22Z"
+}

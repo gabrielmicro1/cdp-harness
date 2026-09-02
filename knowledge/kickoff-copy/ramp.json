@@ -1,0 +1,14 @@
+{
+  "service_id": "ramp",
+  "display_name": "Ramp",
+  "aliases": [],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it** - Instructions: as an Owner/Admin, open each page (Expenses \u2192 Transactions, Expenses \u2192 Reimbursements, Bill Pay \u2192 Bills/Payments, Vendors, People, Accounting) \u2192 filter if needed \u2192 download icon (top right) \u2192 pick CSV, or \"Download receipts (ZIP)\" / \"Download invoices (ZIP)\" on the expense and bill pages. Small files land straight in your downloads; big ones arrive as an emailed link to a CSV or ZIP.\n\nLet me know if you would prefer that we pull this service!",
+  "notes": [
+    "Exports run per page and require Owner or Admin access.",
+    "Large exports arrive as an emailed download link rather than a direct download."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case ramp-csv-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

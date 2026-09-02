@@ -113,10 +113,18 @@ for the client's Zoom **account owner or admin** (secure channel):
    Develop → Build App → Server-to-Server OAuth. (If that app type
    isn't offered, see the note below the snippet — it's a role
    permission, not a wrong page.)
-2. In Scopes, add: recording:read:admin ("View all user recordings").
-3. ACTIVATE the app on its Activation tab. This is the step everyone
-   misses — an un-activated app authenticates fine and then every
-   listing call fails.
+2. In Scopes, add the Cloud Recording read scopes. Newer accounts
+   show GRANULAR scope names and the old bundled "recording:read:admin"
+   is not offered — in that case search Scopes for "recording" and add
+   the Cloud Recording view/read (admin) scopes, which must include:
+     cloud_recording:read:list_account_recordings:admin
+     cloud_recording:read:list_recording_files:admin
+   They are all read-only. Older accounts can add recording:read:admin
+   ("View all user recordings") instead, which covers both.
+3. ACTIVATE the app on its Activation tab — and RE-activate it after
+   any scope change, then save. This is the step everyone misses — an
+   un-activated app (or one whose new scopes were never saved)
+   authenticates fine and then every listing call fails.
 4. Send us three values from the app's credentials page via a secure
    channel (not plain email/chat): Account ID, Client ID, Client
    Secret.

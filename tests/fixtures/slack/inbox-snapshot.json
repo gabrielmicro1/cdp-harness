@@ -1,0 +1,186 @@
+{
+ "channel_id": "C0TEST12345",
+ "taken_at": "2026-09-01T14:00:00Z",
+ "oldest_ts": null,
+ "complete": true,
+ "messages": [
+  {
+   "ts": "10.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[Onboarding]",
+   "reply_count": 2,
+   "latest_reply_ts": "12.000001",
+   "reactions": []
+  },
+  {
+   "ts": "11.000001",
+   "thread_ts": "10.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "hi there",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "12.000001",
+   "thread_ts": "10.000001",
+   "user_id": "U0OWNER0001",
+   "user_name": "Gabe",
+   "is_bot": false,
+   "text": "welcome, start with the canvas",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "20.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[Zoom]",
+   "reply_count": 2,
+   "latest_reply_ts": "22.000001",
+   "reactions": []
+  },
+  {
+   "ts": "21.000001",
+   "thread_ts": "20.000001",
+   "user_id": "U0OWNER0001",
+   "user_name": "Gabe",
+   "is_bot": false,
+   "text": "please create the S2S app",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "22.000001",
+   "thread_ts": "20.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "done, what next?",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "30.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[HubSpot]",
+   "reply_count": 1,
+   "latest_reply_ts": "31.000001",
+   "reactions": []
+  },
+  {
+   "ts": "31.000001",
+   "thread_ts": "30.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "<@U0OWNER0001> which export format do you want?",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "40.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[Slack]",
+   "reply_count": 1,
+   "latest_reply_ts": "41.000001",
+   "reactions": [
+    "white_check_mark"
+   ]
+  },
+  {
+   "ts": "41.000001",
+   "thread_ts": "40.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "thanks, all sent",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "50.000001",
+   "thread_ts": null,
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "Can we get an overall update?",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "60.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[Progress Check]",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "70.000001",
+   "thread_ts": null,
+   "user_id": "U0BOT000001",
+   "user_name": "Company Transfer Setup",
+   "is_bot": true,
+   "text": "[GitHub]",
+   "reply_count": 3,
+   "latest_reply_ts": "73.000001",
+   "reactions": []
+  },
+  {
+   "ts": "71.000001",
+   "thread_ts": "70.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "which org?",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "72.000001",
+   "thread_ts": "70.000001",
+   "user_id": "U0OWNER0001",
+   "user_name": "Gabe",
+   "is_bot": false,
+   "text": "the main one",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  },
+  {
+   "ts": "73.000001",
+   "thread_ts": "70.000001",
+   "user_id": "U0CLIENT001",
+   "user_name": "Client",
+   "is_bot": false,
+   "text": "ok, PAT created",
+   "reply_count": 0,
+   "latest_reply_ts": null,
+   "reactions": []
+  }
+ ]
+}

@@ -1,0 +1,18 @@
+{
+  "service_id": "tl-dv",
+  "display_name": "tl;dv",
+  "aliases": [
+    "tldv",
+    "tl:dv",
+    "tl dv"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: open a meeting \u2192 Download button at the top of the meeting page for the video; for text, Transcript tab \u2192 hover \u2192 copy button \u2192 paste into a file. One meeting at a time, and both the recording's owner and you need Pro or Enterprise plus editor/admin rights on that meeting.\n- **We pull it**, Instructions: from a Pro or Business account, Settings \u2192 Personal settings \u2192 API keys \u2192 generate a new key. Send it to us over secure means. Note the gap before you do: meetings whose calendar organizer is on a Free plan are invisible to the API no matter who shares them, so any key you send only reaches meetings organized by paid seats.\n\nPlease let me know if you plan on pushing this data or if we should pull it!",
+  "notes": [
+    "Meetings whose calendar organizer is on a Free plan are invisible to the API regardless of sharing.",
+    "Push downloads are one meeting at a time and require Pro or Enterprise plus editor or admin rights."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case tldv-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

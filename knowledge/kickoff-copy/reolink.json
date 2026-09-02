@@ -1,0 +1,17 @@
+{
+  "service_id": "reolink",
+  "display_name": "Reolink",
+  "aliases": [
+    "Reolink cameras",
+    "Reolink NVR"
+  ],
+  "direction": "push",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Cloud recordings: cloud.reolink.com or Reolink App \u2192 Cloud Library \u2192 Select files to download \u2192 choose clips, one (or a few) at a time. Local/NVR recordings: on-device Menu \u2192 Search \u2192 Backup \u2192 select all channels + date range \u2192 Start, to a USB drive as MP4/H.265. NVR-only config: Menu \u2192 System \u2192 Maintenance \u2192 Export/Import \u2192 Export, to a config file.\n\nPlease place these files in a folder named Reolink!",
+  "notes": [
+    "Cloud clips download one or a few at a time; there is no bulk cloud export.",
+    "Local/NVR backup goes through a USB drive as MP4/H.265."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case reolink-recording-export-push)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}

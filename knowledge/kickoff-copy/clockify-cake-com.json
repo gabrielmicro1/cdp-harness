@@ -1,0 +1,18 @@
+{
+  "service_id": "clockify-cake-com",
+  "display_name": "Clockify (CAKE.com)",
+  "aliases": [
+    "Clockify",
+    "CAKE.com Clockify",
+    "Clockify time tracking"
+  ],
+  "direction": "adaptive",
+  "status": "approved",
+  "message": "- **You push it**, Instructions: Reports \u2192 Detailed report \u2192 set the longest possible date range \u2192 Export \u2192 CSV/Excel, then Team \u2192 Export user info for the member list. Lands as CSV/Excel files on your disk, but note CSV/Excel needs Basic plan or higher; Free gets PDF only, capped at 31 days per report and 3,000 rows per PDF, so a year of Free-plan history means twelve separate PDF exports.\n- **We pull it**, Instructions: click your profile icon (top right) \u2192 Profile settings \u2192 scroll to the API section \u2192 Generate, and do this from the workspace owner or admin account, the API only shows what your role can see in the UI. Copy the key and send it via secure means.\n\nLet me know which route you would prefer (us pulling or you pushing)",
+  "notes": [
+    "Free-plan exports are PDF only, capped at 31 days per report and 3,000 rows per PDF.",
+    "The API exposes only what the key owner's role can see in the UI."
+  ],
+  "source": "imported from cdp-corpus-transfer-plugin support-cases 2026-09-01.1 (case clockify-push-or-pull-adaptive)",
+  "updated_at": "2026-09-02T02:36:56Z"
+}
